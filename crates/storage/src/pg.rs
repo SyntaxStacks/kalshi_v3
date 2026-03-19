@@ -159,6 +159,18 @@ pub struct ProbabilityCalibrationCard {
 }
 
 #[derive(Debug, Clone)]
+pub struct TrainedModelArtifactCard {
+    pub model_name: String,
+    pub strategy_family: StrategyFamily,
+    pub symbol: Option<String>,
+    pub feature_version: String,
+    pub sample_count: i32,
+    pub weights: market_models::TrainedLinearWeights,
+    pub metrics_json: serde_json::Value,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
 pub struct HistoricalReplayExampleCard {
     pub lane_key: String,
     pub time_to_expiry_bucket: String,
@@ -801,6 +813,67 @@ impl Storage {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(Into::into))
+    }
+
+    pub async fn upsert_trained_model_artifact(
+        &self,
+        model_name: &str,
+        strategy_family: StrategyFamily,
+        symbol: Option<&str>,
+        feature_version: &str,
+        sample_count: i32,
+        weights: &market_models::TrainedLinearWeights,
+        metrics_json: &serde_json::Value,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            insert into trained_model_artifact (
+                model_name, strategy_family, symbol, feature_version, sample_count, weights_json, metrics_json, updated_at
+            )
+            values ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, now())
+            on conflict (model_name, strategy_family, symbol) do update
+            set feature_version = excluded.feature_version,
+                sample_count = excluded.sample_count,
+                weights_json = excluded.weights_json,
+                metrics_json = excluded.metrics_json,
+                updated_at = now()
+            "#,
+        )
+        .bind(model_name)
+        .bind(SqlStrategyFamily::from(strategy_family))
+        .bind(symbol.map(|value| value.to_lowercase()))
+        .bind(feature_version)
+        .bind(sample_count)
+        .bind(serde_json::to_value(weights)?)
+        .bind(metrics_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn latest_trained_model_artifact(
+        &self,
+        model_name: &str,
+        strategy_family: StrategyFamily,
+        symbol: Option<&str>,
+    ) -> Result<Option<TrainedModelArtifactCard>> {
+        let row = sqlx::query_as::<_, TrainedModelArtifactRow>(
+            r#"
+            select model_name, strategy_family, symbol, feature_version, sample_count, weights_json, metrics_json, updated_at
+            from trained_model_artifact
+            where model_name = $1
+              and strategy_family = $2
+              and symbol is not distinct from $3
+            order by updated_at desc, id desc
+            limit 1
+            "#,
+        )
+        .bind(model_name)
+        .bind(SqlStrategyFamily::from(strategy_family))
+        .bind(symbol.map(|value| value.to_lowercase()))
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(TryInto::try_into).transpose()
     }
 
     pub async fn insert_opportunity_decision(&self, decision: &OpportunityDecision) -> Result<i64> {
@@ -3219,6 +3292,18 @@ struct ProbabilityCalibrationRow {
     sample_count: i32,
 }
 
+#[derive(sqlx::FromRow)]
+struct TrainedModelArtifactRow {
+    model_name: String,
+    strategy_family: SqlStrategyFamily,
+    symbol: Option<String>,
+    feature_version: String,
+    sample_count: i32,
+    weights_json: serde_json::Value,
+    metrics_json: serde_json::Value,
+    updated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone)]
 pub struct HistoricalReplayExampleInsert {
     pub source: String,
@@ -3935,6 +4020,23 @@ impl From<ProbabilityCalibrationRow> for ProbabilityCalibrationCard {
             mean_error: value.mean_error,
             sample_count: value.sample_count,
         }
+    }
+}
+
+impl TryFrom<TrainedModelArtifactRow> for TrainedModelArtifactCard {
+    type Error = anyhow::Error;
+
+    fn try_from(value: TrainedModelArtifactRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            model_name: value.model_name,
+            strategy_family: StrategyFamily::from(value.strategy_family),
+            symbol: value.symbol,
+            feature_version: value.feature_version,
+            sample_count: value.sample_count,
+            weights: serde_json::from_value(value.weights_json)?,
+            metrics_json: value.metrics_json,
+            updated_at: value.updated_at,
+        })
     }
 }
 

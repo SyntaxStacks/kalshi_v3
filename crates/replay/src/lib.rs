@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use market_models::{FeatureVector, run_model};
+use market_models::{FeatureVector, TrainedLinearWeights, run_model_with_weights};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,6 +69,7 @@ pub fn benchmark_model_set(
     model_names: &[&str],
     examples: &[ReplayExample],
     policy: ReplayPolicy,
+    trained_weights: Option<&TrainedLinearWeights>,
 ) -> Option<BenchmarkLeaderboard> {
     if examples.is_empty() || model_names.is_empty() {
         return None;
@@ -81,7 +82,7 @@ pub fn benchmark_model_set(
         let mut trade_count = 0usize;
         let mut winning_trades = 0usize;
         for example in examples {
-            let output = run_model(model_name, &example.features);
+            let output = run_model_with_weights(model_name, &example.features, trained_weights);
             brier += (output.probability_yes - example.target_yes_probability).powi(2);
             let trade_result = execution_delta(
                 output.probability_yes,
@@ -200,6 +201,7 @@ mod tests {
                 &[market_models::BASELINE_LOGIT_V1],
                 &[weak],
                 ReplayPolicy::directional_default(),
+                None,
             )
             .expect("leaderboard");
         assert_eq!(board.results[0].trade_count, 0);
@@ -216,6 +218,7 @@ mod tests {
                 &[market_models::BASELINE_LOGIT_V1],
                 &[strong],
                 ReplayPolicy::directional_default(),
+                None,
             )
             .expect("leaderboard");
         assert_eq!(board.results[0].trade_count, 1);
@@ -232,6 +235,7 @@ mod tests {
             &[market_models::BASELINE_LOGIT_V1],
             &[late],
             ReplayPolicy::directional_default(),
+            None,
         )
         .expect("leaderboard");
         assert_eq!(board.results[0].trade_count, 0);

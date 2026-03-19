@@ -5,5 +5,5 @@ pub use pg::{
     LiveFillSyncRecord, LiveOrderSyncRecord, LivePositionSyncRecord,
     LiveTradeReconciliationSnapshot, ModelBenchmarkResultInsert, ModelBenchmarkRunInsert,
     OpenLiveTradeForReconciliation, OpenTradeForExit, PendingExecutionIntent, Storage,
-    TradeExitProgress, WorkerStatusCard,
+    TradeExitProgress, TrainedModelArtifactCard, WorkerStatusCard,
 };

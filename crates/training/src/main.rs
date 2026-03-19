@@ -1,7 +1,7 @@
 use anyhow::Result;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use common::{AppConfig, LaneState, PromotionState, StrategyFamily, lane_key};
-use market_models::{BASELINE_LOGIT_V1, FeatureVector, supported_models};
+use market_models::{BASELINE_LOGIT_V1, FeatureVector, TRAINED_LINEAR_V1, TrainedLinearWeights, supported_models};
 use replay::{BenchmarkLeaderboard, ReplayExample, ReplayPolicy, benchmark_model_set};
 use rusqlite::Connection;
 use serde_json::json;
@@ -148,6 +148,23 @@ async fn training_pass(config: &AppConfig, storage: &storage::Storage) -> Result
             continue;
         }
 
+        let trained_weights = train_symbol_linear_weights(&examples);
+        storage
+            .upsert_trained_model_artifact(
+                TRAINED_LINEAR_V1,
+                StrategyFamily::DirectionalSettlement,
+                Some(&symbol),
+                "trained_linear_symbol_v1",
+                examples.len() as i32,
+                &trained_weights,
+                &json!({
+                    "symbol": symbol,
+                    "training_examples": examples.len(),
+                    "policy": "resolved_history_preferred"
+                }),
+            )
+            .await?;
+
         let lane = lane_key(
             "kalshi",
             &symbol,
@@ -161,6 +178,7 @@ async fn training_pass(config: &AppConfig, storage: &storage::Storage) -> Result
             supported_models(),
             &examples,
             ReplayPolicy::directional_default(),
+            Some(&trained_weights),
         ) else {
             continue;
         };
@@ -338,6 +356,86 @@ async fn persist_calibration(
             .await?;
     }
     Ok(())
+}
+
+fn train_symbol_linear_weights(examples: &[ReplayExample]) -> TrainedLinearWeights {
+    let mut weights = TrainedLinearWeights {
+        bias: 0.0,
+        market_prob: -0.4,
+        reference_yes_prob: 0.6,
+        reference_gap_bps_scaled: 0.15,
+        threshold_distance_bps_scaled: 0.12,
+        order_book_imbalance: 0.10,
+        aggressive_buy_ratio: 0.08,
+        venue_quality_score: 0.05,
+        market_data_age_scaled: -0.05,
+        reference_age_scaled: -0.04,
+        averaging_window_progress: 0.06,
+        seconds_to_expiry_scaled: 0.04,
+    };
+    let learning_rate = 0.03;
+    let regularization = 0.0005;
+    let epochs = 6;
+
+    for _ in 0..epochs {
+        for example in examples {
+            let target = example.target_yes_probability.clamp(0.0, 1.0);
+            let score = linear_score(&weights, &example.features);
+            let prediction = 1.0 / (1.0 + (-score).exp());
+            let error = target - prediction;
+
+            weights.bias += learning_rate * error;
+            weights.market_prob += learning_rate
+                * ((error * example.features.market_prob) - (regularization * weights.market_prob));
+            weights.reference_yes_prob += learning_rate
+                * ((error * example.features.reference_yes_prob)
+                    - (regularization * weights.reference_yes_prob));
+            weights.reference_gap_bps_scaled += learning_rate
+                * ((error * example.features.reference_gap_bps_scaled)
+                    - (regularization * weights.reference_gap_bps_scaled));
+            weights.threshold_distance_bps_scaled += learning_rate
+                * ((error * example.features.threshold_distance_bps_scaled)
+                    - (regularization * weights.threshold_distance_bps_scaled));
+            weights.order_book_imbalance += learning_rate
+                * ((error * example.features.order_book_imbalance)
+                    - (regularization * weights.order_book_imbalance));
+            weights.aggressive_buy_ratio += learning_rate
+                * ((error * example.features.aggressive_buy_ratio)
+                    - (regularization * weights.aggressive_buy_ratio));
+            weights.venue_quality_score += learning_rate
+                * ((error * example.features.venue_quality_score)
+                    - (regularization * weights.venue_quality_score));
+            weights.market_data_age_scaled += learning_rate
+                * ((error * example.features.market_data_age_scaled)
+                    - (regularization * weights.market_data_age_scaled));
+            weights.reference_age_scaled += learning_rate
+                * ((error * example.features.reference_age_scaled)
+                    - (regularization * weights.reference_age_scaled));
+            weights.averaging_window_progress += learning_rate
+                * ((error * example.features.averaging_window_progress)
+                    - (regularization * weights.averaging_window_progress));
+            weights.seconds_to_expiry_scaled += learning_rate
+                * ((error * example.features.seconds_to_expiry_scaled)
+                    - (regularization * weights.seconds_to_expiry_scaled));
+        }
+    }
+
+    weights
+}
+
+fn linear_score(weights: &TrainedLinearWeights, features: &FeatureVector) -> f64 {
+    weights.bias
+        + (weights.market_prob * features.market_prob)
+        + (weights.reference_yes_prob * features.reference_yes_prob)
+        + (weights.reference_gap_bps_scaled * features.reference_gap_bps_scaled)
+        + (weights.threshold_distance_bps_scaled * features.threshold_distance_bps_scaled)
+        + (weights.order_book_imbalance * features.order_book_imbalance)
+        + (weights.aggressive_buy_ratio * features.aggressive_buy_ratio)
+        + (weights.venue_quality_score * features.venue_quality_score)
+        + (weights.market_data_age_scaled * features.market_data_age_scaled)
+        + (weights.reference_age_scaled * features.reference_age_scaled)
+        + (weights.averaging_window_progress * features.averaging_window_progress)
+        + (weights.seconds_to_expiry_scaled * features.seconds_to_expiry_scaled)
 }
 
 async fn backfill_historical_examples_from_v2(

@@ -22,12 +22,29 @@ pub struct ModelOutput {
     pub confidence: f64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrainedLinearWeights {
+    pub bias: f64,
+    pub market_prob: f64,
+    pub reference_yes_prob: f64,
+    pub reference_gap_bps_scaled: f64,
+    pub threshold_distance_bps_scaled: f64,
+    pub order_book_imbalance: f64,
+    pub aggressive_buy_ratio: f64,
+    pub venue_quality_score: f64,
+    pub market_data_age_scaled: f64,
+    pub reference_age_scaled: f64,
+    pub averaging_window_progress: f64,
+    pub seconds_to_expiry_scaled: f64,
+}
+
 pub const BASELINE_LOGIT_V1: &str = "baseline_logit_v1";
 pub const BASELINE_CONTRARIAN_V1: &str = "baseline_contrarian_v1";
 pub const FLOW_WEIGHTED_V2: &str = "flow_weighted_v2";
 pub const FLOW_WEIGHTED_CONTRARIAN_V2: &str = "flow_weighted_contrarian_v2";
 pub const SETTLEMENT_ANCHOR_V3: &str = "settlement_anchor_v3";
 pub const SETTLEMENT_ANCHOR_CONTRARIAN_V3: &str = "settlement_anchor_contrarian_v3";
+pub const TRAINED_LINEAR_V1: &str = "trained_linear_v1";
 
 fn invert_output(output: ModelOutput, confidence_boost: f64) -> ModelOutput {
     ModelOutput {
@@ -112,6 +129,33 @@ pub fn settlement_anchor_logit(features: &FeatureVector) -> ModelOutput {
     }
 }
 
+pub fn trained_linear(features: &FeatureVector, weights: &TrainedLinearWeights) -> ModelOutput {
+    let score = weights.bias
+        + (features.market_prob * weights.market_prob)
+        + (features.reference_yes_prob * weights.reference_yes_prob)
+        + (features.reference_gap_bps_scaled * weights.reference_gap_bps_scaled)
+        + (features.threshold_distance_bps_scaled * weights.threshold_distance_bps_scaled)
+        + (features.order_book_imbalance * weights.order_book_imbalance)
+        + (features.aggressive_buy_ratio * weights.aggressive_buy_ratio)
+        + (features.venue_quality_score * weights.venue_quality_score)
+        + (features.market_data_age_scaled * weights.market_data_age_scaled)
+        + (features.reference_age_scaled * weights.reference_age_scaled)
+        + (features.averaging_window_progress * weights.averaging_window_progress)
+        + (features.seconds_to_expiry_scaled * weights.seconds_to_expiry_scaled);
+    let probability_yes = 1.0 / (1.0 + (-score).exp());
+    let confidence = ((probability_yes - features.market_prob).abs() * 1.75
+        + features.venue_quality_score * 0.24
+        + features.reference_gap_bps_scaled.abs() * 0.08
+        - features.market_data_age_scaled * 0.06
+        - features.reference_age_scaled * 0.04)
+        .clamp(0.05, 0.95);
+    ModelOutput {
+        raw_score: score,
+        probability_yes,
+        confidence,
+    }
+}
+
 pub fn supported_models() -> &'static [&'static str] {
     &[
         BASELINE_LOGIT_V1,
@@ -120,16 +164,28 @@ pub fn supported_models() -> &'static [&'static str] {
         FLOW_WEIGHTED_CONTRARIAN_V2,
         SETTLEMENT_ANCHOR_V3,
         SETTLEMENT_ANCHOR_CONTRARIAN_V3,
+        TRAINED_LINEAR_V1,
     ]
 }
 
 pub fn run_model(model_name: &str, features: &FeatureVector) -> ModelOutput {
+    run_model_with_weights(model_name, features, None)
+}
+
+pub fn run_model_with_weights(
+    model_name: &str,
+    features: &FeatureVector,
+    trained_weights: Option<&TrainedLinearWeights>,
+) -> ModelOutput {
     match model_name {
         BASELINE_CONTRARIAN_V1 => invert_output(baseline_logit(features), 0.03),
         FLOW_WEIGHTED_V2 => flow_weighted_logit(features),
         FLOW_WEIGHTED_CONTRARIAN_V2 => invert_output(flow_weighted_logit(features), 0.03),
         SETTLEMENT_ANCHOR_V3 => settlement_anchor_logit(features),
         SETTLEMENT_ANCHOR_CONTRARIAN_V3 => invert_output(settlement_anchor_logit(features), 0.02),
+        TRAINED_LINEAR_V1 => trained_weights
+            .map(|weights| trained_linear(features, weights))
+            .unwrap_or_else(|| baseline_logit(features)),
         _ => baseline_logit(features),
     }
 }
@@ -139,7 +195,8 @@ mod tests {
     use super::{
         BASELINE_CONTRARIAN_V1, BASELINE_LOGIT_V1, FLOW_WEIGHTED_CONTRARIAN_V2,
         FLOW_WEIGHTED_V2, FeatureVector, SETTLEMENT_ANCHOR_CONTRARIAN_V3,
-        SETTLEMENT_ANCHOR_V3, baseline_logit, run_model, supported_models,
+        SETTLEMENT_ANCHOR_V3, TRAINED_LINEAR_V1, TrainedLinearWeights, baseline_logit, run_model,
+        run_model_with_weights, supported_models,
     };
 
     #[test]
@@ -191,5 +248,39 @@ mod tests {
         assert_ne!(v1.raw_score, v2.raw_score);
         assert!(supported_models().contains(&SETTLEMENT_ANCHOR_V3));
         assert!(supported_models().contains(&SETTLEMENT_ANCHOR_CONTRARIAN_V3));
+    }
+
+    #[test]
+    fn trained_linear_uses_supplied_weights() {
+        let features = FeatureVector {
+            market_prob: 0.40,
+            reference_yes_prob: 0.60,
+            reference_gap_bps_scaled: 0.25,
+            threshold_distance_bps_scaled: 0.10,
+            order_book_imbalance: 0.15,
+            aggressive_buy_ratio: 0.62,
+            venue_quality_score: 0.85,
+            market_data_age_scaled: 0.03,
+            reference_age_scaled: 0.04,
+            averaging_window_progress: 0.45,
+            seconds_to_expiry_scaled: 0.55,
+        };
+        let weights = TrainedLinearWeights {
+            bias: -0.15,
+            market_prob: -1.2,
+            reference_yes_prob: 1.5,
+            reference_gap_bps_scaled: 0.3,
+            threshold_distance_bps_scaled: 0.2,
+            order_book_imbalance: 0.4,
+            aggressive_buy_ratio: 0.5,
+            venue_quality_score: 0.35,
+            market_data_age_scaled: -0.2,
+            reference_age_scaled: -0.1,
+            averaging_window_progress: 0.15,
+            seconds_to_expiry_scaled: 0.1,
+        };
+        let output = run_model_with_weights(TRAINED_LINEAR_V1, &features, Some(&weights));
+        assert!(output.probability_yes > 0.5);
+        assert!(supported_models().contains(&TRAINED_LINEAR_V1));
     }
 }

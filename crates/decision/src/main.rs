@@ -4,7 +4,10 @@ use common::{
     AppConfig, ModelInference, OpportunityDecision, PromotionState, StrategyFamily, TradeMode,
     lane_key,
 };
-use market_models::{BASELINE_LOGIT_V1, FeatureVector, run_model};
+use market_models::{
+    BASELINE_LOGIT_V1, FeatureVector, TRAINED_LINEAR_V1, TrainedLinearWeights,
+    run_model_with_weights,
+};
 use serde_json::json;
 use std::collections::HashMap;
 use std::time::Instant;
@@ -69,6 +72,8 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
     );
     let mut decisions = 0usize;
     let mut approved_count = 0usize;
+    let mut trained_artifact_cache: HashMap<String, Option<(TrainedLinearWeights, i32)>> =
+        HashMap::new();
     let paper_bankroll = storage
         .latest_portfolio_bankroll(TradeMode::Paper)
         .await?
@@ -137,25 +142,46 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
             }
         }
 
-        let model = run_model(
+        let feature_vector = FeatureVector {
+            market_prob: snapshot.market_prob,
+            reference_yes_prob: snapshot.reference_yes_prob,
+            reference_gap_bps_scaled: (snapshot.reference_gap_bps / 1_000.0).clamp(-1.5, 1.5),
+            threshold_distance_bps_scaled: (snapshot.threshold_distance_bps_proxy / 500.0)
+                .clamp(-1.5, 1.5),
+            order_book_imbalance: snapshot.order_book_imbalance,
+            aggressive_buy_ratio: snapshot.aggressive_buy_ratio,
+            venue_quality_score: snapshot.venue_quality_score,
+            market_data_age_scaled: (snapshot.market_data_age_seconds as f64 / 20.0)
+                .clamp(0.0, 1.5),
+            reference_age_scaled: (snapshot.reference_age_seconds as f64 / 20.0)
+                .clamp(0.0, 1.5),
+            averaging_window_progress: snapshot.averaging_window_progress.clamp(0.0, 1.0),
+            seconds_to_expiry_scaled: (snapshot.seconds_to_expiry as f64 / 900.0)
+                .clamp(0.0, 1.0),
+        };
+        let trained_artifact = if model_name == TRAINED_LINEAR_V1 {
+            if !trained_artifact_cache.contains_key(&snapshot.symbol) {
+                let artifact = storage
+                    .latest_trained_model_artifact(
+                        TRAINED_LINEAR_V1,
+                        StrategyFamily::DirectionalSettlement,
+                        Some(&snapshot.symbol),
+                    )
+                    .await?
+                    .map(|artifact| (artifact.weights, artifact.sample_count));
+                trained_artifact_cache.insert(snapshot.symbol.clone(), artifact);
+            }
+            trained_artifact_cache
+                .get(&snapshot.symbol)
+                .cloned()
+                .flatten()
+        } else {
+            None
+        };
+        let model = run_model_with_weights(
             &model_name,
-            &FeatureVector {
-                market_prob: snapshot.market_prob,
-                reference_yes_prob: snapshot.reference_yes_prob,
-                reference_gap_bps_scaled: (snapshot.reference_gap_bps / 1_000.0).clamp(-1.5, 1.5),
-                threshold_distance_bps_scaled: (snapshot.threshold_distance_bps_proxy / 500.0)
-                    .clamp(-1.5, 1.5),
-                order_book_imbalance: snapshot.order_book_imbalance,
-                aggressive_buy_ratio: snapshot.aggressive_buy_ratio,
-                venue_quality_score: snapshot.venue_quality_score,
-                market_data_age_scaled: (snapshot.market_data_age_seconds as f64 / 20.0)
-                    .clamp(0.0, 1.5),
-                reference_age_scaled: (snapshot.reference_age_seconds as f64 / 20.0)
-                    .clamp(0.0, 1.5),
-                averaging_window_progress: snapshot.averaging_window_progress.clamp(0.0, 1.0),
-                seconds_to_expiry_scaled: (snapshot.seconds_to_expiry as f64 / 900.0)
-                    .clamp(0.0, 1.0),
-            },
+            &feature_vector,
+            trained_artifact.as_ref().map(|(weights, _)| weights),
         );
         let calibration = storage
             .latest_probability_calibration(
@@ -290,6 +316,7 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
                 "market_title": snapshot.market_title,
                 "calibration_mean_error": calibration.as_ref().map(|row| row.mean_error),
                 "calibration_sample_count": calibration.as_ref().map(|row| row.sample_count),
+                "trained_artifact_sample_count": trained_artifact.as_ref().map(|(_, sample_count)| *sample_count),
                 "reference_yes_prob": snapshot.reference_yes_prob,
                 "reference_gap_bps": snapshot.reference_gap_bps,
                 "reference_price_change_bps": snapshot.reference_price_change_bps,
