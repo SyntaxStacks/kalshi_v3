@@ -8,128 +8,170 @@
 </head>
 <body>
   <main class="shell">
-    <nav class="family-nav">
-      <a class="family-link" id="family-link-crypto" href="/">Crypto</a>
-      <a class="family-link" id="family-link-weather" href="/weather">Weather</a>
-    </nav>
-    <header class="hero">
-      <div>
+    <header class="masthead">
+      <div class="brand-block">
         <p class="eyebrow">Kalshi V3 Operator</p>
-        <h1 id="hero-title">Capital, readiness, and live risk in one screen.</h1>
+        <h1 id="hero-title">Crypto live cockpit</h1>
+        <p class="hero-copy" id="hero-copy">Live risk first. Lane truth before optimism.</p>
       </div>
-      <div class="hero-status" id="hero-status">Loading</div>
+      <div class="masthead-side">
+        <nav class="family-nav" aria-label="Family navigation">
+          <a class="family-link" id="family-link-crypto" href="/">Crypto</a>
+          <a class="family-link" id="family-link-weather" href="/weather">Weather</a>
+        </nav>
+        <div class="hero-status" id="hero-status">Loading</div>
+      </div>
     </header>
 
-    <section class="grid">
-      <article class="panel panel-bankrolls">
-        <div class="panel-head">
-          <div>
-            <p class="eyebrow">Bankrolls</p>
-            <h2>Paper and live capital</h2>
-          </div>
-        </div>
-        <div class="bankroll-list" id="bankroll-list"></div>
-      </article>
-
-      <article class="panel panel-readiness">
-        <div class="panel-head">
-          <div>
-            <p class="eyebrow">Live readiness</p>
-            <h2>Lane promotion state</h2>
-          </div>
-          <div class="readiness-badge" id="readiness-badge">Loading</div>
-        </div>
-        <div class="state-strip" id="state-strip"></div>
-        <div class="lane-list" id="lane-list"></div>
-      </article>
-
-      <article class="panel panel-readiness">
-        <div class="panel-head">
-          <div>
-            <p class="eyebrow">Exchange truth</p>
-            <h2>Live sync state</h2>
-          </div>
-          <div class="readiness-badge" id="live-sync-badge">Loading</div>
-        </div>
-        <div class="state-strip" id="live-sync-strip"></div>
-        <div class="lane-list" id="live-sync-list"></div>
-      </article>
-    </section>
-
-    <section class="panel panel-ops">
+    <section class="panel panel-decision">
       <div class="panel-head">
         <div>
-          <p class="eyebrow">Operator state</p>
-          <h2>Freshness and intent flow</h2>
+          <p class="eyebrow">Top Decision Bar</p>
+          <h2>Am I safe and what needs action now?</h2>
         </div>
-        <div class="readiness-badge" id="ops-badge">Loading</div>
       </div>
-      <div class="state-strip" id="ops-strip"></div>
-      <div class="lane-list" id="ops-list"></div>
+      <div class="decision-grid" id="decision-grid"></div>
     </section>
 
-    <section class="panel panel-ops">
+    <section class="panel panel-triage">
       <div class="panel-head">
         <div>
-          <p class="eyebrow">Execution truth</p>
-          <h2>Predicted fills versus realized fill truth</h2>
-        </div>
-        <div class="readiness-badge" id="execution-quality-badge">Loading</div>
-      </div>
-      <div class="state-strip" id="execution-quality-strip"></div>
-      <div class="lane-list" id="execution-quality-list"></div>
-    </section>
-
-    <section class="panel panel-ops">
-      <div class="panel-head">
-        <div>
-          <p class="eyebrow">Money view</p>
-          <h2>Lane truth and degradation candidates</h2>
+          <p class="eyebrow">Lane Triage</p>
+          <h2>Which lanes deserve capital</h2>
         </div>
         <div class="readiness-badge" id="money-view-badge">Loading</div>
       </div>
-      <div class="lane-list" id="money-view-list"></div>
+      <div class="state-strip state-strip-compact" id="money-view-family"></div>
+      <div class="triage-list" id="money-view-list"></div>
     </section>
 
-    <section class="panel panel-exceptions">
-      <div class="panel-head">
-        <div>
-          <p class="eyebrow">Live exceptions</p>
-          <h2>Orders, positions, and operator controls</h2>
+    <section class="action-cluster">
+      <section class="panel panel-exceptions">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">Live Exceptions</p>
+            <h2>Urgent positions, orders, and mismatches</h2>
+          </div>
+          <div class="readiness-badge" id="exceptions-badge">Loading</div>
         </div>
-        <div class="readiness-badge" id="exceptions-badge">Loading</div>
-      </div>
-      <div class="control-row">
-        <button class="control-button" data-action="retry_live_sync">Retry live sync</button>
-        <button class="control-button" data-action="reconcile_now">Reconcile now</button>
-        <button class="control-button warn" data-action="cancel_pending_live_orders">Cancel pending live</button>
-        <button class="control-button bad" data-action="flatten_live_positions">Flatten live positions</button>
-        <button class="control-button bad" data-action="disable_live">Disable live</button>
-        <button class="control-button" data-action="enable_live">Enable live</button>
-      </div>
-      <div class="control-feedback muted" id="control-feedback">Operator actions will report here.</div>
-      <div class="state-strip" id="exceptions-strip"></div>
-      <div class="lane-list" id="exceptions-list"></div>
+        <div class="state-strip state-strip-compact" id="exceptions-strip"></div>
+        <div class="lane-list" id="exceptions-list"></div>
+      </section>
+
+      <section class="panel panel-controls">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">Operator Controls</p>
+            <h2>Maintenance, risk, and emergency actions</h2>
+          </div>
+        </div>
+
+        <section class="control-group">
+          <p class="eyebrow">Maintenance</p>
+          <div class="control-row">
+            <button class="control-button" data-action="retry_live_sync">Retry live sync</button>
+            <button class="control-button" data-action="reconcile_now">Reconcile now</button>
+            <button class="control-button" data-action="enable_live">Enable live</button>
+          </div>
+        </section>
+
+        <section class="control-group control-group-risk">
+          <p class="eyebrow">Risk Controls</p>
+          <div class="control-row">
+            <button class="control-button warn" data-action="cancel_pending_live_orders">Cancel pending live</button>
+            <button class="control-button warn" data-action="disable_live">Disable live</button>
+          </div>
+        </section>
+
+        <section class="control-group control-group-emergency">
+          <p class="eyebrow">Emergency</p>
+          <div class="control-row">
+            <button class="control-button bad" data-action="flatten_live_positions">Flatten live positions</button>
+          </div>
+        </section>
+
+        <div class="control-feedback muted" id="control-feedback">Operator actions will report here.</div>
+      </section>
     </section>
 
-    <section class="panel panel-trades">
+    <section class="panel panel-exposure">
       <div class="panel-head">
         <div>
-          <p class="eyebrow">Open trades</p>
-          <h2>Current risk on the book</h2>
+          <p class="eyebrow">Current Exposure</p>
+          <h2>Live risk and open positions on the book</h2>
         </div>
       </div>
       <div class="trade-list" id="trade-list"></div>
+    </section>
+
+    <section class="panel panel-diagnostics">
+      <div class="panel-head">
+        <div>
+          <p class="eyebrow">Execution Diagnostics</p>
+          <h2>Diagnostic only unless live evidence is strong</h2>
+        </div>
+        <div class="readiness-badge" id="execution-quality-badge">Loading</div>
+      </div>
+      <div class="state-strip state-strip-compact" id="execution-quality-strip"></div>
+      <div class="lane-list" id="execution-quality-list"></div>
+    </section>
+
+    <section class="system-cluster">
+      <section class="panel panel-system">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">Readiness Context</p>
+            <h2>Promotion state stays secondary to lane truth</h2>
+          </div>
+          <div class="readiness-badge" id="readiness-badge">Loading</div>
+        </div>
+        <div class="state-strip state-strip-compact" id="state-strip"></div>
+        <div class="lane-list compact-list" id="lane-list"></div>
+      </section>
+
+      <section class="panel panel-system">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">Exchange Truth</p>
+            <h2>Positions, orders, and fills versus local state</h2>
+          </div>
+          <div class="readiness-badge" id="live-sync-badge">Loading</div>
+        </div>
+        <div class="state-strip state-strip-compact" id="live-sync-strip"></div>
+        <div class="lane-list compact-list" id="live-sync-list"></div>
+      </section>
+
+      <section class="panel panel-system">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">Operator State</p>
+            <h2>Freshness, alarms, and acceptance gates</h2>
+          </div>
+          <div class="readiness-badge" id="ops-badge">Loading</div>
+        </div>
+        <div class="state-strip state-strip-compact" id="ops-strip"></div>
+        <div class="lane-list compact-list" id="ops-list"></div>
+      </section>
     </section>
 
     <section class="panel panel-opportunities">
       <div class="panel-head">
         <div>
           <p class="eyebrow">Opportunities</p>
-          <h2>Latest decision flow</h2>
+          <h2>Decision flow after risk and execution gates</h2>
         </div>
       </div>
       <div class="trade-list" id="opportunity-list"></div>
+    </section>
+
+    <section class="panel panel-bankrolls">
+      <div class="panel-head">
+        <div>
+          <p class="eyebrow">Bankroll Detail</p>
+          <h2>Capital by mode and family</h2>
+        </div>
+      </div>
+      <div class="bankroll-list" id="bankroll-list"></div>
     </section>
   </main>
   <script src="/assets/app.js"></script>

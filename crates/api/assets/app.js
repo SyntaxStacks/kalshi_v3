@@ -282,6 +282,104 @@ function bankrollFreshness(item) {
   return { label: titleCase(item.mode), tone: "" };
 }
 
+function badgeTone(value, fallback = "neutral") {
+  const tone = statusTone(value);
+  return tone || fallback;
+}
+
+function sumExposure(items, mode) {
+  return (items || [])
+    .filter((item) => item.mode === mode)
+    .reduce((total, item) => total + (Number(item.open_exposure) || 0), 0);
+}
+
+function liveActionState(payload, runtime, readiness) {
+  const exceptions = payload?.live_exceptions || {};
+  const urgentCount =
+    (exceptions.trade_exceptions || []).length +
+    (exceptions.orders || []).length +
+    (runtime?.alarms || []).length;
+  if (urgentCount > 0) {
+    return { label: "Action needed", tone: "bad", detail: `${urgentCount} urgent item${urgentCount === 1 ? "" : "s"}` };
+  }
+  if ((readiness?.quarantined_count || 0) > 0) {
+    return {
+      label: "Watch lanes",
+      tone: "warn",
+      detail: `${readiness.quarantined_count} quarantined lane${readiness.quarantined_count === 1 ? "" : "s"}`,
+    };
+  }
+  return { label: "No urgent action", tone: "good", detail: "No live exceptions or runtime alarms" };
+}
+
+function executionTruthLabel(summary) {
+  if (!summary) {
+    return { label: "Unavailable", tone: "warn", detail: "No execution truth payload" };
+  }
+  if (!summary.live_sample_sufficient) {
+    return {
+      label: "Diagnostic Only",
+      tone: "neutral",
+      detail: `${summary.recent_live_terminal_intent_count || 0} terminal live intents`,
+    };
+  }
+  const tone = summary.live_sample_sufficient ? executionQualityTone(summary) : "neutral";
+  if (tone === "good") return { label: "Actionable", tone: "good", detail: "Live sample threshold met" };
+  if (tone === "bad") return { label: "Needs caution", tone: "bad", detail: "Live truth diverges from forecast" };
+  return { label: "Watch closely", tone: "warn", detail: "Evidence exists but confidence is mixed" };
+}
+
+function renderDecisionBar(payload, runtime, readiness) {
+  const root = document.getElementById("decision-grid");
+  const liveEnabled = runtime?.live_trading_enabled && runtime?.live_order_placement_enabled;
+  const exchangeStatus = payload?.live_sync?.status || "unavailable";
+  const executionStatus = executionTruthLabel(payload?.execution_quality || runtime?.execution_quality || null);
+  const actionState = liveActionState(payload, runtime, readiness);
+  const liveExposure = sumExposure(payload?.bankrolls || [], "live");
+  const exposureLabel = liveExposure > 0 ? money(liveExposure) : currentFamily() === "weather" ? "Paper only" : "No live exposure";
+
+  root.innerHTML = [
+    {
+      eyebrow: "Live routing",
+      value: liveEnabled ? "Enabled" : "Disabled",
+      tone: liveEnabled ? "warn" : "neutral",
+      detail: liveEnabled ? "Orders can route live right now" : "Live placement is off",
+    },
+    {
+      eyebrow: "Exchange truth",
+      value: titleCase(exchangeStatus),
+      tone: badgeTone(exchangeStatus, "warn"),
+      detail: payload?.live_sync?.issues?.length
+        ? payload.live_sync.issues.join(", ")
+        : "Bankroll, positions, orders, and fills agree",
+    },
+    {
+      eyebrow: "Execution truth",
+      value: executionStatus.label,
+      tone: executionStatus.tone,
+      detail: executionStatus.detail,
+    },
+    {
+      eyebrow: "Live capital at risk",
+      value: exposureLabel,
+      tone: liveExposure > 0 ? "warn" : "neutral",
+      detail: liveExposure > 0 ? "Open live exposure on the book" : "No live dollars currently at risk",
+    },
+    {
+      eyebrow: "Action state",
+      value: actionState.label,
+      tone: actionState.tone,
+      detail: actionState.detail,
+    },
+  ].map((item) => `
+    <section class="decision-tile">
+      <p class="eyebrow">${item.eyebrow}</p>
+      <strong class="${item.tone}">${item.value}</strong>
+      <p class="muted">${item.detail}</p>
+    </section>
+  `).join("");
+}
+
 function renderBankrolls(items) {
   const root = document.getElementById("bankroll-list");
   if (!items.length) {
@@ -457,38 +555,38 @@ function renderExecutionQuality(summary) {
     (summary.recent_live_filled_quantity_ratio || 0) -
     (summary.recent_live_predicted_fill_probability_mean || 0);
   badge.textContent = summary.live_sample_sufficient
-    ? titleCase(tone === "good" ? "Aligned" : tone === "warn" ? "Watch" : "Drift")
+    ? titleCase(tone === "good" ? "Actionable" : tone === "warn" ? "Watch" : "Drift")
     : "Insufficient Sample";
   badge.className = `readiness-badge ${tone}`;
   strip.innerHTML = `
-    <div class="state-pill"><span class="eyebrow">Replay Edge Realization</span><strong>${summary.replay_trade_weighted_edge_realization_ratio_diag == null ? "Diagnostic Only" : ratio(summary.replay_trade_weighted_edge_realization_ratio_diag)}</strong></div>
-    <div class="state-pill"><span class="eyebrow">Replay Fill Rate</span><strong>${summary.replay_trade_weighted_fill_rate_diag == null ? "Diagnostic Only" : pct(summary.replay_trade_weighted_fill_rate_diag)}</strong></div>
-    <div class="state-pill"><span class="eyebrow">Predicted Fill Probability</span><strong>${summary.recent_live_predicted_fill_probability_mean == null ? "Diagnostic Only" : pct(summary.recent_live_predicted_fill_probability_mean)}</strong></div>
-    <div class="state-pill"><span class="eyebrow">Filled Quantity Ratio</span><strong>${summary.recent_live_filled_quantity_ratio == null ? "Diagnostic Only" : pct(summary.recent_live_filled_quantity_ratio)}</strong></div>
+    <div class="state-pill"><span class="eyebrow">Live sample</span><strong>${summary.live_sample_sufficient ? "Trustworthy" : "Insufficient"}</strong></div>
+    <div class="state-pill"><span class="eyebrow">Replay sample</span><strong>${summary.replay_sample_sufficient ? "Diagnostic ready" : "Weak"}</strong></div>
+    <div class="state-pill"><span class="eyebrow">Predicted fill</span><strong>${summary.recent_live_predicted_fill_probability_mean == null ? "Diagnostic Only" : pct(summary.recent_live_predicted_fill_probability_mean)}</strong></div>
+    <div class="state-pill"><span class="eyebrow">Filled qty ratio</span><strong>${summary.recent_live_filled_quantity_ratio == null ? "Diagnostic Only" : pct(summary.recent_live_filled_quantity_ratio)}</strong></div>
   `;
   root.innerHTML = `
     <section class="lane-card">
       <header>
         <div>
           <p class="eyebrow">Execution truth</p>
-          <strong>${summary.replay_lane_count} champion lane${summary.replay_lane_count === 1 ? "" : "s"}</strong>
+          <strong>${summary.live_sample_sufficient ? "Measured live evidence is usable" : "Stay humble with this panel"}</strong>
         </div>
-        <div class="chip ${summary.live_sample_sufficient ? tone : "warn"}">${summary.live_sample_sufficient ? `As of ${dateTime(summary.as_of)}` : "Diagnostic Only"}</div>
+        <div class="chip ${summary.live_sample_sufficient ? tone : "neutral"}">${summary.live_sample_sufficient ? `As of ${dateTime(summary.as_of)}` : "Diagnostic Only"}</div>
       </header>
       <dl class="metric-grid">
-        <div class="metric"><dt>Edge realization</dt><dd class="${(summary.replay_trade_weighted_edge_realization_ratio_diag || 0) >= 1 ? "good" : (summary.replay_trade_weighted_edge_realization_ratio_diag || 0) < 0 ? "bad" : ""}">${summary.replay_trade_weighted_edge_realization_ratio_diag == null ? "Diagnostic Only" : ratio(summary.replay_trade_weighted_edge_realization_ratio_diag)}</dd></div>
-        <div class="metric"><dt>Replay slippage</dt><dd class="mono">${summary.replay_trade_weighted_slippage_bps_diag == null ? "Diagnostic Only" : `${summary.replay_trade_weighted_slippage_bps_diag.toFixed(1)} bps`}</dd></div>
-        <div class="metric"><dt>Replay trades</dt><dd class="mono">${summary.replay_trade_count}</dd></div>
         <div class="metric"><dt>Terminal live intents</dt><dd class="mono">${summary.recent_live_terminal_intent_count}</dd></div>
-        <div class="metric"><dt>Live intents with fills</dt><dd class="mono">${summary.recent_live_intents_with_fill_count}</dd></div>
         <div class="metric"><dt>Predicted live sample</dt><dd class="mono">${summary.recent_live_predicted_fill_sample_count}</dd></div>
+        <div class="metric"><dt>Actual fill hit rate</dt><dd>${summary.recent_live_actual_fill_hit_rate == null ? "Diagnostic Only" : pct(summary.recent_live_actual_fill_hit_rate)}</dd></div>
+        <div class="metric"><dt>Replay edge diag</dt><dd class="${(summary.replay_trade_weighted_edge_realization_ratio_diag || 0) >= 1 ? "good" : (summary.replay_trade_weighted_edge_realization_ratio_diag || 0) < 0 ? "bad" : ""}">${summary.replay_trade_weighted_edge_realization_ratio_diag == null ? "Diagnostic Only" : ratio(summary.replay_trade_weighted_edge_realization_ratio_diag)}</dd></div>
+        <div class="metric"><dt>Replay fill rate</dt><dd>${summary.replay_trade_weighted_fill_rate_diag == null ? "Diagnostic Only" : pct(summary.replay_trade_weighted_fill_rate_diag)}</dd></div>
+        <div class="metric"><dt>Replay slippage</dt><dd class="mono">${summary.replay_trade_weighted_slippage_bps_diag == null ? "Diagnostic Only" : `${summary.replay_trade_weighted_slippage_bps_diag.toFixed(1)} bps`}</dd></div>
       </dl>
       ${
         summary.live_sample_sufficient && summary.recent_live_predicted_fill_probability_mean != null && summary.recent_live_filled_quantity_ratio != null
-          ? `<p class="${Math.abs(fillGap) > 0.15 ? "bad" : "muted"}">Predicted fill ${pct(summary.recent_live_predicted_fill_probability_mean)} vs filled quantity ratio ${pct(summary.recent_live_filled_quantity_ratio)} (${fillGap >= 0 ? "+" : ""}${pct(fillGap)} gap).</p>`
-          : `<p class="muted">Diagnostic only. Live execution truth stays humble until there are at least 20 terminal live intents, 20 comparable live forecasts, and non-zero realized fills.</p>`
+          ? `<p class="${Math.abs(fillGap) > 0.15 ? "bad" : "muted"}">Predicted fill ${pct(summary.recent_live_predicted_fill_probability_mean)} versus realized filled quantity ${pct(summary.recent_live_filled_quantity_ratio)} (${fillGap >= 0 ? "+" : ""}${pct(fillGap)} gap).</p>`
+          : `<p class="diagnostic-copy">Diagnostic only. Do not treat this panel as a green light until live samples are sufficient.</p>`
       }
-      ${!summary.replay_sample_sufficient ? `<p class="muted">Replay metrics remain diagnostic only until trade-weighted replay has at least 50 trades.</p>` : ""}
+      ${!summary.replay_sample_sufficient ? `<p class="muted">Replay remains diagnostic only until trade-weighted replay has enough trades to be comparable.</p>` : ""}
     </section>
   `;
 }
@@ -515,157 +613,81 @@ function formatLaneTruthLabel(laneKey) {
   return pieces.join(" · ") || laneKey;
 }
 
-function familyLabel(value) {
-  return titleCase(value || "unknown");
-}
-
 function renderMoneyView(payload) {
   const badge = document.getElementById("money-view-badge");
+  const familyStrip = document.getElementById("money-view-family");
   const root = document.getElementById("money-view-list");
   const laneRows = payload?.lane_execution_truth || [];
   const familyRows = payload?.family_execution_truth || [];
   if (!laneRows.length && !familyRows.length) {
     badge.textContent = "Unavailable";
     badge.className = "readiness-badge warn";
+    familyStrip.innerHTML = "";
     root.innerHTML = `<div class="empty">Lane-level live execution truth is not available yet.</div>`;
     return;
   }
 
   const worstLane = laneRows[0];
   const worstTone = executionTruthStatusTone(worstLane?.status || familyRows[0]?.status || "insufficient_sample");
-  badge.textContent = titleCase(worstLane?.status || familyRows[0]?.status || "insufficient_sample");
+  badge.textContent = worstLane?.live_sample_sufficient ? titleCase(worstLane?.status || "watch") : "Diagnostic Only";
   badge.className = `readiness-badge ${worstTone}`;
 
-  const renderStatus = (row) =>
-    `<span class="truth-status ${executionTruthStatusTone(row.status)}">${titleCase(row.status)}</span>`;
+  familyStrip.innerHTML = familyRows.map((row) => `
+    <div class="state-pill">
+      <span class="eyebrow">${familyLabel(row.market_family)} · ${titleCase(row.mode)}</span>
+      <strong class="${executionTruthStatusTone(row.status)}">${row.live_sample_sufficient ? titleCase(row.status) : "Diagnostic Only"}</strong>
+    </div>
+  `).join("");
 
-  const familyTable = familyRows.length
-    ? `
-      <section class="lane-card">
-        <header>
+  root.innerHTML = laneRows.map((row) => {
+    const predicted = row.recent_live_predicted_fill_probability_mean;
+    const filled = row.recent_live_filled_quantity_ratio;
+    const actual = row.recent_live_actual_fill_hit_rate;
+    const replay = row.replay_trade_weighted_edge_realization_ratio_diag;
+    const recommendation = row.manual_reenable_required
+      ? "Manual Re-enable"
+      : row.block_promotion_recommended
+        ? "Quarantine Candidate"
+        : row.live_sample_sufficient
+          ? titleCase(row.status)
+          : "Insufficient Sample";
+    const recommendationTone = row.manual_reenable_required
+      ? "bad"
+      : row.block_promotion_recommended
+        ? "warn"
+        : executionTruthStatusTone(row.status);
+
+    return `
+      <article class="triage-card">
+        <div class="triage-head">
           <div>
-            <p class="eyebrow">Family truth</p>
-            <strong>Capital protection by family</strong>
+            <p class="eyebrow">${row.mode ? `${titleCase(row.mode)} · ` : ""}${row.promotion_state ? titleCase(row.promotion_state) : "Lane"}</p>
+            <strong>${formatLaneTruthLabel(row.lane_key)}</strong>
+            <p class="muted">${row.lane_key}</p>
           </div>
-        </header>
-        <div class="truth-table-wrap">
-          <table class="truth-table">
-            <thead>
-              <tr>
-                <th>Family</th>
-                <th>Mode</th>
-                <th>Terminal intents</th>
-                <th>Predicted sample</th>
-                <th>Predicted fill</th>
-                <th>Filled qty ratio</th>
-                <th>Actual fill hit</th>
-                <th>Replay edge diag</th>
-                <th>Live vs replay gap</th>
-                <th>Status</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${familyRows
-                .map(
-                  (row) => `
-                    <tr>
-                      <td class="truth-family">
-                        <strong>${familyLabel(row.market_family)}</strong>
-                        <small>${row.degraded_lane_count} degraded · ${row.quarantine_candidate_count} quarantine candidate</small>
-                      </td>
-                      <td>${titleCase(row.mode)}</td>
-                      <td class="mono">${row.recent_live_terminal_intent_count}</td>
-                      <td class="mono">${row.recent_live_predicted_fill_sample_count}</td>
-                      <td class="mono">${row.recent_live_predicted_fill_probability_mean == null ? "Diagnostic Only" : pct(row.recent_live_predicted_fill_probability_mean)}</td>
-                      <td class="mono">${row.recent_live_filled_quantity_ratio == null ? "Diagnostic Only" : pct(row.recent_live_filled_quantity_ratio)}</td>
-                      <td class="mono">${row.recent_live_actual_fill_hit_rate == null ? "Diagnostic Only" : pct(row.recent_live_actual_fill_hit_rate)}</td>
-                      <td class="mono">${row.replay_trade_weighted_edge_realization_ratio_diag == null ? "Diagnostic Only" : ratio(row.replay_trade_weighted_edge_realization_ratio_diag)}</td>
-                      <td class="mono">${row.live_vs_replay_fill_gap == null ? "Diagnostic Only" : `${row.live_vs_replay_fill_gap >= 0 ? "+" : ""}${pct(row.live_vs_replay_fill_gap)}`}</td>
-                      <td>${renderStatus(row)}${!row.live_sample_sufficient ? `<span class="truth-note">Diagnostic Only</span>` : ""}</td>
-                    </tr>
-                  `,
-                )
-                .join("")}
-            </tbody>
-          </table>
-        </div>
-      </section>
-    `
-    : "";
-
-  const laneTable = laneRows.length
-    ? `
-      <section class="lane-card">
-        <header>
-          <div>
-            <p class="eyebrow">Lane truth</p>
-            <strong>Exact lanes that deserve money</strong>
+          <div class="triage-meta">
+            <span class="triage-chip ${row.live_sample_sufficient ? executionTruthStatusTone(row.status) : "neutral"}">${row.live_sample_sufficient ? titleCase(row.status) : "Diagnostic Only"}</span>
+            <span class="triage-chip ${recommendationTone}">${recommendation}</span>
           </div>
-        </header>
-        <div class="truth-table-wrap">
-          <table class="truth-table">
-            <thead>
-              <tr>
-                <th>Lane</th>
-                <th>Mode</th>
-                <th>Terminal intents</th>
-                <th>Predicted sample</th>
-                <th>Predicted fill</th>
-                <th>Filled qty ratio</th>
-                <th>Actual fill hit</th>
-                <th>Replay edge diag</th>
-                <th>Predicted vs real</th>
-                <th>Live vs replay</th>
-                <th>Status</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${laneRows
-                .map(
-                  (row) => `
-                    <tr>
-                      <td class="truth-lane">
-                        <strong>${formatLaneTruthLabel(row.lane_key)}</strong>
-                        <small>${row.lane_key}</small>
-                        ${
-                          row.recommendation_reason
-                            ? `<span class="truth-note">${titleCase(row.recommendation_reason)}${row.recommended_size_multiplier != null && row.recommended_size_multiplier < 1 ? ` · size cap ${pct(row.recommended_size_multiplier)}` : ""}</span>`
-                            : ""
-                        }
-                      </td>
-                      <td>${titleCase(row.mode)}${row.promotion_state ? `<span class="truth-note">${titleCase(row.promotion_state)}</span>` : ""}</td>
-                      <td class="mono">${row.recent_live_terminal_intent_count}</td>
-                      <td class="mono">${row.recent_live_predicted_fill_sample_count}</td>
-                      <td class="mono">${row.recent_live_predicted_fill_probability_mean == null ? "Diagnostic Only" : pct(row.recent_live_predicted_fill_probability_mean)}</td>
-                      <td class="mono">${row.recent_live_filled_quantity_ratio == null ? "Diagnostic Only" : pct(row.recent_live_filled_quantity_ratio)}</td>
-                      <td class="mono">${row.recent_live_actual_fill_hit_rate == null ? "Diagnostic Only" : pct(row.recent_live_actual_fill_hit_rate)}</td>
-                      <td class="mono">${row.replay_trade_weighted_edge_realization_ratio_diag == null ? "Diagnostic Only" : ratio(row.replay_trade_weighted_edge_realization_ratio_diag)}</td>
-                      <td class="mono">${row.predicted_vs_realized_fill_gap == null ? "Diagnostic Only" : `${row.predicted_vs_realized_fill_gap >= 0 ? "+" : ""}${pct(row.predicted_vs_realized_fill_gap)}`}</td>
-                      <td class="mono">${row.live_vs_replay_fill_gap == null ? "Diagnostic Only" : `${row.live_vs_replay_fill_gap >= 0 ? "+" : ""}${pct(row.live_vs_replay_fill_gap)}`}</td>
-                      <td>
-                        ${renderStatus(row)}
-                        ${
-                          row.manual_reenable_required
-                            ? `<span class="truth-note">Manual re-enable recommended</span>`
-                            : row.block_promotion_recommended
-                              ? `<span class="truth-note">Block promotion recommended</span>`
-                              : !row.live_sample_sufficient
-                                ? `<span class="truth-note">Insufficient Sample</span>`
-                                : ""
-                        }
-                      </td>
-                    </tr>
-                  `,
-                )
-                .join("")}
-            </tbody>
-          </table>
         </div>
-      </section>
-    `
-    : "";
-
-  root.innerHTML = `${familyTable}${laneTable}`;
+        <div class="triage-grid">
+          <div class="triage-metric"><dt>Live sample</dt><dd>${row.recent_live_terminal_intent_count} terminal</dd></div>
+          <div class="triage-metric"><dt>Predicted fill</dt><dd>${predicted == null ? "Diagnostic Only" : pct(predicted)}</dd></div>
+          <div class="triage-metric"><dt>Filled qty ratio</dt><dd>${filled == null ? "Diagnostic Only" : pct(filled)}</dd></div>
+          <div class="triage-metric"><dt>Actual fill hit</dt><dd>${actual == null ? "Diagnostic Only" : pct(actual)}</dd></div>
+          <div class="triage-metric"><dt>Replay diagnostic</dt><dd>${replay == null ? "Diagnostic Only" : ratio(replay)}</dd></div>
+          <div class="triage-metric"><dt>Live vs replay gap</dt><dd>${row.live_vs_replay_fill_gap == null ? "Diagnostic Only" : `${row.live_vs_replay_fill_gap >= 0 ? "+" : ""}${pct(row.live_vs_replay_fill_gap)}`}</dd></div>
+        </div>
+        <p class="${row.live_sample_sufficient ? "muted" : "diagnostic-copy"}">${
+          row.live_sample_sufficient
+            ? (row.recommendation_reason
+              ? `${titleCase(row.recommendation_reason)}${row.recommended_size_multiplier != null && row.recommended_size_multiplier < 1 ? ` · size cap ${pct(row.recommended_size_multiplier)}` : ""}`
+              : "No degradation signal from recent live truth.")
+            : "Diagnostic only. This lane has not earned enough live evidence to deserve capital automatically."
+        }</p>
+      </article>
+    `;
+  }).join("");
 }
 
 function freshnessLabel(seconds, staleAfter) {
@@ -1002,7 +1024,7 @@ function renderLiveExceptions(payload) {
 function renderTrades(items) {
   const root = document.getElementById("trade-list");
   if (!items.length) {
-    root.innerHTML = `<div class="empty">No open trades right now. When risk is live, open inventory will stay visible here without paging.</div>`;
+    root.innerHTML = `<div class="empty">No exposure right now. Open live or paper inventory will stay visible here without paging.</div>`;
     return;
   }
   root.innerHTML = items.map((trade) => `
@@ -1020,9 +1042,10 @@ function renderTrades(items) {
         <div class="chip">${titleCase(trade.status)}</div>
       </header>
       <dl class="trade-grid">
+        <div class="mini"><dt>Mode</dt><dd>${titleCase(trade.mode)}</dd></div>
         <div class="mini"><dt>Quantity</dt><dd>${trade.quantity}</dd></div>
         <div class="mini"><dt>Entry</dt><dd>${money(trade.entry_price)}</dd></div>
-        <div class="mini"><dt>Opened</dt><dd>${relativeAge(trade.created_at)}</dd></div>
+        <div class="mini"><dt>Age</dt><dd>${relativeAge(trade.created_at)}</dd></div>
         <div class="mini"><dt>Placed</dt><dd>${dateTime(trade.created_at)}</dd></div>
       </dl>
       <div class="trade-actions">
@@ -1108,9 +1131,13 @@ async function refreshScreen() {
   refreshPromise = (async () => {
     const [payload, runtime] = await Promise.all([loadDashboard(), loadRuntime()]);
     const family = currentFamily();
+    document.body.dataset.family = family;
     document.getElementById("hero-title").textContent = family === "weather"
-      ? "Weather family budgets, readiness, and paper flow."
-      : "Capital, readiness, and live risk in one screen.";
+      ? "Weather paper cockpit"
+      : "Crypto live cockpit";
+    document.getElementById("hero-copy").textContent = family === "weather"
+      ? "Research-first. Paper evidence before confidence."
+      : "Live risk first. Lane truth before optimism.";
     document.getElementById("family-link-crypto").classList.toggle("active", family === "crypto");
     document.getElementById("family-link-weather").classList.toggle("active", family === "weather");
     const readiness = payload.readiness || {
@@ -1122,6 +1149,7 @@ async function refreshScreen() {
       quarantined_count: 0,
       lanes: [],
     };
+    renderDecisionBar(payload, runtime, readiness);
     renderBankrolls(payload.bankrolls || []);
     renderReadiness(readiness);
     renderLiveSync(payload.live_sync || null);
@@ -1144,7 +1172,10 @@ refreshScreen()
   .then(() => bindOperatorControls(refreshScreen))
   .catch((error) => {
     document.getElementById("hero-status").textContent = "Unavailable";
+    document.getElementById("decision-grid").innerHTML = "";
     document.getElementById("bankroll-list").innerHTML = `<div class="empty">Dashboard load failed: ${error.message}</div>`;
+    document.getElementById("money-view-family").innerHTML = "";
+    document.getElementById("money-view-list").innerHTML = "";
     document.getElementById("lane-list").innerHTML = "";
     document.getElementById("live-sync-list").innerHTML = "";
     document.getElementById("live-sync-strip").innerHTML = "";
