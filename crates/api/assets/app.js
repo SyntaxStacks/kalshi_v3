@@ -50,7 +50,7 @@ function dateTime(value) {
 }
 
 function parseLaneKey(laneKey) {
-  const [exchange, symbol, windowMinutes, side, strategyFamily, modelName] = String(laneKey || "").split(":");
+  const [exchange, symbol, windowMinutes, side, strategyFamily, modelName, expiryRegime] = String(laneKey || "").split(":");
   return {
     exchange,
     symbol: symbol || null,
@@ -58,6 +58,7 @@ function parseLaneKey(laneKey) {
     side: side || null,
     strategyFamily: strategyFamily || null,
     modelName: modelName || null,
+    expiryRegime: expiryRegime || null,
   };
 }
 
@@ -608,8 +609,9 @@ function formatLaneTruthLabel(laneKey) {
   const parsed = parseLaneKey(laneKey);
   const pieces = [];
   if (parsed.symbol) pieces.push(String(parsed.symbol).toUpperCase());
-  if (parsed.side) pieces.push(titleCase(parsed.side));
   if (parsed.windowMinutes) pieces.push(`${parsed.windowMinutes}m`);
+  if (parsed.expiryRegime) pieces.push(titleCase(parsed.expiryRegime));
+  if (parsed.side) pieces.push(titleCase(parsed.side));
   return pieces.join(" · ") || laneKey;
 }
 

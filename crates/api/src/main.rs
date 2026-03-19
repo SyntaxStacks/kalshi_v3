@@ -185,7 +185,12 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
         .pending_execution_intent_status_counts()
         .await
         .unwrap_or_default();
-    let dashboard = state.storage.dashboard_snapshot(None).await.ok();
+    let lane_truth_policy = state.config.lane_truth_recommendation_policy();
+    let dashboard = state
+        .storage
+        .dashboard_snapshot(None, &lane_truth_policy)
+        .await
+        .ok();
 
     let mut out = String::new();
     append_help(
@@ -600,7 +605,12 @@ async fn dashboard(
             &json!({"route": "dashboard", "family": query.family}),
         )
         .await;
-    match state.storage.dashboard_snapshot(family).await {
+    let lane_truth_policy = state.config.lane_truth_recommendation_policy();
+    match state
+        .storage
+        .dashboard_snapshot(family, &lane_truth_policy)
+        .await
+    {
         Ok(snapshot) => Json(json!(snapshot)),
         Err(error) => Json(json!({
             "bankrolls": [],
@@ -674,7 +684,12 @@ async fn runtime(State(state): State<AppState>) -> Json<serde_json::Value> {
         .effective_live_order_placement_enabled(state.config.live_order_placement_enabled)
         .await
         .unwrap_or(false);
-    let dashboard = state.storage.dashboard_snapshot(None).await.ok();
+    let lane_truth_policy = state.config.lane_truth_recommendation_policy();
+    let dashboard = state
+        .storage
+        .dashboard_snapshot(None, &lane_truth_policy)
+        .await
+        .ok();
     let reference_feed_age_seconds = workers
         .iter()
         .find(|worker| worker.service == "ingest")
@@ -975,8 +990,14 @@ fn worker_health_issues(workers: &[WorkerStatusCard], config: &AppConfig) -> Vec
             if worker.status == "failed" {
                 return Some(format!("{service}:failed"));
             }
-            let age_seconds = (Utc::now() - worker.updated_at).num_seconds();
-            if age_seconds > *ttl_seconds {
+            let (age_seconds, stale_budget_seconds) = if worker.status == "running" {
+                let started_at = worker.last_started_at.unwrap_or(worker.updated_at);
+                let in_flight_budget = (*ttl_seconds * 4).max(120);
+                ((Utc::now() - started_at).num_seconds(), in_flight_budget)
+            } else {
+                ((Utc::now() - worker.updated_at).num_seconds(), *ttl_seconds)
+            };
+            if age_seconds > stale_budget_seconds {
                 return Some(format!("{service}:stale:{age_seconds}s"));
             }
             None
@@ -1721,6 +1742,20 @@ mod tests {
             reference_stale_after_seconds: 45,
             live_bankroll_stale_after_seconds: 300,
             live_sync_stale_after_seconds: 45,
+            lane_truth_live_sample_min_terminal_intents: 5,
+            lane_truth_live_sample_min_predicted_fill_samples: 5,
+            lane_truth_watch_min_actual_fill_hit_rate: 0.50,
+            lane_truth_watch_min_filled_quantity_ratio: 0.55,
+            lane_truth_watch_min_predicted_vs_realized_fill_gap: -0.15,
+            lane_truth_watch_min_live_vs_replay_fill_gap: -0.10,
+            lane_truth_watch_min_replay_edge_realization_ratio_diag: 0.5,
+            lane_truth_watch_recommended_size_multiplier: 0.5,
+            lane_truth_quarantine_min_actual_fill_hit_rate: 0.25,
+            lane_truth_quarantine_min_filled_quantity_ratio: 0.35,
+            lane_truth_quarantine_min_predicted_vs_realized_fill_gap: -0.30,
+            lane_truth_quarantine_min_live_vs_replay_fill_gap: -0.25,
+            lane_truth_quarantine_min_replay_edge_realization_ratio_diag: 0.0,
+            lane_truth_quarantine_recommended_size_multiplier: 0.25,
         }
     }
 
@@ -1854,6 +1889,22 @@ mod tests {
             .expect("training worker present");
         training.updated_at = Utc::now() - Duration::seconds(600);
         training.status = "running".to_string();
+
+        assert!(workers_healthy(&workers, &config));
+        assert!(worker_health_issues(&workers, &config).is_empty());
+    }
+
+    #[test]
+    fn workers_healthy_treats_running_decision_pass_as_alive() {
+        let config = test_config();
+        let mut workers = healthy_workers();
+        let decision = workers
+            .iter_mut()
+            .find(|worker| worker.service == "decision")
+            .expect("decision worker present");
+        decision.status = "running".to_string();
+        decision.last_started_at = Some(Utc::now() - Duration::seconds(70));
+        decision.updated_at = Utc::now() - Duration::seconds(70);
 
         assert!(workers_healthy(&workers, &config));
         assert!(worker_health_issues(&workers, &config).is_empty());

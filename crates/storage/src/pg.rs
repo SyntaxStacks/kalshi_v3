@@ -1,8 +1,9 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use common::{
-    BankrollCard, DashboardSnapshot, ExecutionQualitySummary, FamilyExecutionTruthSummary,
-    LaneExecutionTruthSummary, LaneInspectionSnapshot, LaneReplaySummary, LaneState, LaneTradeCard,
+    BankrollCard, DashboardSnapshot, ExecutionQualitySummary, ExpiryRegime,
+    FamilyExecutionTruthSummary, LaneExecutionTruthSummary, LaneInspectionSnapshot,
+    LaneReplaySummary, LaneState, LaneTradeCard, LaneTruthRecommendationPolicy,
     LiveExceptionSnapshot, LiveExchangeSyncSummary, LiveFillCard, LiveIntentCard, LiveOrderCard,
     LivePositionCard, LiveTradeExceptionCard, MarketFamily, MarketFeatureSnapshotRecord,
     ModelInference, OpenTradeSummary, OperatorActionEvent, OperatorControlState, OpportunityCard,
@@ -204,6 +205,7 @@ pub struct TrainedModelArtifactCard {
     pub market_family: MarketFamily,
     pub strategy_family: StrategyFamily,
     pub symbol: Option<String>,
+    pub expiry_regime: Option<ExpiryRegime>,
     pub feature_version: String,
     pub sample_count: i32,
     pub weights: market_models::TrainedLinearWeights,
@@ -226,6 +228,7 @@ pub struct ModelBenchmarkRunInsert {
     pub lane_key: String,
     pub market_family: MarketFamily,
     pub symbol: String,
+    pub expiry_regime: Option<ExpiryRegime>,
     pub strategy_family: StrategyFamily,
     pub source: String,
     pub example_count: i32,
@@ -390,13 +393,16 @@ impl Storage {
     pub async fn dashboard_snapshot(
         &self,
         family: Option<MarketFamily>,
+        lane_truth_policy: &LaneTruthRecommendationPolicy,
     ) -> Result<DashboardSnapshot> {
         let bankrolls = self.list_latest_bankrolls(family).await?;
         let lanes = self.list_lane_states(family).await?;
         let open_trades = self.list_open_trades(family).await?;
         let opportunities = self.list_latest_opportunities(family, 6).await?;
         let execution_quality = self.execution_quality_summary(family).await?;
-        let lane_execution_truth = self.lane_execution_truth_summaries(family, &lanes).await?;
+        let lane_execution_truth = self
+            .lane_execution_truth_summaries(family, &lanes, lane_truth_policy)
+            .await?;
         let family_execution_truth = summarize_family_execution_truth(&lane_execution_truth);
         let live_sync = self.latest_live_exchange_sync_summary().await?;
         let live_exceptions = self.live_exception_snapshot().await?;
@@ -470,6 +476,7 @@ impl Storage {
         .bind(json!({
             "seconds_to_expiry": snapshot.seconds_to_expiry,
             "time_to_expiry_bucket": snapshot.time_to_expiry_bucket,
+            "expiry_regime": snapshot.expiry_regime.map(|value| value.as_key()),
             "settlement_regime": snapshot.settlement_regime,
             "averaging_window_progress": snapshot.averaging_window_progress,
             "threshold_distance_bps_proxy": snapshot.threshold_distance_bps_proxy,
@@ -640,16 +647,17 @@ impl Storage {
         let run_id = sqlx::query_scalar::<_, i64>(
             r#"
             insert into model_benchmark_run (
-                lane_key, market_family, symbol, strategy_family, source, example_count,
-                champion_model_name, details_json
+                lane_key, market_family, symbol, expiry_regime, strategy_family, source,
+                example_count, champion_model_name, details_json
             )
-            values ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
             returning id
             "#,
         )
         .bind(&run.lane_key)
         .bind(SqlMarketFamily::from(run.market_family))
         .bind(&run.symbol)
+        .bind(run.expiry_regime.map(|value| value.as_key()))
         .bind(SqlStrategyFamily::from(run.strategy_family))
         .bind(&run.source)
         .bind(run.example_count)
@@ -828,6 +836,7 @@ impl Storage {
         &self,
         family: Option<MarketFamily>,
         lane_states: &[LaneState],
+        lane_truth_policy: &LaneTruthRecommendationPolicy,
     ) -> Result<Vec<LaneExecutionTruthSummary>> {
         let family_key = family.map(|value| SqlMarketFamily::from(value).as_key().to_string());
         let live_rows = sqlx::query_as::<_, LiveLaneExecutionTruthRow>(
@@ -883,6 +892,7 @@ impl Storage {
             &live_rows,
             &replay_rows,
             lane_states,
+            lane_truth_policy,
         ))
     }
 
@@ -1156,6 +1166,7 @@ impl Storage {
         market_family: MarketFamily,
         strategy_family: StrategyFamily,
         symbol: Option<&str>,
+        expiry_regime: Option<ExpiryRegime>,
         feature_version: &str,
         sample_count: i32,
         weights: &market_models::TrainedLinearWeights,
@@ -1164,10 +1175,16 @@ impl Storage {
         sqlx::query(
             r#"
             insert into trained_model_artifact (
-                model_name, market_family, strategy_family, symbol, feature_version, sample_count, weights_json, metrics_json, updated_at
+                model_name, market_family, strategy_family, symbol, expiry_regime, feature_version, sample_count, weights_json, metrics_json, updated_at
             )
-            values ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, now())
-            on conflict (model_name, strategy_family, market_family, coalesce(symbol, '')) do update
+            values ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, now())
+            on conflict (
+                model_name,
+                strategy_family,
+                market_family,
+                (coalesce(symbol, '')),
+                (coalesce(expiry_regime, ''))
+            ) do update
             set feature_version = excluded.feature_version,
                 sample_count = excluded.sample_count,
                 weights_json = excluded.weights_json,
@@ -1179,6 +1196,7 @@ impl Storage {
         .bind(SqlMarketFamily::from(market_family))
         .bind(SqlStrategyFamily::from(strategy_family))
         .bind(symbol.map(|value| value.to_lowercase()))
+        .bind(expiry_regime.map(|value| value.as_key()))
         .bind(feature_version)
         .bind(sample_count)
         .bind(serde_json::to_value(weights)?)
@@ -1194,15 +1212,17 @@ impl Storage {
         market_family: MarketFamily,
         strategy_family: StrategyFamily,
         symbol: Option<&str>,
+        expiry_regime: Option<ExpiryRegime>,
     ) -> Result<Option<TrainedModelArtifactCard>> {
         let row = sqlx::query_as::<_, TrainedModelArtifactRow>(
             r#"
-            select model_name, market_family, strategy_family, symbol, feature_version, sample_count, weights_json, metrics_json, updated_at
+            select model_name, market_family, strategy_family, symbol, expiry_regime, feature_version, sample_count, weights_json, metrics_json, updated_at
             from trained_model_artifact
             where model_name = $1
               and market_family = $2
               and strategy_family = $3
               and symbol is not distinct from $4
+              and expiry_regime is not distinct from $5
             order by updated_at desc, id desc
             limit 1
             "#,
@@ -1211,6 +1231,7 @@ impl Storage {
         .bind(SqlMarketFamily::from(market_family))
         .bind(SqlStrategyFamily::from(strategy_family))
         .bind(symbol.map(|value| value.to_lowercase()))
+        .bind(expiry_regime.map(|value| value.as_key()))
         .fetch_optional(&self.pool)
         .await?;
         row.map(TryInto::try_into).transpose()
@@ -1332,6 +1353,7 @@ impl Storage {
         market_family: MarketFamily,
         symbol: &str,
         strategy_family: StrategyFamily,
+        expiry_regime: Option<ExpiryRegime>,
     ) -> Result<Option<SymbolLanePolicy>> {
         let pattern = format!("kalshi:{}:%", symbol.to_lowercase());
         let family = match strategy_family {
@@ -1347,6 +1369,10 @@ impl Storage {
             where market_family = $1
               and lane_key like $2
               and lane_key like $3
+              and (
+                    ($4::text is null and split_part(lane_key, ':', 7) = '')
+                    or split_part(lane_key, ':', 7) = $4
+                  )
               and current_champion_model is not null
             order by updated_at desc
             limit 1
@@ -1355,6 +1381,7 @@ impl Storage {
         .bind(SqlMarketFamily::from(market_family))
         .bind(pattern)
         .bind(format!("%:{}:%", family))
+        .bind(expiry_regime.map(|value| value.as_key()))
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(Into::into))
@@ -3499,7 +3526,7 @@ impl Storage {
         strategy_family: StrategyFamily,
     ) -> Result<Option<String>> {
         Ok(self
-            .latest_lane_policy_for_symbol(market_family, symbol, strategy_family)
+            .latest_lane_policy_for_symbol(market_family, symbol, strategy_family, None)
             .await?
             .and_then(|policy| policy.current_champion_model))
     }
@@ -4130,6 +4157,7 @@ struct TrainedModelArtifactRow {
     market_family: SqlMarketFamily,
     strategy_family: SqlStrategyFamily,
     symbol: Option<String>,
+    expiry_regime: Option<String>,
     feature_version: String,
     sample_count: i32,
     weights_json: serde_json::Value,
@@ -4796,6 +4824,9 @@ impl TryFrom<FeatureSnapshotRow> for MarketFeatureSnapshotRecord {
             window_minutes: value.window_minutes,
             seconds_to_expiry: value.seconds_to_expiry,
             time_to_expiry_bucket: value.time_to_expiry_bucket,
+            expiry_regime: json_optional_text(&settlement, "expiry_regime")
+                .as_deref()
+                .and_then(parse_expiry_regime),
             market_prob: json_f64(&venue, "market_prob"),
             best_bid: json_f64(&venue, "best_bid"),
             best_ask: json_f64(&venue, "best_ask"),
@@ -5109,6 +5140,7 @@ impl TryFrom<TrainedModelArtifactRow> for TrainedModelArtifactCard {
             market_family: value.market_family.into(),
             strategy_family: StrategyFamily::from(value.strategy_family),
             symbol: value.symbol,
+            expiry_regime: value.expiry_regime.as_deref().and_then(parse_expiry_regime),
             feature_version: value.feature_version,
             sample_count: value.sample_count,
             weights: serde_json::from_value(value.weights_json)?,
@@ -5280,6 +5312,15 @@ fn parse_market_family(value: &str) -> MarketFamily {
         "crypto" => MarketFamily::Crypto,
         "weather" => MarketFamily::Weather,
         _ => MarketFamily::All,
+    }
+}
+
+fn parse_expiry_regime(value: &str) -> Option<ExpiryRegime> {
+    match value {
+        "early" => Some(ExpiryRegime::Early),
+        "mid" => Some(ExpiryRegime::Mid),
+        "late" => Some(ExpiryRegime::Late),
+        _ => None,
     }
 }
 
@@ -5517,6 +5558,7 @@ fn build_lane_execution_truth_summaries(
     live_rows: &[LiveLaneExecutionTruthRow],
     replay_rows: &[ReplayLaneExecutionTruthRow],
     lane_states: &[LaneState],
+    lane_truth_policy: &LaneTruthRecommendationPolicy,
 ) -> Vec<LaneExecutionTruthSummary> {
     use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -5558,7 +5600,7 @@ fn build_lane_execution_truth_summaries(
         .into_values()
         .map(|aggregate| {
             let lane_state = lane_state_map.get(aggregate.lane_key.as_str()).copied();
-            lane_execution_truth_summary(aggregate, lane_state)
+            lane_execution_truth_summary(aggregate, lane_state, lane_truth_policy)
         })
         .collect::<Vec<_>>();
 
@@ -5578,6 +5620,7 @@ fn build_lane_execution_truth_summaries(
 fn lane_execution_truth_summary(
     aggregate: LaneExecutionTruthAggregate,
     lane_state: Option<&LaneState>,
+    lane_truth_policy: &LaneTruthRecommendationPolicy,
 ) -> LaneExecutionTruthSummary {
     let predicted_fill_probability_mean = if aggregate.recent_live_predicted_fill_sample_count > 0 {
         Some(
@@ -5619,8 +5662,10 @@ fn lane_execution_truth_summary(
     let live_vs_replay_fill_gap = replay_fill_rate
         .zip(actual_fill_hit_rate)
         .map(|(replay, live)| live - replay);
-    let live_sample_sufficient = aggregate.recent_live_terminal_intent_count >= 5
-        && aggregate.recent_live_predicted_fill_sample_count >= 5;
+    let live_sample_sufficient = aggregate.recent_live_terminal_intent_count
+        >= lane_truth_policy.live_sample_min_terminal_intents
+        && aggregate.recent_live_predicted_fill_sample_count
+            >= lane_truth_policy.live_sample_min_predicted_fill_samples;
     let recommendation = lane_execution_truth_recommendation(
         live_sample_sufficient,
         lane_state.and_then(|lane| Some(lane.promotion_state)),
@@ -5629,6 +5674,7 @@ fn lane_execution_truth_summary(
         replay_edge,
         predicted_vs_realized_fill_gap,
         live_vs_replay_fill_gap,
+        lane_truth_policy,
     );
 
     LaneExecutionTruthSummary {
@@ -5812,6 +5858,7 @@ fn lane_execution_truth_recommendation(
     replay_edge: Option<f64>,
     predicted_vs_realized_fill_gap: Option<f64>,
     live_vs_replay_fill_gap: Option<f64>,
+    lane_truth_policy: &LaneTruthRecommendationPolicy,
 ) -> LaneExecutionTruthRecommendation {
     if !live_sample_sufficient {
         return LaneExecutionTruthRecommendation {
@@ -5830,11 +5877,17 @@ fn lane_execution_truth_recommendation(
     let replay_gap = live_vs_replay_fill_gap.unwrap_or_default();
     let replay_edge = replay_edge.unwrap_or(0.0);
 
-    if actual_fill_hit_rate < 0.25
-        || filled_quantity_ratio < 0.35
-        || predicted_gap < -0.30
-        || replay_gap < -0.25
-        || replay_edge < 0.0
+    if actual_fill_hit_rate < lane_truth_policy.quarantine.min_actual_fill_hit_rate
+        || filled_quantity_ratio < lane_truth_policy.quarantine.min_filled_quantity_ratio
+        || predicted_gap
+            < lane_truth_policy
+                .quarantine
+                .min_predicted_vs_realized_fill_gap
+        || replay_gap < lane_truth_policy.quarantine.min_live_vs_replay_fill_gap
+        || replay_edge
+            < lane_truth_policy
+                .quarantine
+                .min_replay_edge_realization_ratio_diag
     {
         let is_live_lane = matches!(
             promotion_state,
@@ -5845,44 +5898,71 @@ fn lane_execution_truth_recommendation(
             degrade_live_recommended: true,
             block_promotion_recommended: true,
             manual_reenable_required: is_live_lane,
-            recommended_size_multiplier: Some(0.25),
-            recommendation_reason: Some(if replay_edge < 0.0 {
-                "live_truth_invalidates_replay".to_string()
-            } else if predicted_gap < -0.30 {
-                "predicted_fills_overstated".to_string()
-            } else if actual_fill_hit_rate < 0.25 {
-                "live_fill_hit_rate_too_low".to_string()
-            } else if filled_quantity_ratio < 0.35 {
-                "filled_quantity_ratio_too_low".to_string()
-            } else {
-                "live_fill_vs_replay_gap_too_negative".to_string()
-            }),
+            recommended_size_multiplier: Some(
+                lane_truth_policy.quarantine.recommended_size_multiplier,
+            ),
+            recommendation_reason: Some(
+                if replay_edge
+                    < lane_truth_policy
+                        .quarantine
+                        .min_replay_edge_realization_ratio_diag
+                {
+                    "live_truth_invalidates_replay".to_string()
+                } else if predicted_gap
+                    < lane_truth_policy
+                        .quarantine
+                        .min_predicted_vs_realized_fill_gap
+                {
+                    "predicted_fills_overstated".to_string()
+                } else if actual_fill_hit_rate
+                    < lane_truth_policy.quarantine.min_actual_fill_hit_rate
+                {
+                    "live_fill_hit_rate_too_low".to_string()
+                } else if filled_quantity_ratio
+                    < lane_truth_policy.quarantine.min_filled_quantity_ratio
+                {
+                    "filled_quantity_ratio_too_low".to_string()
+                } else {
+                    "live_fill_vs_replay_gap_too_negative".to_string()
+                },
+            ),
         };
     }
 
-    if actual_fill_hit_rate < 0.50
-        || filled_quantity_ratio < 0.55
-        || predicted_gap < -0.15
-        || replay_gap < -0.10
-        || replay_edge < 0.5
+    if actual_fill_hit_rate < lane_truth_policy.watch.min_actual_fill_hit_rate
+        || filled_quantity_ratio < lane_truth_policy.watch.min_filled_quantity_ratio
+        || predicted_gap < lane_truth_policy.watch.min_predicted_vs_realized_fill_gap
+        || replay_gap < lane_truth_policy.watch.min_live_vs_replay_fill_gap
+        || replay_edge
+            < lane_truth_policy
+                .watch
+                .min_replay_edge_realization_ratio_diag
     {
         return LaneExecutionTruthRecommendation {
             status: "watch".to_string(),
             degrade_live_recommended: true,
             block_promotion_recommended: true,
             manual_reenable_required: false,
-            recommended_size_multiplier: Some(0.5),
-            recommendation_reason: Some(if replay_edge < 0.5 {
-                "replay_edge_diag_soft".to_string()
-            } else if predicted_gap < -0.15 {
-                "predicted_fill_gap_widening".to_string()
-            } else if actual_fill_hit_rate < 0.50 {
-                "live_fill_hit_rate_soft".to_string()
-            } else if filled_quantity_ratio < 0.55 {
-                "filled_quantity_ratio_soft".to_string()
-            } else {
-                "live_fill_vs_replay_gap_soft".to_string()
-            }),
+            recommended_size_multiplier: Some(lane_truth_policy.watch.recommended_size_multiplier),
+            recommendation_reason: Some(
+                if replay_edge
+                    < lane_truth_policy
+                        .watch
+                        .min_replay_edge_realization_ratio_diag
+                {
+                    "replay_edge_diag_soft".to_string()
+                } else if predicted_gap < lane_truth_policy.watch.min_predicted_vs_realized_fill_gap
+                {
+                    "predicted_fill_gap_widening".to_string()
+                } else if actual_fill_hit_rate < lane_truth_policy.watch.min_actual_fill_hit_rate {
+                    "live_fill_hit_rate_soft".to_string()
+                } else if filled_quantity_ratio < lane_truth_policy.watch.min_filled_quantity_ratio
+                {
+                    "filled_quantity_ratio_soft".to_string()
+                } else {
+                    "live_fill_vs_replay_gap_soft".to_string()
+                },
+            ),
         };
     }
 
@@ -5962,7 +6042,10 @@ mod tests {
         summarize_live_execution_quality, summarize_replay_execution_quality,
     };
     use chrono::Utc;
-    use common::{LaneState, MarketFamily, PromotionState};
+    use common::{
+        LaneState, LaneTruthRecommendationPolicy, LaneTruthThresholdBand, MarketFamily,
+        PromotionState,
+    };
 
     fn lane_state(lane_key: &str, promotion_state: PromotionState) -> LaneState {
         LaneState {
@@ -6006,6 +6089,29 @@ mod tests {
             trade_count,
             fill_rate,
             edge_realization_ratio,
+        }
+    }
+
+    fn lane_truth_policy() -> LaneTruthRecommendationPolicy {
+        LaneTruthRecommendationPolicy {
+            live_sample_min_terminal_intents: 5,
+            live_sample_min_predicted_fill_samples: 5,
+            watch: LaneTruthThresholdBand {
+                min_actual_fill_hit_rate: 0.50,
+                min_filled_quantity_ratio: 0.55,
+                min_predicted_vs_realized_fill_gap: -0.15,
+                min_live_vs_replay_fill_gap: -0.10,
+                min_replay_edge_realization_ratio_diag: 0.5,
+                recommended_size_multiplier: 0.5,
+            },
+            quarantine: LaneTruthThresholdBand {
+                min_actual_fill_hit_rate: 0.25,
+                min_filled_quantity_ratio: 0.35,
+                min_predicted_vs_realized_fill_gap: -0.30,
+                min_live_vs_replay_fill_gap: -0.25,
+                min_replay_edge_realization_ratio_diag: 0.0,
+                recommended_size_multiplier: 0.25,
+            },
         }
     }
 
@@ -6144,8 +6250,9 @@ mod tests {
         let replay_rows = vec![replay_lane_row(lane, 40, 0.7, 0.8)];
         let lane_states = vec![lane_state(lane, PromotionState::LiveMicro)];
 
+        let policy = lane_truth_policy();
         let summaries =
-            build_lane_execution_truth_summaries(&live_rows, &replay_rows, &lane_states);
+            build_lane_execution_truth_summaries(&live_rows, &replay_rows, &lane_states, &policy);
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].status, "quarantine_candidate");
         assert!(summaries[0].degrade_live_recommended);
@@ -6158,7 +6265,8 @@ mod tests {
     fn lane_execution_truth_ignores_replay_only_rows_without_tracking_scope() {
         let lane = "kalshi:btc:15:buy_yes:directional_settlement:trained_linear_v1";
         let replay_rows = vec![replay_lane_row(lane, 100, 0.6, 0.9)];
-        let summaries = build_lane_execution_truth_summaries(&[], &replay_rows, &[]);
+        let policy = lane_truth_policy();
+        let summaries = build_lane_execution_truth_summaries(&[], &replay_rows, &[], &policy);
         assert!(summaries.is_empty());
     }
 
@@ -6179,8 +6287,9 @@ mod tests {
             lane_state(good_lane, PromotionState::PaperActive),
         ];
 
+        let policy = lane_truth_policy();
         let lane_summaries =
-            build_lane_execution_truth_summaries(&live_rows, &replay_rows, &lane_states);
+            build_lane_execution_truth_summaries(&live_rows, &replay_rows, &lane_states, &policy);
         let family_summaries = summarize_family_execution_truth(&lane_summaries);
         assert_eq!(family_summaries.len(), 1);
         assert_eq!(family_summaries[0].market_family, MarketFamily::Crypto);
@@ -6200,8 +6309,51 @@ mod tests {
             replay_lane_row(challenger_lane, 100, 0.7, 1.1),
         ];
 
-        let summaries = build_lane_execution_truth_summaries(&[], &replay_rows, &lane_states);
+        let policy = lane_truth_policy();
+        let summaries =
+            build_lane_execution_truth_summaries(&[], &replay_rows, &lane_states, &policy);
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].lane_key, active_lane);
+    }
+
+    #[test]
+    fn lane_execution_truth_respects_configured_policy_thresholds() {
+        let lane = "kalshi:btc:15:buy_yes:directional_settlement:trained_linear_v1";
+        let live_rows = (0..5)
+            .map(|_| live_lane_row(lane, Some(0.7), 1.0, 0.55))
+            .collect::<Vec<_>>();
+        let replay_rows = vec![replay_lane_row(lane, 40, 0.7, 0.55)];
+        let lane_states = vec![lane_state(lane, PromotionState::PaperActive)];
+        let mut policy = lane_truth_policy();
+        policy.watch.min_actual_fill_hit_rate = 0.60;
+        policy.watch.min_filled_quantity_ratio = 0.60;
+
+        let summaries =
+            build_lane_execution_truth_summaries(&live_rows, &replay_rows, &lane_states, &policy);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].status, "watch");
+        assert_eq!(summaries[0].recommended_size_multiplier, Some(0.5));
+        assert_eq!(
+            summaries[0].recommendation_reason.as_deref(),
+            Some("filled_quantity_ratio_soft")
+        );
+    }
+
+    #[test]
+    fn lane_execution_truth_respects_configured_sample_floor() {
+        let lane = "kalshi:sol:15:buy_no:directional_settlement:trained_linear_v1";
+        let live_rows = (0..5)
+            .map(|_| live_lane_row(lane, Some(0.7), 1.0, 1.0))
+            .collect::<Vec<_>>();
+        let lane_states = vec![lane_state(lane, PromotionState::PaperActive)];
+        let mut policy = lane_truth_policy();
+        policy.live_sample_min_terminal_intents = 6;
+        policy.live_sample_min_predicted_fill_samples = 6;
+
+        let summaries =
+            build_lane_execution_truth_summaries(&live_rows, &[], &lane_states, &policy);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].status, "insufficient_sample");
+        assert!(!summaries[0].live_sample_sufficient);
     }
 }

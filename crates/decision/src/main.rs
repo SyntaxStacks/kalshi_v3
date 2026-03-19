@@ -1,8 +1,8 @@
 use anyhow::Result;
 use chrono::{Duration, Utc};
 use common::{
-    AppConfig, MarketFamily, ModelInference, OpportunityDecision, PromotionState, StrategyFamily,
-    TradeMode, lane_key,
+    AppConfig, ExpiryRegime, MarketFamily, ModelInference, OpportunityDecision, PromotionState,
+    StrategyFamily, TradeMode, lane_key, lane_key_with_regime,
 };
 use market_data::{ContractSide, QueueSideSummary, QueueSnapshot};
 use market_models::{
@@ -16,6 +16,8 @@ use std::time::Instant;
 use storage::TrainedModelArtifactCard;
 use tracing::{info, warn};
 
+use common::ExpiryRegime as Regime;
+
 const WEATHER_MODEL_NAME: &str = "weather_threshold_v1";
 const EXECUTION_SCORE_THRESHOLD_BPS: f64 = 10.0;
 const REDIS_QUEUE_PREFIX: &str = "v3:queue:";
@@ -26,13 +28,6 @@ struct TrainedDecisionPolicy {
     min_confidence: f64,
     min_venue_quality: f64,
     min_seconds_to_expiry_scaled: f64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Regime {
-    Early,
-    Mid,
-    Late,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -67,6 +62,9 @@ async fn main() -> Result<()> {
     ));
     loop {
         interval.tick().await;
+        storage
+            .upsert_worker_started("decision", &json!({"phase": "decision_pass"}))
+            .await?;
         match decide_once(&config, &storage).await {
             Ok((decision_count, approved_count)) => {
                 storage
@@ -104,8 +102,10 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
     );
     let mut decisions = 0usize;
     let mut approved_count = 0usize;
-    let mut trained_artifact_cache: HashMap<String, Option<TrainedModelArtifactCard>> =
-        HashMap::new();
+    let mut trained_artifact_cache: HashMap<
+        (String, Option<ExpiryRegime>),
+        Option<TrainedModelArtifactCard>,
+    > = HashMap::new();
     let paper_crypto_bankroll = storage
         .latest_family_bankroll(TradeMode::Paper, MarketFamily::Crypto)
         .await?
@@ -161,6 +161,7 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
                     MarketFamily::Weather,
                     &snapshot.symbol,
                     StrategyFamily::DirectionalSettlement,
+                    None,
                 )
                 .await?;
             let model_name = lane_policy
@@ -334,30 +335,56 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
                 snapshot.market_family,
                 &snapshot.symbol,
                 StrategyFamily::DirectionalSettlement,
+                snapshot.expiry_regime,
             )
             .await?;
-        let model_name = lane_policy
+        let regime = snapshot
+            .expiry_regime
+            .unwrap_or_else(|| get_regime(i64::from(snapshot.seconds_to_expiry)));
+        let fallback_lane_policy = if lane_policy.is_none() && regime != Regime::Late {
+            storage
+                .latest_lane_policy_for_symbol(
+                    snapshot.market_family,
+                    &snapshot.symbol,
+                    StrategyFamily::DirectionalSettlement,
+                    None,
+                )
+                .await?
+        } else {
+            None
+        };
+        let effective_lane_policy = lane_policy.as_ref().or(fallback_lane_policy.as_ref());
+        let model_name = effective_lane_policy
             .as_ref()
             .and_then(|policy| policy.current_champion_model.clone())
             .unwrap_or_else(|| BASELINE_LOGIT_V1.to_string());
-        let regime = get_regime(i64::from(snapshot.seconds_to_expiry));
         let feature_vector = regime_adjusted_feature_vector(&snapshot, regime);
         let trained_artifact = if uses_trained_linear_weights(&model_name) {
-            if !trained_artifact_cache.contains_key(&snapshot.symbol) {
-                let artifact = storage
+            let cache_key = (snapshot.symbol.clone(), Some(regime));
+            if !trained_artifact_cache.contains_key(&cache_key) {
+                let mut artifact = storage
                     .latest_trained_model_artifact(
                         TRAINED_LINEAR_V1,
                         snapshot.market_family,
                         StrategyFamily::DirectionalSettlement,
                         Some(&snapshot.symbol),
+                        Some(regime),
                     )
                     .await?;
-                trained_artifact_cache.insert(snapshot.symbol.clone(), artifact);
+                if artifact.is_none() && regime != Regime::Late {
+                    artifact = storage
+                        .latest_trained_model_artifact(
+                            TRAINED_LINEAR_V1,
+                            snapshot.market_family,
+                            StrategyFamily::DirectionalSettlement,
+                            Some(&snapshot.symbol),
+                            None,
+                        )
+                        .await?;
+                }
+                trained_artifact_cache.insert(cache_key.clone(), artifact);
             }
-            trained_artifact_cache
-                .get(&snapshot.symbol)
-                .cloned()
-                .flatten()
+            trained_artifact_cache.get(&cache_key).cloned().flatten()
         } else {
             None
         };
@@ -423,13 +450,14 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
         let current_execution_score = compute_execution_score(&execution_score);
         let edge = signed_edge;
         let side = if edge >= 0.0 { "buy_yes" } else { "buy_no" };
-        let lane = lane_key(
+        let lane = lane_key_with_regime(
             "kalshi",
             &snapshot.symbol.to_lowercase(),
             snapshot.window_minutes as u32,
             side,
             StrategyFamily::DirectionalSettlement,
             &model_name,
+            Some(regime),
         );
         if let Some(last_created_at) = storage.latest_decision_at_for_lane(&lane).await? {
             if should_skip_recent_lane_decision(last_created_at, config.decision_poll_seconds) {
@@ -460,7 +488,7 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
         if i64::from(snapshot.seconds_to_expiry) < min_seconds_to_expiry {
             reasons.push("too_close_to_expiry".to_string());
         }
-        let promotion_state = lane_policy.as_ref().map(|policy| policy.promotion_state);
+        let promotion_state = effective_lane_policy.map(|policy| policy.promotion_state);
         match promotion_state {
             Some(PromotionState::Quarantined) => {
                 reasons.push("lane_quarantined".to_string());
@@ -476,6 +504,9 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
             None => {
                 reasons.push("lane_untrained".to_string());
             }
+        }
+        if regime == Regime::Late {
+            reasons.push("late_regime_diagnostic_only".to_string());
         }
 
         let intent_mode = target_intent_mode(config, live_order_placement_enabled, promotion_state);
@@ -577,7 +608,7 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
                 "trade_consumption_rate": snapshot.trade_consumption_rate,
                 "cancel_rate": snapshot.cancel_rate,
                 "queue_decay_rate": snapshot.queue_decay_rate,
-                "regime": regime_name(regime),
+                "expiry_regime": regime_name(regime),
                 "crossing_probability": crossing_probability,
                 "raw_edge_bps": raw_edge_bps,
                 "execution_score_bps": current_execution_score,
@@ -905,19 +936,11 @@ fn regime_adjusted_feature_vector(
 }
 
 fn get_regime(seconds_to_expiry: i64) -> Regime {
-    match seconds_to_expiry {
-        s if s > 300 => Regime::Early,
-        s if s > 60 => Regime::Mid,
-        _ => Regime::Late,
-    }
+    Regime::from_seconds_to_expiry(seconds_to_expiry)
 }
 
 fn regime_name(regime: Regime) -> &'static str {
-    match regime {
-        Regime::Early => "early",
-        Regime::Mid => "mid",
-        Regime::Late => "late",
-    }
+    regime.as_key()
 }
 
 fn crossing_probability_v1(features: &FeatureVector, regime: Regime) -> f64 {
@@ -1177,6 +1200,20 @@ mod tests {
             reference_stale_after_seconds: 45,
             live_bankroll_stale_after_seconds: 300,
             live_sync_stale_after_seconds: 45,
+            lane_truth_live_sample_min_terminal_intents: 5,
+            lane_truth_live_sample_min_predicted_fill_samples: 5,
+            lane_truth_watch_min_actual_fill_hit_rate: 0.50,
+            lane_truth_watch_min_filled_quantity_ratio: 0.55,
+            lane_truth_watch_min_predicted_vs_realized_fill_gap: -0.15,
+            lane_truth_watch_min_live_vs_replay_fill_gap: -0.10,
+            lane_truth_watch_min_replay_edge_realization_ratio_diag: 0.5,
+            lane_truth_watch_recommended_size_multiplier: 0.5,
+            lane_truth_quarantine_min_actual_fill_hit_rate: 0.25,
+            lane_truth_quarantine_min_filled_quantity_ratio: 0.35,
+            lane_truth_quarantine_min_predicted_vs_realized_fill_gap: -0.30,
+            lane_truth_quarantine_min_live_vs_replay_fill_gap: -0.25,
+            lane_truth_quarantine_min_replay_edge_realization_ratio_diag: 0.0,
+            lane_truth_quarantine_recommended_size_multiplier: 0.25,
         }
     }
 
@@ -1230,6 +1267,7 @@ mod tests {
             window_minutes: 15,
             seconds_to_expiry,
             time_to_expiry_bucket: "under_15m".to_string(),
+            expiry_regime: Some(Regime::from_seconds_to_expiry(i64::from(seconds_to_expiry))),
             market_prob: 0.5,
             best_bid: 0.49,
             best_ask: 0.51,

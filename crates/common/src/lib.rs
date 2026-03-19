@@ -3,16 +3,17 @@ pub mod domain;
 pub mod events;
 pub mod kalshi;
 
-pub use config::AppConfig;
+pub use config::{AppConfig, LaneTruthRecommendationPolicy, LaneTruthThresholdBand};
 pub use domain::{
     BankrollCard, CriticalAlertNotification, DashboardSnapshot, ExecutionIntent,
-    ExecutionQualitySummary, FamilyExecutionTruthSummary, HealthSnapshot, KalshiMarketState,
-    LaneExecutionTruthSummary, LaneInspectionSnapshot, LaneReplaySummary, LaneState, LaneTradeCard,
-    LiveExceptionSnapshot, LiveExchangeSyncSummary, LiveFillCard, LiveIntentCard, LiveOrderCard,
-    LivePositionCard, LiveTradeExceptionCard, MarketFamily, MarketFeatureSnapshotRecord,
-    ModelInference, OpenTradeSummary, OperatorActionEvent, OperatorControlState, OpportunityCard,
-    OpportunityDecision, PromotionState, ReadinessSummary, ReferencePriceState,
-    ReplayBenchmarkCard, RuntimeAlarm, StrategyFamily, TradeMode, WeatherReferenceState, lane_key,
+    ExecutionQualitySummary, ExpiryRegime, FamilyExecutionTruthSummary, HealthSnapshot,
+    KalshiMarketState, LaneExecutionTruthSummary, LaneInspectionSnapshot, LaneReplaySummary,
+    LaneState, LaneTradeCard, LiveExceptionSnapshot, LiveExchangeSyncSummary, LiveFillCard,
+    LiveIntentCard, LiveOrderCard, LivePositionCard, LiveTradeExceptionCard, MarketFamily,
+    MarketFeatureSnapshotRecord, ModelInference, OpenTradeSummary, OperatorActionEvent,
+    OperatorControlState, OpportunityCard, OpportunityDecision, ParsedLaneKey, PromotionState,
+    ReadinessSummary, ReferencePriceState, ReplayBenchmarkCard, RuntimeAlarm, StrategyFamily,
+    TradeMode, WeatherReferenceState, lane_key, lane_key_with_regime, parse_lane_key,
 };
 pub use events::subjects;
 pub use kalshi::{

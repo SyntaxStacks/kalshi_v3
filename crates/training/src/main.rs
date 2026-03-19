@@ -1,8 +1,8 @@
 use anyhow::Result;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use common::{
-    AppConfig, LaneState, MarketFamily, MarketFeatureSnapshotRecord, PromotionState,
-    StrategyFamily, lane_key,
+    AppConfig, ExpiryRegime, LaneState, MarketFamily, MarketFeatureSnapshotRecord, PromotionState,
+    StrategyFamily, lane_key, lane_key_with_regime,
 };
 use market_models::{
     BASELINE_LOGIT_V1, FeatureVector, TRAINED_LINEAR_CONTRARIAN_V1, TRAINED_LINEAR_V1,
@@ -139,159 +139,173 @@ async fn training_pass(config: &AppConfig, storage: &storage::Storage) -> Result
                 }
             }
         }
-        let avg_execution_quality = if examples.is_empty() {
-            0.0
-        } else {
-            examples
-                .iter()
-                .map(|example| example.features.venue_quality_score)
-                .sum::<f64>()
-                / examples.len() as f64
-        };
-
         if examples.len() < 4 {
             continue;
         }
 
-        let lane = lane_key(
-            "kalshi",
-            &symbol,
-            15,
-            "buy_yes",
-            StrategyFamily::DirectionalSettlement,
-            BASELINE_LOGIT_V1,
-        );
-        let trained_weights = train_symbol_linear_weights(&examples);
-        let trained_policy = optimize_trained_policy(&lane, &examples, &trained_weights);
-        storage
-            .upsert_trained_model_artifact(
-                TRAINED_LINEAR_V1,
-                MarketFamily::Crypto,
+        for regime in [ExpiryRegime::Early, ExpiryRegime::Mid, ExpiryRegime::Late] {
+            let regime_examples = regime_examples(&examples, regime, &symbol);
+            if regime_examples.len() < 4 {
+                continue;
+            }
+            let regime_execution_quality = regime_examples
+                .iter()
+                .map(|example| example.features.venue_quality_score)
+                .sum::<f64>()
+                / regime_examples.len() as f64;
+
+            let lane = lane_key_with_regime(
+                "kalshi",
+                &symbol,
+                15,
+                "buy_yes",
                 StrategyFamily::DirectionalSettlement,
-                Some(&symbol),
-                "trained_linear_symbol_v1",
-                examples.len() as i32,
-                &trained_weights,
-                &json!({
-                    "symbol": symbol,
-                    "training_examples": examples.len(),
-                    "policy": {
-                        "min_edge": trained_policy.min_edge,
-                        "min_confidence": trained_policy.min_confidence,
-                        "min_venue_quality": trained_policy.min_venue_quality,
-                        "min_seconds_to_expiry_scaled": trained_policy.min_seconds_to_expiry_scaled,
-                        "execution_cost": trained_policy.execution_cost
-                    }
-                }),
+                BASELINE_LOGIT_V1,
+                Some(regime),
+            );
+            let trained_weights = train_symbol_linear_weights(&regime_examples);
+            let trained_policy = optimize_trained_policy(&lane, &regime_examples, &trained_weights);
+            storage
+                .upsert_trained_model_artifact(
+                    TRAINED_LINEAR_V1,
+                    MarketFamily::Crypto,
+                    StrategyFamily::DirectionalSettlement,
+                    Some(&symbol),
+                    Some(regime),
+                    "trained_linear_symbol_v1",
+                    regime_examples.len() as i32,
+                    &trained_weights,
+                    &json!({
+                        "symbol": symbol,
+                        "expiry_regime": regime.as_key(),
+                        "training_examples": regime_examples.len(),
+                        "policy": {
+                            "min_edge": trained_policy.min_edge,
+                            "min_confidence": trained_policy.min_confidence,
+                            "min_venue_quality": trained_policy.min_venue_quality,
+                            "min_seconds_to_expiry_scaled": trained_policy.min_seconds_to_expiry_scaled,
+                            "execution_cost": trained_policy.execution_cost
+                        }
+                    }),
+                )
+                .await?;
+            let Some(leaderboard) = benchmark_model_set(
+                &lane,
+                supported_models(),
+                &regime_examples,
+                ReplayPolicy::directional_default(),
+                Some(&trained_weights),
+                Some(trained_policy),
+            ) else {
+                continue;
+            };
+
+            let Some(champion) = pick_champion(&leaderboard) else {
+                continue;
+            };
+            let champion_lane = lane_key_with_regime(
+                "kalshi",
+                &symbol,
+                15,
+                "buy_yes",
+                StrategyFamily::DirectionalSettlement,
+                &champion.model_name,
+                Some(regime),
+            );
+            persist_model_benchmark_run(
+                storage,
+                &champion_lane,
+                &symbol,
+                Some(regime),
+                StrategyFamily::DirectionalSettlement,
+                if resolved_history_exists {
+                    "historical_resolved"
+                } else {
+                    "live_recent_snapshots"
+                },
+                regime_examples.len(),
+                &leaderboard,
             )
             .await?;
-        let Some(leaderboard) = benchmark_model_set(
-            &lane,
-            supported_models(),
-            &examples,
-            ReplayPolicy::directional_default(),
-            Some(&trained_weights),
-            Some(trained_policy),
-        ) else {
-            continue;
-        };
-
-        let Some(champion) = pick_champion(&leaderboard) else {
-            continue;
-        };
-        let champion_lane = lane_key(
-            "kalshi",
-            &symbol,
-            15,
-            "buy_yes",
-            StrategyFamily::DirectionalSettlement,
-            &champion.model_name,
-        );
-        persist_model_benchmark_run(
-            storage,
-            &champion_lane,
-            &symbol,
-            StrategyFamily::DirectionalSettlement,
-            if resolved_history_exists {
-                "historical_resolved"
-            } else {
-                "live_recent_snapshots"
-            },
-            examples.len(),
-            &leaderboard,
-        )
-        .await?;
-        let paper_metrics = storage
-            .recent_trade_metrics_for_lane(&champion_lane, common::TradeMode::Paper, 20)
-            .await?;
-        let symbol_paper_metrics = storage
-            .recent_trade_metrics_for_symbol(
+            let paper_metrics = storage
+                .recent_trade_metrics_for_lane(&champion_lane, common::TradeMode::Paper, 20)
+                .await?;
+            let live_metrics = storage
+                .recent_trade_metrics_for_lane(&champion_lane, common::TradeMode::Live, 10)
+                .await?;
+            persist_calibration(
+                storage,
                 &symbol,
                 StrategyFamily::DirectionalSettlement,
-                common::TradeMode::Paper,
-                20,
+                &champion.model_name,
+                &regime_examples,
+                if uses_trained_linear_weights(&champion.model_name) {
+                    Some(&trained_weights)
+                } else {
+                    None
+                },
             )
             .await?;
-        let live_metrics = storage
-            .recent_trade_metrics_for_lane(&champion_lane, common::TradeMode::Live, 10)
-            .await?;
-        persist_calibration(
-            storage,
-            &symbol,
-            StrategyFamily::DirectionalSettlement,
-            &champion.model_name,
-            &examples,
-            if uses_trained_linear_weights(&champion.model_name) {
-                Some(&trained_weights)
+            let base_promotion_state = classify_promotion_state(
+                config,
+                champion.brier,
+                champion.execution_pnl,
+                regime_execution_quality,
+                paper_metrics.trade_count,
+                paper_metrics.realized_pnl,
+                paper_metrics.trade_count,
+                paper_metrics.realized_pnl,
+                live_metrics.trade_count,
+                live_metrics.realized_pnl,
+            );
+            let promotion_state = if regime == ExpiryRegime::Late {
+                PromotionState::Shadow
             } else {
-                None
-            },
-        )
-        .await?;
-        let promotion_state = classify_promotion_state(
-            config,
-            champion.brier,
-            champion.execution_pnl,
-            avg_execution_quality,
-            paper_metrics.trade_count,
-            paper_metrics.realized_pnl,
-            symbol_paper_metrics.trade_count,
-            symbol_paper_metrics.realized_pnl,
-            live_metrics.trade_count,
-            live_metrics.realized_pnl,
-        );
-        storage
-            .upsert_lane_state(&LaneState {
-                lane_key: champion_lane,
-                market_family: MarketFamily::Crypto,
-                promotion_state,
-                promotion_reason: Some(promotion_reason(
+                base_promotion_state
+            };
+            let promotion_reason = if regime == ExpiryRegime::Late {
+                "late_regime_diagnostic_only".to_string()
+            } else {
+                promotion_reason(
                     config,
                     promotion_state,
                     champion.brier,
                     champion.execution_pnl,
                     paper_metrics.trade_count,
                     paper_metrics.realized_pnl,
-                    symbol_paper_metrics.trade_count,
-                    symbol_paper_metrics.realized_pnl,
+                    paper_metrics.trade_count,
+                    paper_metrics.realized_pnl,
                     live_metrics.trade_count,
                     live_metrics.realized_pnl,
-                )),
-                recent_pnl: paper_metrics.realized_pnl,
-                recent_brier: champion.brier,
-                recent_execution_quality: avg_execution_quality,
-                recent_replay_expectancy: champion.execution_pnl,
-                quarantine_reason: quarantine_reason(
+                )
+            };
+            let quarantine_reason = if regime == ExpiryRegime::Late {
+                Some("late_regime_diagnostic_only".to_string())
+            } else {
+                quarantine_reason(
                     config,
                     promotion_state,
                     champion.execution_pnl,
                     paper_metrics.trade_count,
                     paper_metrics.realized_pnl,
-                ),
-                current_champion_model: Some(champion.model_name.clone()),
-            })
-            .await?;
-        updated += 1;
+                )
+            };
+            storage
+                .upsert_lane_state(&LaneState {
+                    lane_key: champion_lane,
+                    market_family: MarketFamily::Crypto,
+                    promotion_state,
+                    promotion_reason: Some(promotion_reason),
+                    recent_pnl: paper_metrics.realized_pnl,
+                    recent_brier: champion.brier,
+                    recent_execution_quality: regime_execution_quality,
+                    recent_replay_expectancy: champion.execution_pnl,
+                    quarantine_reason,
+                    current_champion_model: Some(champion.model_name.clone()),
+                })
+                .await?;
+            updated += 1;
+        }
     }
 
     for (symbol, snapshots) in weather_by_symbol {
@@ -346,6 +360,7 @@ async fn persist_model_benchmark_run(
     storage: &storage::Storage,
     lane_key: &str,
     symbol: &str,
+    expiry_regime: Option<ExpiryRegime>,
     strategy_family: StrategyFamily,
     source: &str,
     example_count: usize,
@@ -375,6 +390,7 @@ async fn persist_model_benchmark_run(
                 lane_key: lane_key.to_string(),
                 market_family: MarketFamily::Crypto,
                 symbol: symbol.to_string(),
+                expiry_regime,
                 strategy_family,
                 source: source.to_string(),
                 example_count: example_count as i32,
@@ -620,6 +636,39 @@ fn optimize_trained_policy(
 
 fn uses_trained_linear_weights(model_name: &str) -> bool {
     matches!(model_name, TRAINED_LINEAR_V1 | TRAINED_LINEAR_CONTRARIAN_V1)
+}
+
+fn regime_examples(
+    examples: &[ReplayExample],
+    regime: ExpiryRegime,
+    symbol: &str,
+) -> Vec<ReplayExample> {
+    let lane = lane_key_with_regime(
+        "kalshi",
+        symbol,
+        15,
+        "buy_yes",
+        StrategyFamily::DirectionalSettlement,
+        BASELINE_LOGIT_V1,
+        Some(regime),
+    );
+    examples
+        .iter()
+        .filter(|example| matches_regime_bucket(&example.time_to_expiry_bucket, regime))
+        .cloned()
+        .map(|mut example| {
+            example.lane_key = lane.clone();
+            example
+        })
+        .collect()
+}
+
+fn matches_regime_bucket(bucket: &str, regime: ExpiryRegime) -> bool {
+    match regime {
+        ExpiryRegime::Early => matches!(bucket, "5_to_10m" | "10m_plus"),
+        ExpiryRegime::Mid => bucket == "2_to_5m",
+        ExpiryRegime::Late => bucket == "under_2m",
+    }
 }
 
 fn linear_score(weights: &TrainedLinearWeights, features: &FeatureVector) -> f64 {

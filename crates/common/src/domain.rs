@@ -45,6 +45,44 @@ pub enum TradeMode {
     Live,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Type)]
+#[sqlx(type_name = "text", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum ExpiryRegime {
+    Early,
+    Mid,
+    Late,
+}
+
+impl ExpiryRegime {
+    pub fn from_seconds_to_expiry(seconds_to_expiry: i64) -> Self {
+        match seconds_to_expiry {
+            s if s > 300 => Self::Early,
+            s if s > 60 => Self::Mid,
+            _ => Self::Late,
+        }
+    }
+
+    pub fn as_key(self) -> &'static str {
+        match self {
+            Self::Early => "early",
+            Self::Mid => "mid",
+            Self::Late => "late",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ParsedLaneKey {
+    pub exchange: String,
+    pub symbol: String,
+    pub window_minutes: u32,
+    pub side: String,
+    pub strategy_family: String,
+    pub model_name: String,
+    pub expiry_regime: Option<ExpiryRegime>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthSnapshot {
     pub service: String,
@@ -80,6 +118,7 @@ pub struct MarketFeatureSnapshotRecord {
     pub window_minutes: i32,
     pub seconds_to_expiry: i32,
     pub time_to_expiry_bucket: String,
+    pub expiry_regime: Option<ExpiryRegime>,
     pub market_prob: f64,
     pub best_bid: f64,
     pub best_ask: f64,
@@ -553,20 +592,78 @@ pub fn lane_key(
     strategy_family: StrategyFamily,
     model_name: &str,
 ) -> String {
+    lane_key_with_regime(
+        exchange,
+        symbol,
+        window_minutes,
+        side,
+        strategy_family,
+        model_name,
+        None,
+    )
+}
+
+pub fn lane_key_with_regime(
+    exchange: &str,
+    symbol: &str,
+    window_minutes: u32,
+    side: &str,
+    strategy_family: StrategyFamily,
+    model_name: &str,
+    expiry_regime: Option<ExpiryRegime>,
+) -> String {
     let family = match strategy_family {
         StrategyFamily::Portfolio => "portfolio",
         StrategyFamily::DirectionalSettlement => "directional_settlement",
         StrategyFamily::PreSettlementScalp => "pre_settlement_scalp",
     };
-    format!(
-        "{}:{}:{}:{}:{}:{}",
-        exchange, symbol, window_minutes, side, family, model_name
-    )
+    match expiry_regime {
+        Some(expiry_regime) => format!(
+            "{}:{}:{}:{}:{}:{}:{}",
+            exchange,
+            symbol,
+            window_minutes,
+            side,
+            family,
+            model_name,
+            expiry_regime.as_key()
+        ),
+        None => format!(
+            "{}:{}:{}:{}:{}:{}",
+            exchange, symbol, window_minutes, side, family, model_name
+        ),
+    }
+}
+
+pub fn parse_lane_key(lane: &str) -> Option<ParsedLaneKey> {
+    let parts: Vec<&str> = lane.split(':').collect();
+    if parts.len() != 6 && parts.len() != 7 {
+        return None;
+    }
+    let expiry_regime = if parts.len() == 7 {
+        match parts[6] {
+            "early" => Some(ExpiryRegime::Early),
+            "mid" => Some(ExpiryRegime::Mid),
+            "late" => Some(ExpiryRegime::Late),
+            _ => return None,
+        }
+    } else {
+        None
+    };
+    Some(ParsedLaneKey {
+        exchange: parts[0].to_string(),
+        symbol: parts[1].to_string(),
+        window_minutes: parts[2].parse().ok()?,
+        side: parts[3].to_string(),
+        strategy_family: parts[4].to_string(),
+        model_name: parts[5].to_string(),
+        expiry_regime,
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{StrategyFamily, lane_key};
+    use super::{ExpiryRegime, StrategyFamily, lane_key, lane_key_with_regime, parse_lane_key};
 
     #[test]
     fn lane_key_is_stable() {
@@ -581,5 +678,33 @@ mod tests {
             ),
             "kalshi:btc:15:buy_yes:directional_settlement:baseline_logit_v1"
         );
+    }
+
+    #[test]
+    fn lane_key_supports_explicit_regime() {
+        assert_eq!(
+            lane_key_with_regime(
+                "kalshi",
+                "btc",
+                15,
+                "buy_yes",
+                StrategyFamily::DirectionalSettlement,
+                "trained_linear_v1",
+                Some(ExpiryRegime::Mid)
+            ),
+            "kalshi:btc:15:buy_yes:directional_settlement:trained_linear_v1:mid"
+        );
+    }
+
+    #[test]
+    fn parse_lane_key_accepts_legacy_and_regime_shapes() {
+        let legacy =
+            parse_lane_key("kalshi:btc:15:buy_yes:directional_settlement:trained_linear_v1")
+                .expect("legacy lane");
+        assert_eq!(legacy.expiry_regime, None);
+        let regime =
+            parse_lane_key("kalshi:btc:15:buy_yes:directional_settlement:trained_linear_v1:early")
+                .expect("regime lane");
+        assert_eq!(regime.expiry_regime, Some(ExpiryRegime::Early));
     }
 }

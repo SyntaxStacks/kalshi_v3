@@ -209,6 +209,12 @@ async fn main() -> Result<()> {
         tokio::time::interval(Duration::from_secs(config.market_poll_seconds.max(5)));
     loop {
         interval.tick().await;
+        storage
+            .upsert_worker_started(
+                "ingest",
+                &serde_json::json!({"exchange": config.exchange, "phase": "recovery_sync"}),
+            )
+            .await?;
         match recovery_sync_once(
             &config,
             &http,

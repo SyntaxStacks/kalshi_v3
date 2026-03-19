@@ -129,6 +129,16 @@ async fn main() -> Result<()> {
     ));
     loop {
         interval.tick().await;
+        storage
+            .upsert_worker_started(
+                "execution",
+                &json!({
+                    "phase": "execute",
+                    "live_client_ready": live_client.is_some(),
+                    "live_order_placement_enabled": config.live_order_placement_enabled
+                }),
+            )
+            .await?;
         match execute_once(
             &storage,
             &redis_client,

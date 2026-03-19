@@ -4,6 +4,31 @@ use std::env;
 use std::fs;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaneTruthThresholdBand {
+    // Minimum acceptable live actual fill-hit rate for the band.
+    pub min_actual_fill_hit_rate: f64,
+    // Minimum acceptable filled/submitted quantity ratio for the band.
+    pub min_filled_quantity_ratio: f64,
+    // Maximum tolerated negative gap between realized and predicted fill outcomes.
+    pub min_predicted_vs_realized_fill_gap: f64,
+    // Maximum tolerated negative gap between live fill behavior and replay diagnostics.
+    pub min_live_vs_replay_fill_gap: f64,
+    // Minimum replay edge diagnostic required for the band.
+    pub min_replay_edge_realization_ratio_diag: f64,
+    // Suggested size cap when the band is triggered.
+    pub recommended_size_multiplier: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaneTruthRecommendationPolicy {
+    // Minimum live sample needed before lane execution truth is actionable.
+    pub live_sample_min_terminal_intents: i64,
+    pub live_sample_min_predicted_fill_samples: i64,
+    pub watch: LaneTruthThresholdBand,
+    pub quarantine: LaneTruthThresholdBand,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub app_env: String,
     pub api_bind_addr: String,
@@ -73,6 +98,20 @@ pub struct AppConfig {
     pub reference_stale_after_seconds: i64,
     pub live_bankroll_stale_after_seconds: i64,
     pub live_sync_stale_after_seconds: i64,
+    pub lane_truth_live_sample_min_terminal_intents: i64,
+    pub lane_truth_live_sample_min_predicted_fill_samples: i64,
+    pub lane_truth_watch_min_actual_fill_hit_rate: f64,
+    pub lane_truth_watch_min_filled_quantity_ratio: f64,
+    pub lane_truth_watch_min_predicted_vs_realized_fill_gap: f64,
+    pub lane_truth_watch_min_live_vs_replay_fill_gap: f64,
+    pub lane_truth_watch_min_replay_edge_realization_ratio_diag: f64,
+    pub lane_truth_watch_recommended_size_multiplier: f64,
+    pub lane_truth_quarantine_min_actual_fill_hit_rate: f64,
+    pub lane_truth_quarantine_min_filled_quantity_ratio: f64,
+    pub lane_truth_quarantine_min_predicted_vs_realized_fill_gap: f64,
+    pub lane_truth_quarantine_min_live_vs_replay_fill_gap: f64,
+    pub lane_truth_quarantine_min_replay_edge_realization_ratio_diag: f64,
+    pub lane_truth_quarantine_recommended_size_multiplier: f64,
 }
 
 impl AppConfig {
@@ -84,6 +123,34 @@ impl AppConfig {
             toml::from_str::<Self>(&raw).context("failed to deserialize config/default.toml")?;
         settings.apply_env_overrides()?;
         Ok(settings)
+    }
+
+    pub fn lane_truth_recommendation_policy(&self) -> LaneTruthRecommendationPolicy {
+        LaneTruthRecommendationPolicy {
+            live_sample_min_terminal_intents: self.lane_truth_live_sample_min_terminal_intents,
+            live_sample_min_predicted_fill_samples: self
+                .lane_truth_live_sample_min_predicted_fill_samples,
+            watch: LaneTruthThresholdBand {
+                min_actual_fill_hit_rate: self.lane_truth_watch_min_actual_fill_hit_rate,
+                min_filled_quantity_ratio: self.lane_truth_watch_min_filled_quantity_ratio,
+                min_predicted_vs_realized_fill_gap: self
+                    .lane_truth_watch_min_predicted_vs_realized_fill_gap,
+                min_live_vs_replay_fill_gap: self.lane_truth_watch_min_live_vs_replay_fill_gap,
+                min_replay_edge_realization_ratio_diag: self
+                    .lane_truth_watch_min_replay_edge_realization_ratio_diag,
+                recommended_size_multiplier: self.lane_truth_watch_recommended_size_multiplier,
+            },
+            quarantine: LaneTruthThresholdBand {
+                min_actual_fill_hit_rate: self.lane_truth_quarantine_min_actual_fill_hit_rate,
+                min_filled_quantity_ratio: self.lane_truth_quarantine_min_filled_quantity_ratio,
+                min_predicted_vs_realized_fill_gap: self
+                    .lane_truth_quarantine_min_predicted_vs_realized_fill_gap,
+                min_live_vs_replay_fill_gap: self.lane_truth_quarantine_min_live_vs_replay_fill_gap,
+                min_replay_edge_realization_ratio_diag: self
+                    .lane_truth_quarantine_min_replay_edge_realization_ratio_diag,
+                recommended_size_multiplier: self.lane_truth_quarantine_recommended_size_multiplier,
+            },
+        }
     }
 
     fn apply_env_overrides(&mut self) -> Result<()> {
@@ -253,6 +320,62 @@ impl AppConfig {
         self.live_sync_stale_after_seconds = env_parse(
             "LIVE_SYNC_STALE_AFTER_SECONDS",
             self.live_sync_stale_after_seconds,
+        )?;
+        self.lane_truth_live_sample_min_terminal_intents = env_parse(
+            "LANE_TRUTH_LIVE_SAMPLE_MIN_TERMINAL_INTENTS",
+            self.lane_truth_live_sample_min_terminal_intents,
+        )?;
+        self.lane_truth_live_sample_min_predicted_fill_samples = env_parse(
+            "LANE_TRUTH_LIVE_SAMPLE_MIN_PREDICTED_FILL_SAMPLES",
+            self.lane_truth_live_sample_min_predicted_fill_samples,
+        )?;
+        self.lane_truth_watch_min_actual_fill_hit_rate = env_parse(
+            "LANE_TRUTH_WATCH_MIN_ACTUAL_FILL_HIT_RATE",
+            self.lane_truth_watch_min_actual_fill_hit_rate,
+        )?;
+        self.lane_truth_watch_min_filled_quantity_ratio = env_parse(
+            "LANE_TRUTH_WATCH_MIN_FILLED_QUANTITY_RATIO",
+            self.lane_truth_watch_min_filled_quantity_ratio,
+        )?;
+        self.lane_truth_watch_min_predicted_vs_realized_fill_gap = env_parse(
+            "LANE_TRUTH_WATCH_MIN_PREDICTED_VS_REALIZED_FILL_GAP",
+            self.lane_truth_watch_min_predicted_vs_realized_fill_gap,
+        )?;
+        self.lane_truth_watch_min_live_vs_replay_fill_gap = env_parse(
+            "LANE_TRUTH_WATCH_MIN_LIVE_VS_REPLAY_FILL_GAP",
+            self.lane_truth_watch_min_live_vs_replay_fill_gap,
+        )?;
+        self.lane_truth_watch_min_replay_edge_realization_ratio_diag = env_parse(
+            "LANE_TRUTH_WATCH_MIN_REPLAY_EDGE_REALIZATION_RATIO_DIAG",
+            self.lane_truth_watch_min_replay_edge_realization_ratio_diag,
+        )?;
+        self.lane_truth_watch_recommended_size_multiplier = env_parse(
+            "LANE_TRUTH_WATCH_RECOMMENDED_SIZE_MULTIPLIER",
+            self.lane_truth_watch_recommended_size_multiplier,
+        )?;
+        self.lane_truth_quarantine_min_actual_fill_hit_rate = env_parse(
+            "LANE_TRUTH_QUARANTINE_MIN_ACTUAL_FILL_HIT_RATE",
+            self.lane_truth_quarantine_min_actual_fill_hit_rate,
+        )?;
+        self.lane_truth_quarantine_min_filled_quantity_ratio = env_parse(
+            "LANE_TRUTH_QUARANTINE_MIN_FILLED_QUANTITY_RATIO",
+            self.lane_truth_quarantine_min_filled_quantity_ratio,
+        )?;
+        self.lane_truth_quarantine_min_predicted_vs_realized_fill_gap = env_parse(
+            "LANE_TRUTH_QUARANTINE_MIN_PREDICTED_VS_REALIZED_FILL_GAP",
+            self.lane_truth_quarantine_min_predicted_vs_realized_fill_gap,
+        )?;
+        self.lane_truth_quarantine_min_live_vs_replay_fill_gap = env_parse(
+            "LANE_TRUTH_QUARANTINE_MIN_LIVE_VS_REPLAY_FILL_GAP",
+            self.lane_truth_quarantine_min_live_vs_replay_fill_gap,
+        )?;
+        self.lane_truth_quarantine_min_replay_edge_realization_ratio_diag = env_parse(
+            "LANE_TRUTH_QUARANTINE_MIN_REPLAY_EDGE_REALIZATION_RATIO_DIAG",
+            self.lane_truth_quarantine_min_replay_edge_realization_ratio_diag,
+        )?;
+        self.lane_truth_quarantine_recommended_size_multiplier = env_parse(
+            "LANE_TRUTH_QUARANTINE_RECOMMENDED_SIZE_MULTIPLIER",
+            self.lane_truth_quarantine_recommended_size_multiplier,
         )?;
         Ok(())
     }

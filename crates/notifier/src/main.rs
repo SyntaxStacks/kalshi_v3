@@ -37,6 +37,9 @@ async fn main() -> Result<()> {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
     loop {
         interval.tick().await;
+        storage
+            .upsert_worker_started("notifier", &json!({"phase": "notify"}))
+            .await?;
         match notify_once(&config, &storage, &client).await {
             Ok(sent_count) => {
                 storage
@@ -564,7 +567,18 @@ fn strategy_family_label(strategy_family: common::StrategyFamily) -> String {
 fn compact_lane_summary(lane_key: &str) -> String {
     let parts: Vec<&str> = lane_key.split(':').collect();
     if parts.len() >= 6 {
-        return format!("{} {}m · {}", parts[1].to_uppercase(), parts[2], parts[5]);
+        let regime = if parts.len() >= 7 {
+            format!(" · {}", parts[6])
+        } else {
+            String::new()
+        };
+        return format!(
+            "{} {}m{} · {}",
+            parts[1].to_uppercase(),
+            parts[2],
+            regime,
+            parts[5]
+        );
     }
     lane_key.to_string()
 }

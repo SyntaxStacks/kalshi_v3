@@ -1,8 +1,8 @@
 use anyhow::Result;
 use chrono::Utc;
 use common::{
-    AppConfig, KalshiMarketState, MarketFamily, MarketFeatureSnapshotRecord, ReferencePriceState,
-    WeatherReferenceState,
+    AppConfig, ExpiryRegime, KalshiMarketState, MarketFamily, MarketFeatureSnapshotRecord,
+    ReferencePriceState, WeatherReferenceState,
 };
 use market_data::QueueSnapshot;
 use redis::AsyncCommands;
@@ -35,6 +35,9 @@ async fn main() -> Result<()> {
     ));
     loop {
         interval.tick().await;
+        storage
+            .upsert_worker_started("feature", &serde_json::json!({"phase": "materialize"}))
+            .await?;
         match materialize_once(&config, &storage, &redis_client).await {
             Ok(written) => {
                 storage
@@ -249,6 +252,9 @@ fn build_crypto_snapshot(
         window_minutes: market.window_minutes,
         seconds_to_expiry,
         time_to_expiry_bucket: expiry_bucket(seconds_to_expiry).to_string(),
+        expiry_regime: Some(ExpiryRegime::from_seconds_to_expiry(i64::from(
+            seconds_to_expiry,
+        ))),
         market_prob: market.market_prob,
         best_bid: market.best_bid,
         best_ask: market.best_ask,
@@ -353,6 +359,7 @@ fn build_weather_snapshot(
         window_minutes: market.window_minutes,
         seconds_to_expiry,
         time_to_expiry_bucket: weather_expiry_bucket(seconds_to_expiry).to_string(),
+        expiry_regime: None,
         market_prob: market.market_prob,
         best_bid: market.best_bid,
         best_ask: market.best_ask,
