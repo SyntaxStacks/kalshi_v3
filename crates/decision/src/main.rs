@@ -1,8 +1,8 @@
 use anyhow::Result;
 use chrono::{Duration, Utc};
 use common::{
-    AppConfig, ModelInference, OpportunityDecision, PromotionState, StrategyFamily, TradeMode,
-    lane_key,
+    AppConfig, MarketFamily, ModelInference, OpportunityDecision, PromotionState,
+    StrategyFamily, TradeMode, lane_key,
 };
 use market_models::{
     BASELINE_LOGIT_V1, FeatureVector, TRAINED_LINEAR_CONTRARIAN_V1, TRAINED_LINEAR_V1,
@@ -13,6 +13,8 @@ use std::collections::HashMap;
 use std::time::Instant;
 use storage::TrainedModelArtifactCard;
 use tracing::{info, warn};
+
+const WEATHER_MODEL_NAME: &str = "weather_threshold_v1";
 
 #[derive(Debug, Clone, Copy)]
 struct TrainedDecisionPolicy {
@@ -73,7 +75,7 @@ async fn main() -> Result<()> {
 async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(usize, usize)> {
     let started_at = Instant::now();
     info!("decision_pass_started");
-    let features = storage.list_latest_feature_snapshots(16).await?;
+    let features = select_decision_snapshots(storage.list_latest_feature_snapshots(128).await?);
     info!(
         feature_count = features.len(),
         elapsed_ms = started_at.elapsed().as_millis(),
@@ -83,12 +85,22 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
     let mut approved_count = 0usize;
     let mut trained_artifact_cache: HashMap<String, Option<TrainedModelArtifactCard>> =
         HashMap::new();
-    let paper_bankroll = storage
-        .latest_portfolio_bankroll(TradeMode::Paper)
+    let paper_crypto_bankroll = storage
+        .latest_family_bankroll(TradeMode::Paper, MarketFamily::Crypto)
         .await?
         .map(|card| card.deployable_balance.max(0.0))
-        .unwrap_or(config.initial_paper_bankroll);
+        .unwrap_or(config.initial_paper_crypto_budget);
+    let paper_weather_bankroll = storage
+        .latest_family_bankroll(TradeMode::Paper, MarketFamily::Weather)
+        .await?
+        .map(|card| card.deployable_balance.max(0.0))
+        .unwrap_or(config.initial_paper_weather_budget);
     let live_bankroll_card = storage.latest_portfolio_bankroll(TradeMode::Live).await?;
+    let live_crypto_bankroll = storage
+        .latest_family_bankroll(TradeMode::Live, MarketFamily::Crypto)
+        .await?
+        .map(|card| card.deployable_balance.max(0.0))
+        .unwrap_or(config.initial_live_crypto_budget);
     let live_deployable_bankroll = live_bankroll_card
         .as_ref()
         .map(|card| card.deployable_balance.max(0.0))
@@ -105,12 +117,14 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
         config.initial_live_bankroll,
         config.live_portfolio_drawdown_kill_pct,
     );
-    let mut paper_remaining = paper_bankroll;
-    let mut live_remaining = live_deployable_bankroll;
+    let mut paper_crypto_remaining = paper_crypto_bankroll;
+    let mut paper_weather_remaining = paper_weather_bankroll;
+    let mut live_remaining = live_crypto_bankroll.min(live_deployable_bankroll);
     let mut lane_exposure_adjustments: HashMap<String, f64> = HashMap::new();
     let mut symbol_exposure_adjustments: HashMap<String, f64> = HashMap::new();
     info!(
-        paper_bankroll,
+        paper_crypto_bankroll,
+        paper_weather_bankroll,
         live_deployable_bankroll,
         live_total_bankroll,
         live_drawdown_guard_active,
@@ -120,37 +134,184 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
 
     for snapshot in features {
         let snapshot_started_at = Instant::now();
+        if snapshot.market_family == MarketFamily::Weather {
+            let lane_policy = storage
+                .latest_lane_policy_for_symbol(
+                    MarketFamily::Weather,
+                    &snapshot.symbol,
+                    StrategyFamily::DirectionalSettlement,
+                )
+                .await?;
+            let model_name = lane_policy
+                .as_ref()
+                .and_then(|policy| policy.current_champion_model.clone())
+                .unwrap_or_else(|| WEATHER_MODEL_NAME.to_string());
+            let model_prob = snapshot.reference_yes_prob.clamp(0.01, 0.99);
+            let edge = model_prob - snapshot.market_prob;
+            let side = if edge >= 0.0 { "buy_yes" } else { "buy_no" };
+            let lane = lane_key(
+                "kalshi",
+                &snapshot.symbol.to_lowercase(),
+                snapshot.window_minutes as u32,
+                side,
+                StrategyFamily::DirectionalSettlement,
+                &model_name,
+            );
+            if let Some(last_created_at) = storage.latest_decision_at_for_lane(&lane).await? {
+                if should_skip_recent_lane_decision(last_created_at, config.decision_poll_seconds) {
+                    continue;
+                }
+            }
+            let confidence = (
+                snapshot.weather_reference_confidence.unwrap_or(0.05) * 0.55
+                    + edge.abs() * 1.35
+                    + snapshot.venue_quality_score * 0.25
+                    - (snapshot.reference_age_seconds as f64 / 3_600.0) * 0.08
+                    - (snapshot.market_data_age_seconds as f64 / 300.0) * 0.04
+            )
+            .clamp(0.05, 0.95);
+            let mut reasons = Vec::new();
+            if snapshot.weather_forecast_temperature_f.is_none() {
+                reasons.push("missing_weather_reference".to_string());
+            }
+            if edge.abs() < config.min_edge {
+                reasons.push("edge_below_threshold".to_string());
+            }
+            if confidence < config.min_confidence {
+                reasons.push("low_confidence".to_string());
+            }
+            if snapshot.venue_quality_score < config.min_venue_quality {
+                reasons.push("low_venue_quality".to_string());
+            }
+            if snapshot.reference_age_seconds > 10_800 {
+                reasons.push("stale_weather_reference".to_string());
+            }
+            let promotion_state = lane_policy
+                .as_ref()
+                .map(|policy| policy.promotion_state)
+                .unwrap_or(if config.weather_paper_trading_enabled {
+                    PromotionState::PaperActive
+                } else {
+                    PromotionState::Shadow
+                });
+            match promotion_state {
+                PromotionState::Quarantined => reasons.push("lane_quarantined".to_string()),
+                PromotionState::Shadow if !config.weather_paper_trading_enabled => {
+                    reasons.push("weather_paper_disabled".to_string())
+                }
+                PromotionState::Shadow => reasons.push("lane_not_paper_ready".to_string()),
+                PromotionState::PaperActive
+                | PromotionState::LiveMicro
+                | PromotionState::LiveScaled => {}
+            }
+
+            let position_cap = (paper_weather_remaining * config.max_position_pct).max(0.0);
+            let raw_size = paper_weather_remaining
+                * edge.abs()
+                * confidence
+                * snapshot.venue_quality_score
+                * config.max_position_pct
+                * 0.75;
+            let recommended_size = if position_cap >= 5.0 {
+                raw_size.clamp(5.0, position_cap)
+            } else {
+                position_cap
+            };
+            if recommended_size > paper_weather_remaining + f64::EPSILON {
+                reasons.push("insufficient_deployable_balance".to_string());
+            }
+            if recommended_size < 5.0 {
+                reasons.push("size_too_small".to_string());
+            }
+            let approved = reasons.is_empty();
+            let inference = ModelInference {
+                market_id: snapshot.market_id,
+                market_family: MarketFamily::Weather,
+                lane_key: lane.clone(),
+                strategy_family: StrategyFamily::DirectionalSettlement,
+                model_name: model_name.clone(),
+                raw_score: edge,
+                raw_probability_yes: model_prob,
+                calibrated_probability_yes: model_prob,
+                raw_confidence: confidence,
+                calibrated_confidence: confidence,
+                feature_version: snapshot.feature_version.clone(),
+                rationale_json: json!({
+                    "market_ticker": snapshot.market_ticker,
+                    "market_title": snapshot.market_title,
+                    "weather_city": snapshot.weather_city,
+                    "weather_contract_kind": snapshot.weather_contract_kind,
+                    "weather_market_date": snapshot.weather_market_date,
+                    "weather_forecast_temperature_f": snapshot.weather_forecast_temperature_f,
+                    "weather_observation_temperature_f": snapshot.weather_observation_temperature_f,
+                    "weather_reference_confidence": snapshot.weather_reference_confidence,
+                    "weather_reference_source": snapshot.weather_reference_source,
+                    "weather_strike_type": snapshot.weather_strike_type,
+                    "weather_floor_strike": snapshot.weather_floor_strike,
+                    "weather_cap_strike": snapshot.weather_cap_strike,
+                }),
+            };
+            storage.insert_model_inference(&inference).await?;
+            let decision = OpportunityDecision {
+                market_id: snapshot.market_id,
+                market_family: MarketFamily::Weather,
+                lane_key: lane.clone(),
+                strategy_family: StrategyFamily::DirectionalSettlement,
+                model_name,
+                side: side.to_string(),
+                market_prob: snapshot.market_prob,
+                model_prob,
+                edge,
+                confidence,
+                approved,
+                reasons_json: reasons.clone(),
+                recommended_size,
+            };
+            let decision_id = storage.insert_opportunity_decision(&decision).await?;
+            decisions += 1;
+            if approved
+                && !storage.has_open_trade_for_lane(&lane).await?
+                && !storage.has_active_execution_intent_for_lane(&lane).await?
+            {
+                storage
+                    .insert_execution_intent(
+                        decision_id,
+                        MarketFamily::Weather,
+                        TradeMode::Paper,
+                        "midpoint",
+                        &[1.0],
+                        snapshot.seconds_to_expiry.max(7_200),
+                        900,
+                        &["expiry_exit".to_string()],
+                    )
+                    .await?;
+                paper_weather_remaining = (paper_weather_remaining - recommended_size).max(0.0);
+                approved_count += 1;
+            }
+            info!(
+                market_id = snapshot.market_id,
+                symbol = snapshot.symbol,
+                lane,
+                approved,
+                edge,
+                confidence,
+                snapshot_elapsed_ms = snapshot_started_at.elapsed().as_millis(),
+                "weather_decision_snapshot_processed"
+            );
+            continue;
+        }
+
         let lane_policy = storage
-            .latest_lane_policy_for_symbol(&snapshot.symbol, StrategyFamily::DirectionalSettlement)
+            .latest_lane_policy_for_symbol(
+                snapshot.market_family,
+                &snapshot.symbol,
+                StrategyFamily::DirectionalSettlement,
+            )
             .await?;
         let model_name = lane_policy
             .as_ref()
             .and_then(|policy| policy.current_champion_model.clone())
             .unwrap_or_else(|| BASELINE_LOGIT_V1.to_string());
-        let lane_yes = lane_key(
-            "kalshi",
-            &snapshot.symbol.to_lowercase(),
-            snapshot.window_minutes as u32,
-            "buy_yes",
-            StrategyFamily::DirectionalSettlement,
-            &model_name,
-        );
-
-        if let Some(last_created_at) = storage.latest_decision_at_for_lane(&lane_yes).await? {
-            if last_created_at
-                > Utc::now() - Duration::seconds(config.decision_poll_seconds as i64 - 1)
-            {
-                info!(
-                    market_id = snapshot.market_id,
-                    symbol = snapshot.symbol,
-                    lane = lane_yes,
-                    last_created_at = %last_created_at,
-                    "decision_skipped_recent_lane"
-                );
-                continue;
-            }
-        }
-
         let feature_vector = FeatureVector {
             market_prob: snapshot.market_prob,
             reference_yes_prob: snapshot.reference_yes_prob,
@@ -173,6 +334,7 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
                 let artifact = storage
                     .latest_trained_model_artifact(
                         TRAINED_LINEAR_V1,
+                        snapshot.market_family,
                         StrategyFamily::DirectionalSettlement,
                         Some(&snapshot.symbol),
                     )
@@ -196,6 +358,7 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
         );
         let calibration = storage
             .latest_probability_calibration(
+                snapshot.market_family,
                 &snapshot.symbol,
                 StrategyFamily::DirectionalSettlement,
                 &model_name,
@@ -233,6 +396,18 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
             StrategyFamily::DirectionalSettlement,
             &model_name,
         );
+        if let Some(last_created_at) = storage.latest_decision_at_for_lane(&lane).await? {
+            if should_skip_recent_lane_decision(last_created_at, config.decision_poll_seconds) {
+                info!(
+                    market_id = snapshot.market_id,
+                    symbol = snapshot.symbol,
+                    lane = lane,
+                    last_created_at = %last_created_at,
+                    "decision_skipped_recent_lane"
+                );
+                continue;
+            }
+        }
 
         let mut reasons = Vec::new();
         if edge.abs() < min_edge {
@@ -267,7 +442,7 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
 
         let intent_mode = target_intent_mode(config, live_order_placement_enabled, promotion_state);
         let bankroll = match intent_mode {
-            TradeMode::Paper => paper_remaining,
+            TradeMode::Paper => paper_crypto_remaining,
             TradeMode::Live => live_remaining,
         };
         let theoretical_entry_price = contract_price_for_side(side, snapshot.market_prob);
@@ -327,6 +502,7 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
 
         let inference = ModelInference {
             market_id: snapshot.market_id,
+            market_family: snapshot.market_family,
             lane_key: lane.clone(),
             strategy_family: StrategyFamily::DirectionalSettlement,
             model_name: model_name.clone(),
@@ -366,6 +542,7 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
 
         let decision = OpportunityDecision {
             market_id: snapshot.market_id,
+            market_family: snapshot.market_family,
             lane_key: lane.clone(),
             strategy_family: StrategyFamily::DirectionalSettlement,
             model_name: model_name.clone(),
@@ -381,10 +558,14 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
         let decision_id = storage.insert_opportunity_decision(&decision).await?;
         decisions += 1;
 
-        if approved && !storage.has_open_trade_for_lane(&lane).await? {
+        if approved
+            && !storage.has_open_trade_for_lane(&lane).await?
+            && !storage.has_active_execution_intent_for_lane(&lane).await?
+        {
             storage
                 .insert_execution_intent(
                     decision_id,
+                    snapshot.market_family,
                     intent_mode,
                     "midpoint",
                     &[1.0],
@@ -395,7 +576,7 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
                 .await?;
             match intent_mode {
                 TradeMode::Paper => {
-                    paper_remaining = (paper_remaining - recommended_size).max(0.0);
+                    paper_crypto_remaining = (paper_crypto_remaining - recommended_size).max(0.0);
                 }
                 TradeMode::Live => {
                     live_remaining = (live_remaining - recommended_size).max(0.0);
@@ -433,6 +614,50 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
         "decision_pass_succeeded"
     );
     Ok((decisions, approved_count))
+}
+
+fn select_decision_snapshots(
+    features: Vec<common::MarketFeatureSnapshotRecord>,
+) -> Vec<common::MarketFeatureSnapshotRecord> {
+    let mut selected = Vec::new();
+    let mut front_crypto: HashMap<(String, i32), common::MarketFeatureSnapshotRecord> =
+        HashMap::new();
+
+    for snapshot in features {
+        if snapshot.market_family != MarketFamily::Crypto {
+            selected.push(snapshot);
+            continue;
+        }
+        if snapshot.seconds_to_expiry <= 0 {
+            continue;
+        }
+        if snapshot.seconds_to_expiry > crypto_decision_horizon_seconds(snapshot.window_minutes) {
+            continue;
+        }
+        let key = (snapshot.symbol.to_lowercase(), snapshot.window_minutes);
+        match front_crypto.get(&key) {
+            Some(existing)
+                if existing.seconds_to_expiry < snapshot.seconds_to_expiry
+                    || (existing.seconds_to_expiry == snapshot.seconds_to_expiry
+                        && existing.created_at >= snapshot.created_at) => {}
+            _ => {
+                front_crypto.insert(key, snapshot);
+            }
+        }
+    }
+
+    let mut front_crypto_snapshots: Vec<_> = front_crypto.into_values().collect();
+    front_crypto_snapshots.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    selected.extend(front_crypto_snapshots);
+    selected
+}
+
+fn crypto_decision_horizon_seconds(window_minutes: i32) -> i32 {
+    (window_minutes.max(1) * 60 * 3).max(45 * 60)
+}
+
+fn should_skip_recent_lane_decision(last_created_at: chrono::DateTime<Utc>, poll_seconds: u64) -> bool {
+    last_created_at > Utc::now() - Duration::seconds(poll_seconds as i64 - 1)
 }
 
 fn target_intent_mode(
@@ -513,9 +738,12 @@ fn contract_price_for_side(side: &str, market_prob: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppConfig, PromotionState, TradeMode, live_contract_count, live_drawdown_triggered,
-        max_position_pct_for_mode, target_intent_mode,
+        AppConfig, MarketFamily, PromotionState, TradeMode, crypto_decision_horizon_seconds,
+        live_contract_count, live_drawdown_triggered, max_position_pct_for_mode,
+        select_decision_snapshots, should_skip_recent_lane_decision, target_intent_mode,
     };
+    use chrono::{Duration, Utc};
+    use common::MarketFeatureSnapshotRecord;
 
     fn test_config() -> AppConfig {
         AppConfig {
@@ -528,6 +756,13 @@ mod tests {
             reference_price_mode: "proxy".to_string(),
             reference_price_source: "coinbase_proxy".to_string(),
             reference_averaging_window_seconds: 60,
+            nws_api_base: "https://api.weather.gov".to_string(),
+            open_meteo_geocode_api_base: "https://geocoding-api.open-meteo.com/v1/search"
+                .to_string(),
+            weather_series_category: "Climate and Weather".to_string(),
+            weather_series_title_patterns: vec!["Highest temperature".to_string()],
+            weather_series_poll_limit: 4,
+            weather_reference_refresh_seconds: 900,
             kalshi_api_base: "https://example.com".to_string(),
             kalshi_ws_url: "wss://example.com".to_string(),
             kalshi_api_key_id: None,
@@ -537,11 +772,16 @@ mod tests {
             v2_reference_sqlite_path: None,
             coinbase_ws_url: "wss://example.com".to_string(),
             paper_trading_enabled: true,
+            weather_paper_trading_enabled: true,
             live_trading_enabled: true,
             live_order_placement_enabled: true,
             discord_webhook_url: None,
             initial_paper_bankroll: 1000.0,
             initial_live_bankroll: 1000.0,
+            initial_paper_crypto_budget: 850.0,
+            initial_paper_weather_budget: 150.0,
+            initial_live_crypto_budget: 1000.0,
+            initial_live_weather_budget: 0.0,
             kalshi_series_tickers: vec!["KXBTC15M".to_string()],
             reference_symbols: vec!["BTC".to_string()],
             market_poll_seconds: 15,
@@ -609,5 +849,99 @@ mod tests {
     fn live_contract_count_requires_whole_contract() {
         assert_eq!(live_contract_count(0.4, 0.55), 0.0);
         assert_eq!(live_contract_count(1.4, 0.55), 2.0);
+    }
+
+    fn sample_snapshot(
+        market_family: MarketFamily,
+        symbol: &str,
+        ticker: &str,
+        seconds_to_expiry: i32,
+        created_offset_seconds: i64,
+    ) -> MarketFeatureSnapshotRecord {
+        MarketFeatureSnapshotRecord {
+            market_id: i64::from(seconds_to_expiry),
+            market_family,
+            market_ticker: ticker.to_string(),
+            market_title: ticker.to_string(),
+            feature_version: "test".to_string(),
+            exchange: "kalshi".to_string(),
+            symbol: symbol.to_string(),
+            window_minutes: 15,
+            seconds_to_expiry,
+            time_to_expiry_bucket: "under_15m".to_string(),
+            market_prob: 0.5,
+            best_bid: 0.49,
+            best_ask: 0.51,
+            last_price: 0.5,
+            bid_size: 10.0,
+            ask_size: 10.0,
+            liquidity: 100.0,
+            order_book_imbalance: 0.0,
+            aggressive_buy_ratio: 0.5,
+            spread_bps: 200.0,
+            venue_quality_score: 0.7,
+            reference_price: 1.0,
+            reference_previous_price: 1.0,
+            reference_price_change_bps: 0.0,
+            reference_yes_prob: 0.52,
+            reference_gap_bps: 200.0,
+            threshold_distance_bps_proxy: 0.0,
+            averaging_window_progress: 0.0,
+            settlement_regime: "mid_window".to_string(),
+            last_minute_avg_proxy: 1.0,
+            market_data_age_seconds: 0,
+            reference_age_seconds: 0,
+            weather_city: None,
+            weather_contract_kind: None,
+            weather_market_date: None,
+            weather_strike_type: None,
+            weather_floor_strike: None,
+            weather_cap_strike: None,
+            weather_forecast_temperature_f: None,
+            weather_observation_temperature_f: None,
+            weather_reference_confidence: None,
+            weather_reference_source: None,
+            created_at: Utc::now() + Duration::seconds(created_offset_seconds),
+        }
+    }
+
+    #[test]
+    fn decision_selection_keeps_only_front_crypto_market() {
+        let selected = select_decision_snapshots(vec![
+            sample_snapshot(MarketFamily::Crypto, "btc", "KXBTC15M-near", 600, 0),
+            sample_snapshot(MarketFamily::Crypto, "btc", "KXBTC15M-far", 18_000, 5),
+            sample_snapshot(MarketFamily::Weather, "chi", "KWCHI-temp", 7_200, 0),
+        ]);
+
+        assert_eq!(selected.len(), 2);
+        assert!(selected.iter().any(|row| row.market_ticker == "KXBTC15M-near"));
+        assert!(!selected.iter().any(|row| row.market_ticker == "KXBTC15M-far"));
+    }
+
+    #[test]
+    fn decision_selection_prefers_nearest_valid_crypto_market() {
+        let selected = select_decision_snapshots(vec![
+            sample_snapshot(MarketFamily::Crypto, "xrp", "KXXRP15M-expired", 0, 0),
+            sample_snapshot(MarketFamily::Crypto, "xrp", "KXXRP15M-front", 389, 0),
+            sample_snapshot(MarketFamily::Crypto, "xrp", "KXXRP15M-next", 1_289, 0),
+            sample_snapshot(MarketFamily::Crypto, "xrp", "KXXRP15M-too-far", 5_000, 0),
+        ]);
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].market_ticker, "KXXRP15M-front");
+    }
+
+    #[test]
+    fn crypto_decision_horizon_matches_short_horizon_contracts() {
+        assert_eq!(crypto_decision_horizon_seconds(15), 2700);
+    }
+
+    #[test]
+    fn recent_lane_decisions_are_deduped_by_poll_window() {
+        assert!(should_skip_recent_lane_decision(Utc::now() - Duration::seconds(5), 15));
+        assert!(!should_skip_recent_lane_decision(
+            Utc::now() - Duration::seconds(20),
+            15
+        ));
     }
 }

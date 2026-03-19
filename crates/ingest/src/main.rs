@@ -2,15 +2,17 @@ use anyhow::Result;
 use async_nats::Client as NatsClient;
 use chrono::{DateTime, Utc};
 use common::{
-    AppConfig, KalshiMarketState, ReferencePriceState, TradeMode, events::ReferencePriceTick,
+    AppConfig, KalshiMarketState, MarketFamily, ReferencePriceState, TradeMode,
+    WeatherReferenceState, events::ReferencePriceTick,
     kalshi_api_key_id, kalshi_private_key, kalshi_sign_rest_request,
     kalshi_sign_ws_connect_request, kalshi_timestamp_ms, subjects,
 };
 use futures::{SinkExt, StreamExt};
 use redis::AsyncCommands;
 use reqwest::Client as HttpClient;
+use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::{HashMap, HashSet}, sync::Arc};
 use storage::{LiveFillSyncRecord, LiveOrderSyncRecord, LivePositionSyncRecord};
 use tokio::{
     sync::RwLock,
@@ -27,11 +29,112 @@ use tokio_tungstenite::{
 use tracing::{info, warn};
 
 const REDIS_MARKETS_KEY: &str = "v3:kalshi:markets";
+const REDIS_WEATHER_REFERENCE_PREFIX: &str = "v3:weather:reference:";
 const REDIS_TTL_SECONDS: u64 = 300;
 const WS_RECONNECT_MAX_SECONDS: u64 = 30;
 
 type MarketCache = Arc<RwLock<HashMap<String, KalshiMarketState>>>;
 type ReferenceCache = Arc<RwLock<HashMap<String, ReferencePriceState>>>;
+type WeatherReferenceCache = Arc<RwLock<HashMap<String, WeatherReferenceState>>>;
+
+const WEATHER_HIGH_KIND: &str = "daily_high_temperature";
+const WEATHER_LOW_KIND: &str = "daily_low_temperature";
+const WEATHER_MODEL_NAME: &str = "weather_threshold_v1";
+
+#[derive(Debug, Clone)]
+struct SeriesDiscovery {
+    market_family: MarketFamily,
+    series_ticker: String,
+    series_title: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct WeatherSeriesMetadata {
+    city: String,
+    contract_kind: String,
+}
+
+#[derive(Debug, Clone)]
+struct WeatherMarketMetadata {
+    city: String,
+    contract_kind: String,
+    market_date: String,
+    strike_type: String,
+    floor_strike: Option<f64>,
+    cap_strike: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenMeteoGeocodeResponse {
+    results: Option<Vec<OpenMeteoGeocodeResult>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenMeteoGeocodeResult {
+    latitude: f64,
+    longitude: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct NwsPointsResponse {
+    properties: NwsPointsProperties,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NwsPointsProperties {
+    forecast_hourly: String,
+    observation_stations: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct NwsHourlyForecastResponse {
+    properties: NwsHourlyForecastProperties,
+}
+
+#[derive(Debug, Deserialize)]
+struct NwsHourlyForecastProperties {
+    periods: Vec<NwsHourlyForecastPeriod>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NwsHourlyForecastPeriod {
+    start_time: String,
+    temperature: Option<f64>,
+    temperature_unit: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NwsStationsResponse {
+    features: Vec<NwsStationFeature>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NwsStationFeature {
+    properties: NwsStationProperties,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NwsStationProperties {
+    station_identifier: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct NwsObservationResponse {
+    properties: NwsObservationProperties,
+}
+
+#[derive(Debug, Deserialize)]
+struct NwsObservationProperties {
+    temperature: NwsQuantitativeValue,
+}
+
+#[derive(Debug, Deserialize)]
+struct NwsQuantitativeValue {
+    value: Option<f64>,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -52,6 +155,7 @@ async fn main() -> Result<()> {
 
     let market_cache: MarketCache = Arc::new(RwLock::new(HashMap::new()));
     let reference_cache: ReferenceCache = Arc::new(RwLock::new(HashMap::new()));
+    let weather_reference_cache: WeatherReferenceCache = Arc::new(RwLock::new(HashMap::new()));
 
     let bootstrap_markets = fetch_kalshi_markets(&config, &http).await?;
     refresh_market_cache(
@@ -103,6 +207,7 @@ async fn main() -> Result<()> {
             &storage,
             &market_cache,
             &reference_cache,
+            &weather_reference_cache,
         )
         .await
         {
@@ -142,6 +247,7 @@ async fn recovery_sync_once(
     storage: &storage::Storage,
     market_cache: &MarketCache,
     reference_cache: &ReferenceCache,
+    weather_reference_cache: &WeatherReferenceCache,
 ) -> Result<(usize, usize, bool, bool)> {
     let markets = fetch_kalshi_markets(config, http).await?;
     refresh_market_cache(
@@ -180,6 +286,25 @@ async fn recovery_sync_once(
         }
         reference_count += reference_cache.read().await.contains_key(&symbol_key) as usize;
     }
+
+    let weather_markets = market_cache
+        .read()
+        .await
+        .values()
+        .filter(|market| market.market_family == MarketFamily::Weather)
+        .cloned()
+        .collect::<Vec<_>>();
+    let weather_reference_count = sync_weather_reference_states(
+        config,
+        http,
+        redis_client,
+        storage,
+        nats,
+        weather_reference_cache,
+        &weather_markets,
+    )
+    .await?;
+    reference_count += weather_reference_count;
 
     let live_balance_synced = match fetch_live_balance(config, http).await {
         Ok(Some(balance)) => {
@@ -523,6 +648,7 @@ async fn process_coinbase_ws_message(
         .unwrap_or(price);
 
     let state = ReferencePriceState {
+        market_family: MarketFamily::Crypto,
         source: "coinbase_ws".to_string(),
         symbol,
         price,
@@ -691,26 +817,403 @@ async fn fetch_kalshi_markets(
     http: &HttpClient,
 ) -> Result<Vec<KalshiMarketState>> {
     let mut out = Vec::new();
-    for series in &config.kalshi_series_tickers {
+    let discovered_series = discover_series(config, http).await?;
+    for series in discovered_series {
         let url = format!("{}/markets", config.kalshi_api_base.trim_end_matches('/'));
-        let response = http
-            .get(url)
-            .query(&[("series_ticker", series.as_str()), ("limit", "50")])
-            .send()
-            .await?
-            .error_for_status()?;
-        let payload: Value = response.json().await?;
-        let Some(markets) = payload.get("markets").and_then(Value::as_array) else {
-            continue;
-        };
-        for item in markets {
-            if let Some(market) = normalize_market(item) {
-                out.push(market);
+        let mut cursor: Option<String> = None;
+        let mut pages_fetched = 0usize;
+        let mut found_near_term_crypto = false;
+
+        loop {
+            let mut request = http.get(&url).query(&[
+                ("series_ticker", series.series_ticker.as_str()),
+                ("limit", "50"),
+            ]);
+            if let Some(cursor_value) = cursor.as_deref() {
+                request = request.query(&[("cursor", cursor_value)]);
             }
+
+            let response = match request.send().await?.error_for_status() {
+                Ok(response) => response,
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        series_ticker = %series.series_ticker,
+                        market_family = ?series.market_family,
+                        cursor = cursor,
+                        "series_market_fetch_failed"
+                    );
+                    break;
+                }
+            };
+            let payload: Value = response.json().await?;
+            let Some(markets) = payload.get("markets").and_then(Value::as_array) else {
+                break;
+            };
+
+            for item in markets {
+                if let Some(market) =
+                    normalize_market(item, series.market_family, series.series_title.as_deref())
+                {
+                    if series.market_family == MarketFamily::Crypto
+                        && market.close_at <= Utc::now() + chrono::Duration::hours(1)
+                    {
+                        found_near_term_crypto = true;
+                    }
+                    out.push(market);
+                }
+            }
+
+            pages_fetched += 1;
+            let next_cursor = payload
+                .get("cursor")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            if !should_fetch_next_market_page(
+                series.market_family,
+                found_near_term_crypto,
+                pages_fetched,
+                next_cursor.is_some(),
+            ) {
+                break;
+            }
+            cursor = next_cursor;
         }
     }
     out.sort_by(|left, right| left.close_at.cmp(&right.close_at));
     Ok(out)
+}
+
+fn should_fetch_next_market_page(
+    market_family: MarketFamily,
+    found_near_term_crypto: bool,
+    pages_fetched: usize,
+    has_next_cursor: bool,
+) -> bool {
+    if !has_next_cursor {
+        return false;
+    }
+    match market_family {
+        MarketFamily::Crypto => !found_near_term_crypto && pages_fetched < 4,
+        _ => false,
+    }
+}
+
+async fn discover_series(config: &AppConfig, http: &HttpClient) -> Result<Vec<SeriesDiscovery>> {
+    let mut out = config
+        .kalshi_series_tickers
+        .iter()
+        .map(|series_ticker| SeriesDiscovery {
+            market_family: MarketFamily::Crypto,
+            series_ticker: series_ticker.clone(),
+            series_title: None,
+        })
+        .collect::<Vec<_>>();
+
+    match fetch_weather_series(config, http).await {
+        Ok(weather_series) => out.extend(weather_series),
+        Err(error) => {
+            warn!(error = %error, "weather_series_discovery_failed");
+        }
+    }
+    Ok(out)
+}
+
+async fn fetch_weather_series(
+    config: &AppConfig,
+    http: &HttpClient,
+) -> Result<Vec<SeriesDiscovery>> {
+    let url = format!("{}/series", config.kalshi_api_base.trim_end_matches('/'));
+    let response = http
+        .get(url)
+        .query(&[("limit", "1000")])
+        .send()
+        .await?
+        .error_for_status()?;
+    let payload: Value = response.json().await?;
+    let Some(series) = payload.get("series").and_then(Value::as_array) else {
+        return Ok(Vec::new());
+    };
+
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for item in series {
+        let Some(category) = item.get("category").and_then(Value::as_str) else {
+            continue;
+        };
+        if !category.eq_ignore_ascii_case(&config.weather_series_category) {
+            continue;
+        }
+        let Some(title) = item.get("title").and_then(Value::as_str) else {
+            continue;
+        };
+        let title_matches = config
+            .weather_series_title_patterns
+            .iter()
+            .any(|pattern| title.to_lowercase().contains(&pattern.to_lowercase()));
+        if !title_matches {
+            continue;
+        }
+        let Some(ticker) = item.get("ticker").and_then(Value::as_str) else {
+            continue;
+        };
+        if !seen.insert(ticker.to_string()) {
+            continue;
+        }
+        out.push(SeriesDiscovery {
+            market_family: MarketFamily::Weather,
+            series_ticker: ticker.to_string(),
+            series_title: Some(title.to_string()),
+        });
+        if out.len() >= config.weather_series_poll_limit {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+async fn sync_weather_reference_states(
+    config: &AppConfig,
+    http: &HttpClient,
+    redis_client: &redis::Client,
+    storage: &storage::Storage,
+    nats: Option<&NatsClient>,
+    weather_reference_cache: &WeatherReferenceCache,
+    markets: &[KalshiMarketState],
+) -> Result<usize> {
+    let mut seen = HashSet::new();
+    let now = Utc::now();
+    for market in markets {
+        let Some(metadata) = weather_metadata_from_market(market) else {
+            continue;
+        };
+        let reference_key = weather_reference_cache_key(
+            &metadata.city,
+            &metadata.market_date,
+            &metadata.contract_kind,
+        );
+        if !seen.insert(reference_key.clone()) {
+            continue;
+        }
+        let should_refresh = {
+            let cache = weather_reference_cache.read().await;
+            cache.get(&reference_key).is_none_or(|state| {
+                state.source != "nws_hourly_forecast"
+                    || (now - state.updated_at).num_seconds()
+                        > config.weather_reference_refresh_seconds as i64
+            })
+        };
+        if !should_refresh {
+            continue;
+        }
+        let weather_state = match fetch_weather_reference_state(config, http, &metadata).await {
+            Ok(state) => state,
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    city = %metadata.city,
+                    contract_kind = %metadata.contract_kind,
+                    market_date = %metadata.market_date,
+                    "weather_reference_refresh_failed"
+                );
+                continue;
+            }
+        };
+        if let Some(state) = weather_state {
+            upsert_weather_reference_state(
+                redis_client,
+                storage,
+                nats,
+                weather_reference_cache,
+                state,
+                "nws_hourly_forecast",
+            )
+            .await?;
+        }
+    }
+
+    Ok(weather_reference_cache.read().await.len())
+}
+
+async fn upsert_weather_reference_state(
+    redis_client: &redis::Client,
+    storage: &storage::Storage,
+    nats: Option<&NatsClient>,
+    weather_reference_cache: &WeatherReferenceCache,
+    state: WeatherReferenceState,
+    source: &str,
+) -> Result<()> {
+    {
+        let mut cache = weather_reference_cache.write().await;
+        cache.insert(state.reference_key.clone(), state.clone());
+    }
+
+    let mut redis = redis_client.get_multiplexed_async_connection().await?;
+    let key = format!("{}{}", REDIS_WEATHER_REFERENCE_PREFIX, state.reference_key);
+    let _: () = redis
+        .set_ex(key, serde_json::to_string(&state)?, REDIS_TTL_SECONDS)
+        .await?;
+
+    if let Some(client) = nats {
+        let tick = ReferencePriceTick {
+            source: state.source.clone(),
+            symbol: state.reference_key.clone(),
+            price: state.forecast_temperature_f,
+            averaging_window_seconds: 86_400,
+            quality_score: state.confidence_score,
+        };
+        if let Err(error) = client
+            .publish(
+                subjects::REFERENCE_PRICE_TICK,
+                serde_json::to_vec(&tick)?.into(),
+            )
+            .await
+        {
+            warn!(error = %error, "weather_reference_tick_publish_failed");
+        }
+    }
+
+    storage
+        .insert_ingest_event(
+            "weather_public",
+            source,
+            &state.reference_key,
+            &serde_json::to_value(&state)?,
+            state.updated_at,
+        )
+        .await?;
+    Ok(())
+}
+
+async fn fetch_weather_reference_state(
+    config: &AppConfig,
+    http: &HttpClient,
+    metadata: &WeatherMarketMetadata,
+) -> Result<Option<WeatherReferenceState>> {
+    let Some((latitude, longitude)) = resolve_weather_city_coordinates(config, http, &metadata.city).await? else {
+        return Ok(None);
+    };
+    let points_url = format!(
+        "{}/points/{latitude},{longitude}",
+        config.nws_api_base.trim_end_matches('/')
+    );
+    let points: NwsPointsResponse = http
+        .get(points_url)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    let hourly: NwsHourlyForecastResponse = http
+        .get(points.properties.forecast_hourly.as_str())
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    let forecast_temperatures = hourly
+        .properties
+        .periods
+        .iter()
+        .filter(|period| period.start_time.starts_with(&metadata.market_date))
+        .filter_map(|period| period.temperature.map(|value| nws_temperature_to_fahrenheit(value, period.temperature_unit.as_deref())))
+        .collect::<Vec<_>>();
+    let forecast_temperature_f = match metadata.contract_kind.as_str() {
+        WEATHER_LOW_KIND => forecast_temperatures.iter().copied().reduce(f64::min),
+        _ => forecast_temperatures.iter().copied().reduce(f64::max),
+    };
+    let Some(forecast_temperature_f) = forecast_temperature_f else {
+        return Ok(None);
+    };
+
+    let station_response = http
+        .get(points.properties.observation_stations.as_str())
+        .send()
+        .await?
+        .error_for_status()?;
+    let stations: NwsStationsResponse = station_response.json().await?;
+    let observation_temperature_f = if let Some(station_id) = stations
+        .features
+        .first()
+        .map(|feature| feature.properties.station_identifier.clone())
+    {
+        let observation_url = format!(
+            "{}/stations/{station_id}/observations/latest",
+            config.nws_api_base.trim_end_matches('/')
+        );
+        let observation: NwsObservationResponse = http
+            .get(observation_url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        observation.properties.temperature.value.map(celsius_to_fahrenheit)
+    } else {
+        None
+    };
+
+    let days_out = date_days_from_now(&metadata.market_date);
+    let hourly_coverage = (forecast_temperatures.len() as f64 / 24.0).clamp(0.0, 1.0);
+    let observation_bonus = if observation_temperature_f.is_some() { 0.06 } else { 0.0 };
+    let confidence_score = (0.72 + (hourly_coverage * 0.16) + observation_bonus
+        - (days_out as f64 * 0.04))
+        .clamp(0.35, 0.96);
+    Ok(Some(WeatherReferenceState {
+        market_family: MarketFamily::Weather,
+        reference_key: weather_reference_cache_key(
+            &metadata.city,
+            &metadata.market_date,
+            &metadata.contract_kind,
+        ),
+        city: metadata.city.clone(),
+        contract_kind: metadata.contract_kind.clone(),
+        market_date: metadata.market_date.clone(),
+        forecast_temperature_f,
+        observation_temperature_f,
+        confidence_score,
+        source: "nws_hourly_forecast".to_string(),
+        updated_at: Utc::now(),
+    }))
+}
+
+async fn resolve_weather_city_coordinates(
+    config: &AppConfig,
+    http: &HttpClient,
+    city: &str,
+) -> Result<Option<(f64, f64)>> {
+    if let Some(point) = canonical_weather_city(city)
+        .as_deref()
+        .and_then(weather_city_coordinates)
+    {
+        return Ok(Some(point));
+    }
+    geocode_city(config, http, city).await
+}
+
+async fn geocode_city(
+    config: &AppConfig,
+    http: &HttpClient,
+    city: &str,
+) -> Result<Option<(f64, f64)>> {
+    let response = http
+        .get(config.open_meteo_geocode_api_base.as_str())
+        .query(&[
+            ("name", city),
+            ("count", "1"),
+            ("language", "en"),
+            ("format", "json"),
+        ])
+        .send()
+        .await?
+        .error_for_status()?;
+    let payload: OpenMeteoGeocodeResponse = response.json().await?;
+    Ok(payload
+        .results
+        .and_then(|mut results| results.drain(..).next())
+        .map(|result| (result.latitude, result.longitude)))
 }
 
 async fn fetch_live_balance(config: &AppConfig, http: &HttpClient) -> Result<Option<LiveBalance>> {
@@ -831,6 +1334,7 @@ async fn fetch_reference_state(
         .unwrap_or(price);
 
     Ok(Some(ReferencePriceState {
+        market_family: MarketFamily::Crypto,
         source: "coinbase_proxy".to_string(),
         symbol: symbol.to_uppercase(),
         price,
@@ -839,7 +1343,11 @@ async fn fetch_reference_state(
     }))
 }
 
-fn normalize_market(value: &Value) -> Option<KalshiMarketState> {
+fn normalize_market(
+    value: &Value,
+    market_family: MarketFamily,
+    series_title: Option<&str>,
+) -> Option<KalshiMarketState> {
     let ticker = value.get("ticker")?.as_str()?.to_string();
     let status = value
         .get("status")
@@ -859,7 +1367,23 @@ fn normalize_market(value: &Value) -> Option<KalshiMarketState> {
         .and_then(Value::as_str)
         .unwrap_or(&ticker)
         .to_string();
-    let symbol = infer_symbol(&ticker, &title)?;
+    let weather_metadata = if market_family == MarketFamily::Weather {
+        normalize_weather_metadata(value, &title, series_title)?
+    } else {
+        WeatherMarketMetadata {
+            city: String::new(),
+            contract_kind: String::new(),
+            market_date: String::new(),
+            strike_type: String::new(),
+            floor_strike: None,
+            cap_strike: None,
+        }
+    };
+    let symbol = if market_family == MarketFamily::Weather {
+        weather_symbol(&weather_metadata.city, &weather_metadata.contract_kind)
+    } else {
+        infer_crypto_symbol(&ticker, &title)?
+    };
     let best_bid = to_f64(value.get("yes_bid_dollars"));
     let best_ask = to_f64(value.get("yes_ask_dollars"));
     let last_price = to_f64(value.get("last_price_dollars"));
@@ -870,8 +1394,14 @@ fn normalize_market(value: &Value) -> Option<KalshiMarketState> {
 
     Some(KalshiMarketState {
         market_id: stable_market_id(&ticker),
+        market_family,
         market_ticker: ticker,
         market_title: title,
+        series_ticker: value
+            .get("event_ticker")
+            .and_then(Value::as_str)
+            .and_then(|event| event.split('-').next())
+            .map(ToOwned::to_owned),
         symbol,
         window_minutes: 15,
         market_prob,
@@ -881,6 +1411,20 @@ fn normalize_market(value: &Value) -> Option<KalshiMarketState> {
         bid_size,
         ask_size,
         liquidity,
+        metadata_json: if market_family == MarketFamily::Weather {
+            json!({
+                "city": weather_metadata.city,
+                "contract_kind": weather_metadata.contract_kind,
+                "market_date": weather_metadata.market_date,
+                "strike_type": weather_metadata.strike_type,
+                "floor_strike": weather_metadata.floor_strike,
+                "cap_strike": weather_metadata.cap_strike,
+                "series_title": series_title,
+                "family_model_name": WEATHER_MODEL_NAME,
+            })
+        } else {
+            json!({})
+        },
         close_at,
         created_at: Utc::now(),
     })
@@ -926,8 +1470,10 @@ fn normalize_market_from_ws_ticker(
 
     Some(KalshiMarketState {
         market_id: existing.market_id,
+        market_family: existing.market_family,
         market_ticker: ticker,
         market_title: existing.market_title.clone(),
+        series_ticker: existing.series_ticker.clone(),
         symbol: existing.symbol.clone(),
         window_minutes: existing.window_minutes,
         market_prob: midpoint(best_bid, best_ask, last_price),
@@ -937,6 +1483,7 @@ fn normalize_market_from_ws_ticker(
         bid_size,
         ask_size,
         liquidity: bid_size + ask_size + open_interest.max(0.0),
+        metadata_json: existing.metadata_json.clone(),
         close_at: existing.close_at,
         created_at,
     })
@@ -946,13 +1493,258 @@ fn reference_key(symbol: &str) -> String {
     format!("v3:reference:{}", symbol.to_uppercase())
 }
 
-fn infer_symbol(ticker: &str, title: &str) -> Option<String> {
+fn weather_reference_cache_key(city: &str, market_date: &str, contract_kind: &str) -> String {
+    format!(
+        "{}:{}:{}",
+        normalize_weather_city(city),
+        market_date,
+        contract_kind
+    )
+}
+
+fn normalize_weather_city(city: &str) -> String {
+    city.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .replace("__", "_")
+}
+
+fn weather_symbol(city: &str, contract_kind: &str) -> String {
+    let suffix = if contract_kind == WEATHER_LOW_KIND {
+        "low_temp"
+    } else {
+        "high_temp"
+    };
+    format!("{}_{}", normalize_weather_city(city), suffix)
+}
+
+fn infer_crypto_symbol(ticker: &str, title: &str) -> Option<String> {
     for candidate in ["BTC", "ETH", "SOL", "XRP"] {
         if ticker.contains(candidate) || title.to_uppercase().contains(candidate) {
             return Some(candidate.to_string());
         }
     }
     None
+}
+
+fn normalize_weather_metadata(
+    value: &Value,
+    market_title: &str,
+    series_title: Option<&str>,
+) -> Option<WeatherMarketMetadata> {
+    let metadata = series_title.and_then(parse_weather_series_metadata).or_else(|| {
+        parse_weather_series_metadata(market_title).or_else(|| parse_weather_market_city(market_title))
+    })?;
+    let event_ticker = value.get("event_ticker").and_then(Value::as_str).unwrap_or_default();
+    let market_date = parse_market_date_from_event_ticker(event_ticker)?;
+    Some(WeatherMarketMetadata {
+        city: metadata.city,
+        contract_kind: metadata.contract_kind,
+        market_date,
+        strike_type: value
+            .get("strike_type")
+            .and_then(Value::as_str)
+            .unwrap_or("between")
+            .to_string(),
+        floor_strike: parse_f64(value.get("floor_strike")),
+        cap_strike: parse_f64(value.get("cap_strike")),
+    })
+}
+
+fn parse_weather_series_metadata(title: &str) -> Option<WeatherSeriesMetadata> {
+    let normalized = title.to_lowercase();
+    let contract_kind = if normalized.contains("highest temperature")
+        || normalized.contains("high temp")
+        || normalized.contains("max temperature")
+        || normalized.contains("maximum temperature")
+        || normalized.contains("daily high temperature")
+    {
+        WEATHER_HIGH_KIND.to_string()
+    } else if normalized.contains("lowest temperature")
+        || normalized.contains("low temp")
+        || normalized.contains("minimum temperature")
+        || normalized.contains("min temperature")
+        || normalized.contains("daily low temperature")
+    {
+        WEATHER_LOW_KIND.to_string()
+    } else {
+        return None;
+    };
+
+    let city = title
+        .split_once(" in ")
+        .map(|(_, tail)| tail.trim().to_string())
+        .or_else(|| canonical_weather_city(title))
+        .filter(|value| !value.is_empty())?;
+    Some(WeatherSeriesMetadata {
+        city,
+        contract_kind,
+    })
+}
+
+fn parse_weather_market_city(title: &str) -> Option<WeatherSeriesMetadata> {
+    let lower = title.to_lowercase();
+    let city = if let Some((_, tail)) = title.split_once(" in ") {
+        tail.split(" be ").next().map(str::trim)
+    } else {
+        None
+    }
+    .and_then(canonical_weather_city)?;
+    let contract_kind = if lower.contains("high temp") || lower.contains("highest temperature") {
+        WEATHER_HIGH_KIND.to_string()
+    } else if lower.contains("low temp") || lower.contains("lowest temperature") {
+        WEATHER_LOW_KIND.to_string()
+    } else {
+        return None;
+    };
+    Some(WeatherSeriesMetadata {
+        city,
+        contract_kind,
+    })
+}
+
+fn canonical_weather_city(input: &str) -> Option<String> {
+    let mut city = input.trim().to_string();
+    for suffix in [
+        " Daily High Temperature",
+        " Daily Low Temperature",
+        " Highest Temperature",
+        " Lowest Temperature",
+        " Maximum Temperature",
+        " Minimum Temperature",
+        " Max Temperature",
+        " Min Temperature",
+        " High Temperature",
+        " Low Temperature",
+        " High Temp",
+        " Low Temp",
+    ] {
+        if city.to_lowercase().ends_with(&suffix.to_lowercase()) {
+            let keep_len = city.len().saturating_sub(suffix.len());
+            city = city[..keep_len].trim().to_string();
+            break;
+        }
+    }
+    let canonical = match city.trim().to_ascii_uppercase().as_str() {
+        "NYC" => "New York City".to_string(),
+        "PHIL" => "Philadelphia".to_string(),
+        "LAX" => "Los Angeles".to_string(),
+        "SEA" => "Seattle".to_string(),
+        "SATX" => "San Antonio".to_string(),
+        "ATL" => "Atlanta".to_string(),
+        "AUS" => "Austin".to_string(),
+        "HOU" => "Houston".to_string(),
+        "MIA" => "Miami".to_string(),
+        "DEN" => "Denver".to_string(),
+        "DAL" => "Dallas".to_string(),
+        "CHI" => "Chicago".to_string(),
+        value if !value.is_empty() => city.trim().to_string(),
+        _ => return None,
+    };
+    Some(canonical)
+}
+
+fn parse_market_date_from_event_ticker(event_ticker: &str) -> Option<String> {
+    let raw = event_ticker.split('-').nth(1)?;
+    if raw.len() != 7 {
+        return None;
+    }
+    let year = format!("20{}", &raw[0..2]);
+    let month = match &raw[2..5] {
+        "JAN" => "01",
+        "FEB" => "02",
+        "MAR" => "03",
+        "APR" => "04",
+        "MAY" => "05",
+        "JUN" => "06",
+        "JUL" => "07",
+        "AUG" => "08",
+        "SEP" => "09",
+        "OCT" => "10",
+        "NOV" => "11",
+        "DEC" => "12",
+        _ => return None,
+    };
+    let day = &raw[5..7];
+    Some(format!("{year}-{month}-{day}"))
+}
+
+fn weather_metadata_from_market(market: &KalshiMarketState) -> Option<WeatherMarketMetadata> {
+    if market.market_family != MarketFamily::Weather {
+        return None;
+    }
+    Some(WeatherMarketMetadata {
+        city: market
+            .metadata_json
+            .get("city")
+            .and_then(Value::as_str)?
+            .to_string(),
+        contract_kind: market
+            .metadata_json
+            .get("contract_kind")
+            .and_then(Value::as_str)?
+            .to_string(),
+        market_date: market
+            .metadata_json
+            .get("market_date")
+            .and_then(Value::as_str)?
+            .to_string(),
+        strike_type: market
+            .metadata_json
+            .get("strike_type")
+            .and_then(Value::as_str)
+            .unwrap_or("between")
+            .to_string(),
+        floor_strike: parse_f64(market.metadata_json.get("floor_strike")),
+        cap_strike: parse_f64(market.metadata_json.get("cap_strike")),
+    })
+}
+
+fn date_days_from_now(market_date: &str) -> i64 {
+    chrono::NaiveDate::parse_from_str(market_date, "%Y-%m-%d")
+        .ok()
+        .map(|date| {
+            let today = Utc::now().date_naive();
+            (date - today).num_days().max(0)
+        })
+        .unwrap_or_default()
+}
+
+fn weather_city_coordinates(city: &str) -> Option<(f64, f64)> {
+    match city.to_ascii_lowercase().as_str() {
+        "new york city" => Some((40.7128, -74.0060)),
+        "philadelphia" => Some((39.9526, -75.1652)),
+        "los angeles" => Some((34.0522, -118.2437)),
+        "seattle" => Some((47.6062, -122.3321)),
+        "san antonio" => Some((29.4241, -98.4936)),
+        "atlanta" => Some((33.7490, -84.3880)),
+        "austin" => Some((30.2672, -97.7431)),
+        "houston" => Some((29.7604, -95.3698)),
+        "miami" => Some((25.7617, -80.1918)),
+        "denver" => Some((39.7392, -104.9903)),
+        "dallas" => Some((32.7767, -96.7970)),
+        "chicago" => Some((41.8781, -87.6298)),
+        "minneapolis" => Some((44.9778, -93.2650)),
+        _ => None,
+    }
+}
+
+fn nws_temperature_to_fahrenheit(value: f64, unit: Option<&str>) -> f64 {
+    match unit.unwrap_or("F").to_ascii_uppercase().as_str() {
+        "C" | "CELSIUS" => celsius_to_fahrenheit(value),
+        _ => value,
+    }
+}
+
+fn celsius_to_fahrenheit(value: f64) -> f64 {
+    (value * 9.0 / 5.0) + 32.0
 }
 
 fn stable_market_id(input: &str) -> i64 {
@@ -996,6 +1788,44 @@ fn to_i64(value: Option<&Value>) -> i64 {
                 .and_then(|raw| raw.parse::<i64>().ok())
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_fetch_next_market_page;
+    use common::MarketFamily;
+
+    #[test]
+    fn crypto_market_pagination_continues_until_near_term_market_is_found() {
+        assert!(should_fetch_next_market_page(
+            MarketFamily::Crypto,
+            false,
+            1,
+            true
+        ));
+        assert!(!should_fetch_next_market_page(
+            MarketFamily::Crypto,
+            true,
+            1,
+            true
+        ));
+        assert!(!should_fetch_next_market_page(
+            MarketFamily::Crypto,
+            false,
+            4,
+            true
+        ));
+    }
+
+    #[test]
+    fn weather_market_pagination_stays_single_page() {
+        assert!(!should_fetch_next_market_page(
+            MarketFamily::Weather,
+            false,
+            1,
+            true
+        ));
+    }
 }
 
 fn cents_to_dollars(value: Option<&Value>) -> f64 {

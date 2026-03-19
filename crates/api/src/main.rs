@@ -3,13 +3,13 @@ use std::{net::SocketAddr, sync::Arc};
 use anyhow::Result;
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     response::{Html, IntoResponse},
     routing::{get, post},
 };
 use chrono::{DateTime, Utc};
 use common::{
-    AppConfig, HealthSnapshot, RuntimeAlarm, kalshi_api_key_id, kalshi_private_key,
+    AppConfig, HealthSnapshot, MarketFamily, RuntimeAlarm, kalshi_api_key_id, kalshi_private_key,
     kalshi_sign_rest_request, kalshi_timestamp_ms,
 };
 use reqwest::Client;
@@ -43,11 +43,24 @@ struct OperatorActionRequest {
     note: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct DashboardQuery {
+    family: Option<String>,
+}
+
 #[derive(Serialize)]
 struct AcceptanceGateStatus {
     gate: String,
     status: String,
     message: String,
+}
+
+fn parse_market_family_query(value: &str) -> Option<MarketFamily> {
+    match value {
+        "crypto" => Some(MarketFamily::Crypto),
+        "weather" => Some(MarketFamily::Weather),
+        _ => None,
+    }
 }
 
 #[tokio::main]
@@ -61,7 +74,14 @@ async fn main() -> Result<()> {
     let storage = Storage::connect(&config.database_url).await?;
     storage.migrate().await?;
     storage
-        .ensure_bootstrap_state(config.initial_paper_bankroll, config.initial_live_bankroll)
+        .ensure_bootstrap_state(
+            config.initial_paper_bankroll,
+            config.initial_live_bankroll,
+            config.initial_paper_crypto_budget,
+            config.initial_paper_weather_budget,
+            config.initial_live_crypto_budget,
+            config.initial_live_weather_budget,
+        )
         .await?;
     storage
         .upsert_worker_started("api", &json!({"bind_addr": config.api_bind_addr}))
@@ -75,6 +95,7 @@ async fn main() -> Result<()> {
     };
     let app = Router::new()
         .route("/", get(index))
+        .route("/weather", get(weather_index))
         .route("/assets/app.css", get(styles))
         .route("/assets/app.js", get(script))
         .route("/healthz", get(healthz))
@@ -163,7 +184,7 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
         .pending_execution_intent_status_counts()
         .await
         .unwrap_or_default();
-    let dashboard = state.storage.dashboard_snapshot().await.ok();
+    let dashboard = state.storage.dashboard_snapshot(None).await.ok();
 
     let mut out = String::new();
     append_help(
@@ -404,6 +425,10 @@ async fn index() -> Html<&'static str> {
     Html(include_str!("../assets/index.html"))
 }
 
+async fn weather_index() -> Html<&'static str> {
+    Html(include_str!("../assets/index.html"))
+}
+
 async fn styles() -> impl IntoResponse {
     (
         [("content-type", "text/css; charset=utf-8")],
@@ -418,12 +443,16 @@ async fn script() -> impl IntoResponse {
     )
 }
 
-async fn dashboard(State(state): State<AppState>) -> Json<serde_json::Value> {
+async fn dashboard(
+    Query(query): Query<DashboardQuery>,
+    State(state): State<AppState>,
+) -> Json<serde_json::Value> {
+    let family = query.family.as_deref().and_then(parse_market_family_query);
     let _ = state
         .storage
-        .upsert_worker_success("api", &json!({"route": "dashboard"}))
+        .upsert_worker_success("api", &json!({"route": "dashboard", "family": query.family}))
         .await;
-    match state.storage.dashboard_snapshot().await {
+    match state.storage.dashboard_snapshot(family).await {
         Ok(snapshot) => Json(json!(snapshot)),
         Err(error) => Json(json!({
             "bankrolls": [],
@@ -496,7 +525,7 @@ async fn runtime(State(state): State<AppState>) -> Json<serde_json::Value> {
         .effective_live_order_placement_enabled(state.config.live_order_placement_enabled)
         .await
         .unwrap_or(false);
-    let dashboard = state.storage.dashboard_snapshot().await.ok();
+    let dashboard = state.storage.dashboard_snapshot(None).await.ok();
     let reference_feed_age_seconds = workers
         .iter()
         .find(|worker| worker.service == "ingest")
@@ -614,37 +643,43 @@ async fn operator_action(
             }
         }
         "cancel_pending_live_orders" => {
-            let mut exchange_cancelled = 0usize;
-            if let Some(client) = state.live_client.as_ref() {
-                let orders = state.storage.list_resting_live_orders(100).await;
-                if let Ok(orders) = orders {
+            async {
+                let mut exchange_cancelled = 0usize;
+                let mut exchange_cancel_failed = Vec::new();
+                if let Some(client) = state.live_client.as_ref() {
+                    let orders = state.storage.list_resting_live_orders(100).await?;
                     for order in orders {
-                        if cancel_live_order(client, &order.order_id)
-                            .await
-                            .unwrap_or(false)
-                        {
-                            exchange_cancelled += 1;
+                        match cancel_live_order(client, &order.order_id).await {
+                            Ok(true) => {
+                                exchange_cancelled += 1;
+                            }
+                            Ok(false) => {
+                                exchange_cancel_failed.push(order.order_id);
+                            }
+                            Err(error) => {
+                                exchange_cancel_failed.push(format!("{}:{error}", order.order_id));
+                            }
                         }
                     }
                 }
-            }
-            let local_cancelled = state
-                .storage
-                .cancel_live_execution_intents("operator_cancelled")
-                .await;
-            let live_sync = perform_live_sync(&state).await.ok();
-            match local_cancelled {
-                Ok(local_cancelled) => Ok(json!({
+
+                let local_cancelled = state
+                    .storage
+                    .cancel_live_execution_intents("operator_cancelled")
+                    .await?;
+                let live_sync = perform_live_sync(&state).await.ok();
+                Ok(json!({
                     "ok": true,
                     "action": action,
                     "result": {
                         "exchange_cancelled": exchange_cancelled,
+                        "exchange_cancel_failed": exchange_cancel_failed,
                         "local_cancelled": local_cancelled,
                         "live_sync": live_sync
                     }
-                })),
-                Err(error) => Err(error),
+                }))
             }
+            .await
         }
         "flatten_live_positions" => {
             async {
@@ -753,6 +788,11 @@ async fn operator_action(
 
     let _ = state
         .storage
+        .record_operator_action_event(action, "operator_api", note, &payload)
+        .await;
+
+    let _ = state
+        .storage
         .upsert_worker_success(
             "api",
             &json!({"route": "operator_action", "action": action}),
@@ -761,7 +801,7 @@ async fn operator_action(
     Json(payload)
 }
 
-fn workers_healthy(workers: &[WorkerStatusCard], config: &AppConfig) -> bool {
+fn worker_health_issues(workers: &[WorkerStatusCard], config: &AppConfig) -> Vec<String> {
     let required = [
         ("ingest", (config.market_poll_seconds as i64 * 3).max(30)),
         ("feature", (config.feature_poll_seconds as i64 * 3).max(30)),
@@ -773,19 +813,29 @@ fn workers_healthy(workers: &[WorkerStatusCard], config: &AppConfig) -> bool {
             "execution",
             (config.execution_poll_seconds as i64 * 3).max(30),
         ),
-        ("training", 180),
         ("notifier", 60),
     ];
 
-    required.iter().all(|(service, ttl_seconds)| {
+    required
+        .iter()
+        .filter_map(|(service, ttl_seconds)| {
         let Some(worker) = workers.iter().find(|worker| worker.service == *service) else {
-            return false;
+            return Some(format!("{service}:missing"));
         };
         if worker.status == "failed" {
-            return false;
+            return Some(format!("{service}:failed"));
         }
-        (Utc::now() - worker.updated_at).num_seconds() <= *ttl_seconds
+        let age_seconds = (Utc::now() - worker.updated_at).num_seconds();
+        if age_seconds > *ttl_seconds {
+            return Some(format!("{service}:stale:{age_seconds}s"));
+        }
+        None
     })
+        .collect()
+}
+
+fn workers_healthy(workers: &[WorkerStatusCard], config: &AppConfig) -> bool {
+    worker_health_issues(workers, config).is_empty()
 }
 
 fn build_runtime_alarms(
@@ -894,7 +944,8 @@ fn build_acceptance_gates(
 ) -> Vec<AcceptanceGateStatus> {
     let orphaned_intents = status_count(intent_status_counts, "orphaned");
     let pending_intents = status_count(intent_status_counts, "pending");
-    let gate_a_passed = workers_healthy(workers, config)
+    let worker_issues = worker_health_issues(workers, config);
+    let gate_a_passed = worker_issues.is_empty()
         && alarms.is_empty()
         && orphaned_intents == 0
         && pending_intents == 0;
@@ -942,8 +993,8 @@ fn build_acceptance_gates(
                     .to_string()
             } else {
                 format!(
-                    "Paper stability still needs proof: healthy_workers={}, alarms={}, pending_intents={}, orphaned_intents={}.",
-                    workers_healthy(workers, config),
+                    "Paper stability still needs proof: worker_issues=[{}], alarms={}, pending_intents={}, orphaned_intents={}.",
+                    worker_issues.join(", "),
                     alarms.len(),
                     pending_intents,
                     orphaned_intents
@@ -1434,4 +1485,263 @@ struct LiveBalance {
     bankroll: f64,
     available_balance: f64,
     open_exposure: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AcceptanceGateStatus, build_acceptance_gates, worker_health_issues, workers_healthy};
+    use chrono::{Duration, Utc};
+    use common::{
+        AppConfig, DashboardSnapshot, LaneState, LiveExceptionSnapshot, LiveExchangeSyncSummary,
+        MarketFamily, PromotionState, ReadinessSummary, RuntimeAlarm,
+    };
+    use serde_json::json;
+    use storage::WorkerStatusCard;
+
+    fn test_config() -> AppConfig {
+        AppConfig {
+            app_env: "test".to_string(),
+            api_bind_addr: "127.0.0.1:8080".to_string(),
+            database_url: "postgres://test".to_string(),
+            redis_url: "redis://test".to_string(),
+            nats_url: "nats://test".to_string(),
+            exchange: "kalshi".to_string(),
+            reference_price_mode: "proxy".to_string(),
+            reference_price_source: "coinbase_proxy".to_string(),
+            reference_averaging_window_seconds: 60,
+            nws_api_base: "https://api.weather.gov".to_string(),
+            open_meteo_geocode_api_base: "https://geocoding-api.open-meteo.com/v1/search"
+                .to_string(),
+            weather_series_category: "Climate and Weather".to_string(),
+            weather_series_title_patterns: vec!["Highest temperature".to_string()],
+            weather_series_poll_limit: 4,
+            weather_reference_refresh_seconds: 900,
+            kalshi_api_base: "https://example.com".to_string(),
+            kalshi_ws_url: "wss://example.com".to_string(),
+            kalshi_api_key_id: None,
+            kalshi_api_key_id_file: None,
+            kalshi_private_key_path: None,
+            kalshi_private_key_b64: None,
+            v2_reference_sqlite_path: None,
+            coinbase_ws_url: "wss://example.com".to_string(),
+            paper_trading_enabled: true,
+            weather_paper_trading_enabled: true,
+            live_trading_enabled: false,
+            live_order_placement_enabled: false,
+            discord_webhook_url: None,
+            initial_paper_bankroll: 1000.0,
+            initial_live_bankroll: 1000.0,
+            initial_paper_crypto_budget: 850.0,
+            initial_paper_weather_budget: 150.0,
+            initial_live_crypto_budget: 1000.0,
+            initial_live_weather_budget: 0.0,
+            kalshi_series_tickers: vec!["KXBTC15M".to_string()],
+            reference_symbols: vec!["BTC".to_string()],
+            market_poll_seconds: 15,
+            feature_poll_seconds: 15,
+            decision_poll_seconds: 15,
+            execution_poll_seconds: 15,
+            historical_import_batch_size: 5000,
+            min_edge: 0.04,
+            min_confidence: 0.42,
+            min_venue_quality: 0.2,
+            max_position_pct: 0.03,
+            live_max_position_pct: 0.02,
+            live_max_lane_exposure_pct: 0.03,
+            live_max_symbol_exposure_pct: 0.05,
+            live_portfolio_drawdown_kill_pct: 0.15,
+            paper_promotion_max_negative_replay: -0.1,
+            paper_promotion_max_negative_pnl: -5.0,
+            paper_promotion_max_brier: 0.25,
+            live_micro_min_examples: 8,
+            live_micro_min_pnl: 15.0,
+            live_micro_max_brier: 0.03,
+            live_scaled_min_examples: 3,
+            live_scaled_min_pnl: 8.0,
+            live_scaled_max_brier: 0.025,
+            live_demote_max_negative_pnl: -8.0,
+            live_entry_time_in_force: "good_till_cancelled".to_string(),
+            live_exit_time_in_force: "good_till_cancelled".to_string(),
+            live_order_replace_enabled: true,
+            live_order_replace_after_seconds: 20,
+            live_order_stale_after_seconds: 45,
+            market_stale_after_seconds: 45,
+            reference_stale_after_seconds: 45,
+            live_bankroll_stale_after_seconds: 300,
+            live_sync_stale_after_seconds: 45,
+        }
+    }
+
+    fn worker(service: &str, status: &str, age_seconds: i64) -> WorkerStatusCard {
+        WorkerStatusCard {
+            service: service.to_string(),
+            status: status.to_string(),
+            last_started_at: Some(Utc::now() - Duration::seconds(age_seconds)),
+            last_succeeded_at: Some(Utc::now() - Duration::seconds(age_seconds)),
+            last_failed_at: None,
+            last_error: None,
+            details_json: json!({}),
+            updated_at: Utc::now() - Duration::seconds(age_seconds),
+        }
+    }
+
+    fn healthy_workers() -> Vec<WorkerStatusCard> {
+        vec![
+            worker("ingest", "ok", 5),
+            worker("feature", "ok", 5),
+            worker("decision", "ok", 5),
+            worker("execution", "ok", 5),
+            worker("training", "ok", 30),
+            worker("notifier", "ok", 10),
+        ]
+    }
+
+    fn dashboard_with_lane(state: PromotionState, replay: f64, brier: f64) -> DashboardSnapshot {
+        DashboardSnapshot {
+            market_family: Some(MarketFamily::Crypto),
+            bankrolls: Vec::new(),
+            readiness: ReadinessSummary {
+                overall_status: "paper_active".to_string(),
+                shadow_count: 0,
+                paper_active_count: if state == PromotionState::PaperActive { 1 } else { 0 },
+                live_micro_count: if state == PromotionState::LiveMicro { 1 } else { 0 },
+                live_scaled_count: if state == PromotionState::LiveScaled { 1 } else { 0 },
+                quarantined_count: if state == PromotionState::Quarantined { 1 } else { 0 },
+                lanes: vec![LaneState {
+                    lane_key:
+                        "kalshi:btc:15:buy_yes:directional_settlement:trained_linear_v1".to_string(),
+                    market_family: MarketFamily::Crypto,
+                    promotion_state: state,
+                    promotion_reason: Some("paper_ready".to_string()),
+                    recent_pnl: 1.0,
+                    recent_brier: brier,
+                    recent_execution_quality: 0.9,
+                    recent_replay_expectancy: replay,
+                    quarantine_reason: None,
+                    current_champion_model: Some("trained_linear_v1".to_string()),
+                }],
+            },
+            open_trades: Vec::new(),
+            opportunities: Vec::new(),
+            live_sync: None,
+            live_exceptions: LiveExceptionSnapshot {
+                operator_control: None,
+                positions: Vec::new(),
+                orders: Vec::new(),
+                recent_fills: Vec::new(),
+                trade_exceptions: Vec::new(),
+                live_intents: Vec::new(),
+            },
+        }
+    }
+
+    fn gate_status(gates: &[AcceptanceGateStatus], gate: &str) -> String {
+        gates
+            .iter()
+            .find(|item| item.gate == gate)
+            .map(|item| item.status.clone())
+            .unwrap_or_else(|| "missing".to_string())
+    }
+
+    #[test]
+    fn workers_healthy_requires_recent_notifier() {
+        let config = test_config();
+        assert!(workers_healthy(&healthy_workers(), &config));
+        assert!(worker_health_issues(&healthy_workers(), &config).is_empty());
+
+        let mut stale = healthy_workers();
+        stale[5].updated_at = Utc::now() - Duration::seconds(90);
+        assert!(!workers_healthy(&stale, &config));
+        assert_eq!(
+            worker_health_issues(&stale, &config),
+            vec!["notifier:stale:90s".to_string()]
+        );
+    }
+
+    #[test]
+    fn workers_healthy_does_not_require_training_for_gate_a() {
+        let config = test_config();
+        let mut workers = healthy_workers();
+        let training = workers
+            .iter_mut()
+            .find(|worker| worker.service == "training")
+            .expect("training worker present");
+        training.updated_at = Utc::now() - Duration::seconds(600);
+        training.status = "running".to_string();
+
+        assert!(workers_healthy(&workers, &config));
+        assert!(worker_health_issues(&workers, &config).is_empty());
+    }
+
+    #[test]
+    fn acceptance_gate_a_fails_when_alarm_present() {
+        let config = test_config();
+        let gates = build_acceptance_gates(
+            &config,
+            Some(&dashboard_with_lane(PromotionState::PaperActive, 10.0, 0.2)),
+            &healthy_workers(),
+            &[RuntimeAlarm {
+                code: "market_feed_stale".to_string(),
+                severity: "critical".to_string(),
+                message: "stale".to_string(),
+            }],
+            &[],
+            Some(10),
+            None,
+            false,
+        );
+        assert_eq!(gate_status(&gates, "A"), "pending");
+    }
+
+    #[test]
+    fn acceptance_gate_b_requires_non_negative_replay() {
+        let config = test_config();
+        let passing = build_acceptance_gates(
+            &config,
+            Some(&dashboard_with_lane(PromotionState::PaperActive, 1.0, 0.2)),
+            &healthy_workers(),
+            &[],
+            &[],
+            Some(10),
+            None,
+            false,
+        );
+        assert_eq!(gate_status(&passing, "B"), "passed");
+
+        let failing = build_acceptance_gates(
+            &config,
+            Some(&dashboard_with_lane(PromotionState::PaperActive, -1.0, 0.2)),
+            &healthy_workers(),
+            &[],
+            &[],
+            Some(10),
+            None,
+            false,
+        );
+        assert_eq!(gate_status(&failing, "B"), "pending");
+    }
+
+    #[test]
+    fn acceptance_gate_d_requires_live_enabled_and_promoted_lane() {
+        let config = test_config();
+        let gates = build_acceptance_gates(
+            &config,
+            Some(&dashboard_with_lane(PromotionState::LiveMicro, 1.0, 0.2)),
+            &healthy_workers(),
+            &[],
+            &[],
+            Some(10),
+            Some(&LiveExchangeSyncSummary {
+                synced_at: Utc::now(),
+                positions_count: 0,
+                resting_orders_count: 0,
+                recent_fills_count: 0,
+                local_open_live_trades_count: 0,
+                status: "ok".to_string(),
+                issues: Vec::new(),
+            }),
+            false,
+        );
+        assert_eq!(gate_status(&gates, "D"), "pending");
+    }
 }

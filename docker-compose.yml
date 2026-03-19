@@ -4,6 +4,33 @@ x-logging: &default-logging
     max-size: "10m"
     max-file: "5"
 
+x-app-build: &app-build
+  context: .
+  dockerfile: Dockerfile
+
+x-app-service: &app-service
+  image: kalshi-v3-app:latest
+  build: *app-build
+  env_file:
+    - .env
+  environment:
+    DATABASE_URL: postgres://kalshi:kalshi@timescaledb:5432/kalshi_v3
+    REDIS_URL: redis://redis:6379
+    NATS_URL: nats://nats:4222
+    KALSHI_PRIVATE_KEY_PATH: /run/secrets/kalshi-private-key.pem
+    KALSHI_PRIVATE_KEY_B64: ${KALSHI_PRIVATE_KEY_B64:-}
+  volumes:
+    - ${KALSHI_PRIVATE_KEY_PATH}:/run/secrets/kalshi-private-key.pem:ro
+  restart: unless-stopped
+  logging: *default-logging
+  depends_on:
+    timescaledb:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    nats:
+      condition: service_healthy
+
 services:
   timescaledb:
     image: timescale/timescaledb:latest-pg17
@@ -71,12 +98,8 @@ services:
     logging: *default-logging
 
   api:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    <<: *app-service
     container_name: kalshi-v3-api
-    env_file:
-      - .env
     environment:
       API_BIND_ADDR: 0.0.0.0:8080
       DATABASE_URL: postgres://kalshi:kalshi@timescaledb:5432/kalshi_v3
@@ -84,20 +107,9 @@ services:
       NATS_URL: nats://nats:4222
       KALSHI_PRIVATE_KEY_PATH: /run/secrets/kalshi-private-key.pem
       KALSHI_PRIVATE_KEY_B64: ${KALSHI_PRIVATE_KEY_B64:-}
-    volumes:
-      - ${KALSHI_PRIVATE_KEY_PATH}:/run/secrets/kalshi-private-key.pem:ro
     command: ["/app/bin/api"]
     ports:
       - "8080:8080"
-    restart: unless-stopped
-    logging: *default-logging
-    depends_on:
-      timescaledb:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      nats:
-        condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/healthz >/dev/null"]
       interval: 15s
@@ -105,116 +117,28 @@ services:
       retries: 10
 
   ingest:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    <<: *app-service
     container_name: kalshi-v3-ingest
-    env_file:
-      - .env
-    environment:
-      DATABASE_URL: postgres://kalshi:kalshi@timescaledb:5432/kalshi_v3
-      REDIS_URL: redis://redis:6379
-      NATS_URL: nats://nats:4222
-      KALSHI_PRIVATE_KEY_PATH: /run/secrets/kalshi-private-key.pem
-      KALSHI_PRIVATE_KEY_B64: ${KALSHI_PRIVATE_KEY_B64:-}
-    volumes:
-      - ${KALSHI_PRIVATE_KEY_PATH}:/run/secrets/kalshi-private-key.pem:ro
     command: ["/app/bin/ingest"]
-    restart: unless-stopped
-    logging: *default-logging
-    depends_on:
-      timescaledb:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      nats:
-        condition: service_healthy
 
   feature:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    <<: *app-service
     container_name: kalshi-v3-feature
-    env_file:
-      - .env
-    environment:
-      DATABASE_URL: postgres://kalshi:kalshi@timescaledb:5432/kalshi_v3
-      REDIS_URL: redis://redis:6379
-      NATS_URL: nats://nats:4222
-      KALSHI_PRIVATE_KEY_PATH: /run/secrets/kalshi-private-key.pem
-      KALSHI_PRIVATE_KEY_B64: ${KALSHI_PRIVATE_KEY_B64:-}
-    volumes:
-      - ${KALSHI_PRIVATE_KEY_PATH}:/run/secrets/kalshi-private-key.pem:ro
     command: ["/app/bin/feature"]
-    restart: unless-stopped
-    logging: *default-logging
-    depends_on:
-      timescaledb:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      nats:
-        condition: service_healthy
 
   decision:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    <<: *app-service
     container_name: kalshi-v3-decision
-    env_file:
-      - .env
-    environment:
-      DATABASE_URL: postgres://kalshi:kalshi@timescaledb:5432/kalshi_v3
-      REDIS_URL: redis://redis:6379
-      NATS_URL: nats://nats:4222
-      KALSHI_PRIVATE_KEY_PATH: /run/secrets/kalshi-private-key.pem
-      KALSHI_PRIVATE_KEY_B64: ${KALSHI_PRIVATE_KEY_B64:-}
-    volumes:
-      - ${KALSHI_PRIVATE_KEY_PATH}:/run/secrets/kalshi-private-key.pem:ro
     command: ["/app/bin/decision"]
-    restart: unless-stopped
-    logging: *default-logging
-    depends_on:
-      timescaledb:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      nats:
-        condition: service_healthy
 
   execution:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    <<: *app-service
     container_name: kalshi-v3-execution
-    env_file:
-      - .env
-    environment:
-      DATABASE_URL: postgres://kalshi:kalshi@timescaledb:5432/kalshi_v3
-      REDIS_URL: redis://redis:6379
-      NATS_URL: nats://nats:4222
-      KALSHI_PRIVATE_KEY_PATH: /run/secrets/kalshi-private-key.pem
-      KALSHI_PRIVATE_KEY_B64: ${KALSHI_PRIVATE_KEY_B64:-}
-    volumes:
-      - ${KALSHI_PRIVATE_KEY_PATH}:/run/secrets/kalshi-private-key.pem:ro
     command: ["/app/bin/execution"]
-    restart: unless-stopped
-    logging: *default-logging
-    depends_on:
-      timescaledb:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      nats:
-        condition: service_healthy
 
   training:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    <<: *app-service
     container_name: kalshi-v3-training
-    env_file:
-      - .env
     environment:
       DATABASE_URL: postgres://kalshi:kalshi@timescaledb:5432/kalshi_v3
       REDIS_URL: redis://redis:6379
@@ -226,38 +150,8 @@ services:
       - ${KALSHI_PRIVATE_KEY_PATH}:/run/secrets/kalshi-private-key.pem:ro
       - ${V2_REFERENCE_SQLITE_PATH}:/reference/v2/clawbot_local.db:ro
     command: ["/app/bin/training"]
-    restart: unless-stopped
-    logging: *default-logging
-    depends_on:
-      timescaledb:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      nats:
-        condition: service_healthy
 
   notifier:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    <<: *app-service
     container_name: kalshi-v3-notifier
-    env_file:
-      - .env
-    environment:
-      DATABASE_URL: postgres://kalshi:kalshi@timescaledb:5432/kalshi_v3
-      REDIS_URL: redis://redis:6379
-      NATS_URL: nats://nats:4222
-      KALSHI_PRIVATE_KEY_PATH: /run/secrets/kalshi-private-key.pem
-      KALSHI_PRIVATE_KEY_B64: ${KALSHI_PRIVATE_KEY_B64:-}
-    volumes:
-      - ${KALSHI_PRIVATE_KEY_PATH}:/run/secrets/kalshi-private-key.pem:ro
     command: ["/app/bin/notifier"]
-    restart: unless-stopped
-    logging: *default-logging
-    depends_on:
-      timescaledb:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      nats:
-        condition: service_healthy

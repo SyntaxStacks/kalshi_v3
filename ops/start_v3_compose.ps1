@@ -6,10 +6,10 @@ $ErrorActionPreference = "Stop"
 
 Push-Location $RepoRoot
 try {
-    docker compose up -d --build
+    docker compose build api
+    docker compose up -d
     docker compose ps
 }
 finally {
     Pop-Location
 }
-

@@ -11,6 +11,21 @@ pub enum StrategyFamily {
     PreSettlementScalp,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Type)]
+#[sqlx(type_name = "text", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum MarketFamily {
+    All,
+    Crypto,
+    Weather,
+}
+
+impl Default for MarketFamily {
+    fn default() -> Self {
+        Self::Crypto
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Type)]
 #[sqlx(type_name = "text", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
@@ -40,6 +55,7 @@ pub struct HealthSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelInference {
     pub market_id: i64,
+    pub market_family: MarketFamily,
     pub lane_key: String,
     pub strategy_family: StrategyFamily,
     pub model_name: String,
@@ -55,6 +71,7 @@ pub struct ModelInference {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketFeatureSnapshotRecord {
     pub market_id: i64,
+    pub market_family: MarketFamily,
     pub market_ticker: String,
     pub market_title: String,
     pub feature_version: String,
@@ -85,14 +102,28 @@ pub struct MarketFeatureSnapshotRecord {
     pub last_minute_avg_proxy: f64,
     pub market_data_age_seconds: i32,
     pub reference_age_seconds: i32,
+    pub weather_city: Option<String>,
+    pub weather_contract_kind: Option<String>,
+    pub weather_market_date: Option<String>,
+    pub weather_strike_type: Option<String>,
+    pub weather_floor_strike: Option<f64>,
+    pub weather_cap_strike: Option<f64>,
+    pub weather_forecast_temperature_f: Option<f64>,
+    pub weather_observation_temperature_f: Option<f64>,
+    pub weather_reference_confidence: Option<f64>,
+    pub weather_reference_source: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KalshiMarketState {
     pub market_id: i64,
+    #[serde(default)]
+    pub market_family: MarketFamily,
     pub market_ticker: String,
     pub market_title: String,
+    #[serde(default)]
+    pub series_ticker: Option<String>,
     pub symbol: String,
     pub window_minutes: i32,
     pub market_prob: f64,
@@ -102,12 +133,16 @@ pub struct KalshiMarketState {
     pub bid_size: f64,
     pub ask_size: f64,
     pub liquidity: f64,
+    #[serde(default = "default_metadata_json")]
+    pub metadata_json: serde_json::Value,
     pub close_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReferencePriceState {
+    #[serde(default)]
+    pub market_family: MarketFamily,
     pub source: String,
     pub symbol: String,
     pub price: f64,
@@ -116,8 +151,24 @@ pub struct ReferencePriceState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WeatherReferenceState {
+    #[serde(default = "default_weather_market_family")]
+    pub market_family: MarketFamily,
+    pub reference_key: String,
+    pub city: String,
+    pub contract_kind: String,
+    pub market_date: String,
+    pub forecast_temperature_f: f64,
+    pub observation_temperature_f: Option<f64>,
+    pub confidence_score: f64,
+    pub source: String,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpportunityDecision {
     pub market_id: i64,
+    pub market_family: MarketFamily,
     pub lane_key: String,
     pub strategy_family: StrategyFamily,
     pub model_name: String,
@@ -145,6 +196,7 @@ pub struct ExecutionIntent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LaneState {
     pub lane_key: String,
+    pub market_family: MarketFamily,
     pub promotion_state: PromotionState,
     pub promotion_reason: Option<String>,
     pub recent_pnl: f64,
@@ -158,6 +210,7 @@ pub struct LaneState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BankrollCard {
     pub scope: String,
+    pub market_family: MarketFamily,
     pub mode: TradeMode,
     pub strategy_family: StrategyFamily,
     pub bankroll: f64,
@@ -183,8 +236,17 @@ pub struct ReadinessSummary {
 pub struct OpenTradeSummary {
     pub trade_id: i64,
     pub lane_key: String,
+    pub market_family: MarketFamily,
     pub strategy_family: StrategyFamily,
     pub mode: TradeMode,
+    pub market_ticker: Option<String>,
+    pub market_title: Option<String>,
+    pub weather_city: Option<String>,
+    pub weather_contract_kind: Option<String>,
+    pub weather_market_date: Option<String>,
+    pub weather_strike_type: Option<String>,
+    pub weather_floor_strike: Option<f64>,
+    pub weather_cap_strike: Option<f64>,
     pub quantity: f64,
     pub entry_price: f64,
     pub created_at: DateTime<Utc>,
@@ -194,6 +256,7 @@ pub struct OpenTradeSummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpportunityCard {
     pub lane_key: String,
+    pub market_family: MarketFamily,
     pub strategy_family: StrategyFamily,
     pub side: String,
     pub market_prob: f64,
@@ -202,6 +265,8 @@ pub struct OpportunityCard {
     pub confidence: f64,
     pub approved: bool,
     pub reasons: Vec<String>,
+    pub execution_status: Option<String>,
+    pub execution_note: Option<String>,
     pub as_of: DateTime<Utc>,
 }
 
@@ -229,6 +294,29 @@ pub struct RuntimeAlarm {
     pub code: String,
     pub severity: String,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CriticalAlertNotification {
+    pub alert_key: String,
+    pub headline: String,
+    pub severity: String,
+    pub reason: String,
+    pub subsystem: String,
+    pub affected_lane: Option<String>,
+    pub current_state: Option<String>,
+    pub next_action: Option<String>,
+    pub occurred_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorActionEvent {
+    pub id: i64,
+    pub action: String,
+    pub actor: Option<String>,
+    pub note: Option<String>,
+    pub payload_json: serde_json::Value,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -311,6 +399,7 @@ pub struct LiveExceptionSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LaneTradeCard {
     pub trade_id: i64,
+    pub market_family: MarketFamily,
     pub status: String,
     pub mode: TradeMode,
     pub quantity: f64,
@@ -345,6 +434,7 @@ pub struct LaneReplaySummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LaneInspectionSnapshot {
     pub lane_key: String,
+    pub market_family: MarketFamily,
     pub lane_state: Option<LaneState>,
     pub recent_opportunities: Vec<OpportunityCard>,
     pub recent_trades: Vec<LaneTradeCard>,
@@ -353,12 +443,21 @@ pub struct LaneInspectionSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DashboardSnapshot {
+    pub market_family: Option<MarketFamily>,
     pub bankrolls: Vec<BankrollCard>,
     pub readiness: ReadinessSummary,
     pub open_trades: Vec<OpenTradeSummary>,
     pub opportunities: Vec<OpportunityCard>,
     pub live_sync: Option<LiveExchangeSyncSummary>,
     pub live_exceptions: LiveExceptionSnapshot,
+}
+
+fn default_metadata_json() -> serde_json::Value {
+    serde_json::json!({})
+}
+
+fn default_weather_market_family() -> MarketFamily {
+    MarketFamily::Weather
 }
 
 pub fn lane_key(

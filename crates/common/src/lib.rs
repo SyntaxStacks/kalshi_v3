@@ -5,13 +5,14 @@ pub mod kalshi;
 
 pub use config::AppConfig;
 pub use domain::{
-    BankrollCard, DashboardSnapshot, ExecutionIntent, HealthSnapshot, KalshiMarketState,
-    LaneInspectionSnapshot, LaneReplaySummary, LaneState, LaneTradeCard, LiveExceptionSnapshot,
-    LiveExchangeSyncSummary, LiveFillCard, LiveIntentCard, LiveOrderCard, LivePositionCard,
-    LiveTradeExceptionCard, MarketFeatureSnapshotRecord, ModelInference, OpenTradeSummary,
-    OperatorControlState, OpportunityCard, OpportunityDecision, PromotionState,
-    ReadinessSummary, ReferencePriceState, ReplayBenchmarkCard, RuntimeAlarm, StrategyFamily,
-    TradeMode, lane_key,
+    BankrollCard, CriticalAlertNotification, DashboardSnapshot, ExecutionIntent, HealthSnapshot,
+    KalshiMarketState, LaneInspectionSnapshot, LaneReplaySummary, LaneState, LaneTradeCard,
+    LiveExceptionSnapshot, LiveExchangeSyncSummary, LiveFillCard, LiveIntentCard, LiveOrderCard,
+    LivePositionCard, LiveTradeExceptionCard, MarketFamily, MarketFeatureSnapshotRecord,
+    ModelInference, OpenTradeSummary, OperatorActionEvent, OperatorControlState, OpportunityCard,
+    OpportunityDecision, PromotionState, ReadinessSummary, ReferencePriceState,
+    WeatherReferenceState,
+    ReplayBenchmarkCard, RuntimeAlarm, StrategyFamily, TradeMode, lane_key,
 };
 pub use events::subjects;
 pub use kalshi::{

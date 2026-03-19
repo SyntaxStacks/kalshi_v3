@@ -1,5 +1,10 @@
+function currentFamily() {
+  return window.location.pathname.startsWith("/weather") ? "weather" : "crypto";
+}
+
 async function loadDashboard() {
-  const response = await fetch("/v1/dashboard");
+  const family = currentFamily();
+  const response = await fetch(`/v1/dashboard?family=${family}`);
   if (!response.ok) {
     throw new Error(`dashboard request failed: ${response.status}`);
   }
@@ -13,6 +18,9 @@ async function loadRuntime() {
   }
   return response.json();
 }
+
+const AUTO_REFRESH_MS = 15000;
+let refreshPromise = null;
 
 async function postOperatorAction(action) {
   const response = await fetch("/v1/operator/action", {
@@ -41,10 +49,164 @@ function dateTime(value) {
   return new Date(value).toLocaleString();
 }
 
+function parseLaneKey(laneKey) {
+  const [exchange, symbol, windowMinutes, side, strategyFamily, modelName] = String(laneKey || "").split(":");
+  return {
+    exchange,
+    symbol: symbol || null,
+    windowMinutes: Number(windowMinutes) || null,
+    side: side || null,
+    strategyFamily: strategyFamily || null,
+    modelName: modelName || null,
+  };
+}
+
+function kalshiTradeUrl(trade) {
+  const parsed = parseLaneKey(trade?.lane_key);
+  const symbol = (parsed.symbol || "").toLowerCase();
+  const windowMinutes = parsed.windowMinutes;
+  const ticker = String(trade?.market_ticker || "").toLowerCase();
+  const marketFamily = String(trade?.market_family || "").toLowerCase();
+
+  if (ticker) {
+    const series = ticker.split("-")[0];
+    if (marketFamily === "weather" && series) {
+      return `https://kalshi.com/markets/${series}`;
+    }
+    if (series && symbol && windowMinutes) {
+      return `https://kalshi.com/markets/${series}/${symbol}-${windowMinutes}-minute/${ticker}`;
+    }
+  }
+
+  if (symbol && windowMinutes) {
+    const series = `kx${symbol}${windowMinutes}m`;
+    return `https://kalshi.com/markets/${series}/${symbol}-${windowMinutes}-minute`;
+  }
+
+  return "https://kalshi.com/markets";
+}
+
 function titleCase(value) {
   return String(value || "")
     .replaceAll("_", " ")
     .replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function normalizeDegreeGlyphs(value) {
+  return String(value || "").replaceAll(
+    `${String.fromCharCode(194)}${String.fromCharCode(176)}`,
+    String.fromCharCode(176),
+  );
+}
+
+function formatWeatherTemp(value) {
+  if (value == null || Number.isNaN(Number(value))) return null;
+  const numeric = Number(value);
+  const rounded = Number.isInteger(numeric) ? String(numeric) : String(numeric).replace(/\.0$/, "");
+  return `${rounded}°`;
+}
+
+function formatWeatherMarketDate(value) {
+  if (!value) return null;
+  const parsed = new Date(`${value}T12:00:00Z`);
+  if (Number.isNaN(parsed.getTime())) return value;
+  return parsed.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+}
+
+function weatherBucketLabel(trade) {
+  const strikeType = String(trade?.weather_strike_type || "").toLowerCase();
+  const floor = Number(trade?.weather_floor_strike);
+  const cap = Number(trade?.weather_cap_strike);
+
+  if (strikeType === "greater" && Number.isFinite(floor)) {
+    return `${formatWeatherTemp(floor + 1)} or above`;
+  }
+  if (strikeType === "less" && Number.isFinite(cap)) {
+    return `${formatWeatherTemp(cap - 1)} or below`;
+  }
+  if (strikeType === "between" && Number.isFinite(floor) && Number.isFinite(cap)) {
+    return `${formatWeatherTemp(floor)} to ${formatWeatherTemp(cap)}`;
+  }
+  return null;
+}
+
+function weatherContractSummary(trade) {
+  const parsed = parseLaneKey(trade?.lane_key);
+  const city = trade?.weather_city || parsed.symbol || "Weather";
+  const contractKind = String(trade?.weather_contract_kind || "").toLowerCase();
+  const kindLabel = contractKind === "daily_low_temperature"
+    ? "low temp"
+    : contractKind === "daily_high_temperature"
+      ? "high temp"
+      : null;
+  const bucket = weatherBucketLabel(trade);
+  const marketDate = formatWeatherMarketDate(trade?.weather_market_date);
+  return normalizeDegreeGlyphs(cleanMarketTitle([titleCase(city), kindLabel, bucket, marketDate].filter(Boolean).join(" · ")));
+}
+
+function cleanMarketTitle(value) {
+  return String(value || "")
+    .replaceAll("**", "")
+    .replaceAll("Â°", "°")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function tradeHeadline(trade) {
+  if (trade?.market_family === "weather") {
+    return weatherContractSummary(trade) || cleanMarketTitle(trade?.market_title || "");
+  }
+  const parsed = parseLaneKey(trade?.lane_key);
+  const symbol = (parsed.symbol || "market").toUpperCase();
+  const side = String(parsed.side || "").toLowerCase();
+  if (side === "buy_yes") return `${symbol} YES`;
+  if (side === "buy_no") return `${symbol} NO`;
+  return symbol;
+}
+
+function tradeSubhead(trade) {
+  const parsed = parseLaneKey(trade?.lane_key);
+  if (trade?.market_family === "weather") {
+    const direction = tradeDirectionLabel(trade);
+    const bucket = weatherBucketLabel(trade);
+    return normalizeDegreeGlyphs([direction, bucket, titleCase(parsed.strategyFamily || trade?.strategy_family)].filter(Boolean).join(" · "));
+  }
+  const windowText = parsed.windowMinutes ? `${parsed.windowMinutes}m` : "short horizon";
+  const strategyText = titleCase(parsed.strategyFamily || trade?.strategy_family);
+  return `${windowText} ${strategyText}`;
+}
+
+function tradeDirectionTone(trade) {
+  const side = String(parseLaneKey(trade?.lane_key).side || "").toLowerCase();
+  if (side === "buy_yes") return "good";
+  if (side === "buy_no") return "warn";
+  return "";
+}
+
+function tradeDirectionLabel(trade) {
+  const side = String(parseLaneKey(trade?.lane_key).side || "").toLowerCase();
+  if (side === "buy_yes") return "Buy YES";
+  if (side === "buy_no") return "Buy NO";
+  return titleCase(side || "Unknown");
+}
+
+function relativeAge(value) {
+  if (!value) return "n/a";
+  const seconds = Math.max(0, Math.round((Date.now() - new Date(value).getTime()) / 1000));
+  if (seconds < 60) return `${seconds}s open`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m open`;
+  const hours = Math.floor(minutes / 60);
+  const remMinutes = minutes % 60;
+  if (hours < 24) return remMinutes ? `${hours}h ${remMinutes}m open` : `${hours}h open`;
+  const days = Math.floor(hours / 24);
+  return `${days}d open`;
+}
+
+function familyLabel(value) {
+  if (value === "all") return "Total account";
+  if (value === "weather") return "Weather";
+  return "Crypto";
 }
 
 function statusTone(status) {
@@ -63,6 +225,49 @@ function statusTone(status) {
     normalized.includes("failed") ||
     normalized.includes("disabled")
   ) return "bad";
+  return "";
+}
+
+function opportunityLabel(item) {
+  if (!item.approved) return "Blocked";
+  if (item.execution_note === "existing_open_trade_for_lane") return "Held";
+  if (item.execution_status === "opened") return "Executed";
+  if (item.execution_status === "pending") return "Queued";
+  if (item.execution_status === "submitted" || item.execution_status === "acknowledged") return "Routing";
+  if (item.execution_status) return titleCase(item.execution_status);
+  return "Approved";
+}
+
+function opportunityTone(item) {
+  if (!item.approved) return "warn";
+  if (item.execution_note === "existing_open_trade_for_lane") return "warn";
+  if (item.execution_status === "pending" || item.execution_status === "submitted" || item.execution_status === "acknowledged") return "warn";
+  if (item.execution_status === "cancelled" || item.execution_status === "rejected" || item.execution_status === "orphaned") return "bad";
+  return "good";
+}
+
+function opportunityExecutionSummary(item) {
+  if (item.execution_note === "existing_open_trade_for_lane") {
+    return "Execution held because this lane already had an open trade when the decision was approved.";
+  }
+  if (item.execution_status === "opened") {
+    return "Execution opened a trade from this decision.";
+  }
+  if (item.execution_status === "pending") {
+    return "Execution intent created and waiting for the execution worker.";
+  }
+  if (item.execution_status === "submitted" || item.execution_status === "acknowledged") {
+    return `Execution intent is currently ${item.execution_status}.`;
+  }
+  if (item.execution_status === "cancelled" || item.execution_status === "rejected" || item.execution_status === "orphaned") {
+    return `Execution ended as ${titleCase(item.execution_status)}${item.execution_note ? `: ${item.execution_note}` : "."}`;
+  }
+  if (item.execution_note) {
+    return `Execution note: ${item.execution_note}`;
+  }
+  if (item.approved) {
+    return "Approved by decisioning.";
+  }
   return "";
 }
 
@@ -85,10 +290,11 @@ function renderBankrolls(items) {
   }
 
   const grouped = items.reduce((acc, item) => {
-    const key = item.mode;
+    const key = `${item.mode}:${item.market_family || "all"}`;
     if (!acc[key]) {
       acc[key] = {
         mode: item.mode,
+        market_family: item.market_family || "all",
         bankroll: 0,
         deployable_balance: 0,
         open_exposure: 0,
@@ -112,7 +318,7 @@ function renderBankrolls(items) {
     <section class="metric-card">
       <header>
         <div>
-          <p class="eyebrow">${titleCase(item.mode)} bankroll</p>
+          <p class="eyebrow">${familyLabel(item.market_family)} · ${titleCase(item.mode)} bankroll</p>
           <h3>${money(item.bankroll)}</h3>
         </div>
         <div class="chip ${bankrollFreshness(item).tone}">${bankrollFreshness(item).label}</div>
@@ -553,17 +759,30 @@ function renderTrades(items) {
       <header>
         <div>
           <p class="eyebrow">${titleCase(trade.mode)} · ${titleCase(trade.strategy_family)}</p>
-          <strong>${trade.lane_key}</strong>
+          <div class="trade-heading-row">
+            <p class="eyebrow">${titleCase(trade.mode)} · ${tradeSubhead(trade)}</p>
+            <span class="trade-direction ${tradeDirectionTone(trade)}">${tradeDirectionLabel(trade)}</span>
+          </div>
+          <strong class="trade-headline">${tradeHeadline(trade)}</strong>
+          <p class="trade-subtitle">${trade.market_ticker || "Kalshi market link ready"}</p>
         </div>
         <div class="chip">${titleCase(trade.status)}</div>
       </header>
       <dl class="trade-grid">
         <div class="mini"><dt>Quantity</dt><dd>${trade.quantity}</dd></div>
         <div class="mini"><dt>Entry</dt><dd>${money(trade.entry_price)}</dd></div>
+        <div class="mini"><dt>Opened</dt><dd>${relativeAge(trade.created_at)}</dd></div>
+        <div class="mini"><dt>Placed</dt><dd>${dateTime(trade.created_at)}</dd></div>
       </dl>
+      <div class="trade-actions">
+        <a class="action-link" href="${kalshiTradeUrl(trade)}" target="_blank" rel="noopener noreferrer">${trade.market_ticker ? "Open on Kalshi" : "Open Kalshi series"}</a>
+      </div>
       <details>
         <summary>More detail</summary>
-        <p class="muted">Opened ${dateTime(trade.created_at)}</p>
+        ${trade.market_title ? `<p class="muted">${cleanMarketTitle(trade.market_title)}</p>` : ""}
+        ${trade.market_ticker ? `<p class="muted">Ticker ${trade.market_ticker}</p>` : ""}
+        <p class="muted">${tradeHeadline(trade)} on ${tradeSubhead(trade)}</p>
+        <p class="muted">Lane ${trade.lane_key}</p>
         <p class="mono">Trade ID ${trade.trade_id}</p>
       </details>
     </article>
@@ -573,7 +792,11 @@ function renderTrades(items) {
 function renderOpportunities(items) {
   const root = document.getElementById("opportunity-list");
   if (!items.length) {
-    root.innerHTML = `<div class="empty">No opportunities yet. Once ingest, feature, and decision workers are flowing, the latest decisions will appear here.</div>`;
+    const family = currentFamily();
+    const message = family === "crypto"
+      ? "No fresh crypto decisions right now. If Kalshi does not have a near-expiry 15m contract in range, this section will stay empty instead of showing stale decisions."
+      : "No fresh weather decisions right now. Once ingest, features, and decisioning update again, the latest weather flow will appear here.";
+    root.innerHTML = `<div class="empty">${message}</div>`;
     return;
   }
   root.innerHTML = items.map((item) => `
@@ -583,7 +806,7 @@ function renderOpportunities(items) {
           <p class="eyebrow">${titleCase(item.strategy_family)} · ${titleCase(item.side)}</p>
           <strong>${item.lane_key}</strong>
         </div>
-        <div class="chip ${item.approved ? "good" : "warn"}">${item.approved ? "Approved" : "Blocked"}</div>
+        <div class="chip ${opportunityTone(item)}">${opportunityLabel(item)}</div>
       </header>
       <dl class="trade-grid">
         <div class="mini"><dt>Edge</dt><dd class="${item.edge >= 0 ? "good" : "bad"}">${(item.edge * 100).toFixed(1)}%</dd></div>
@@ -592,6 +815,7 @@ function renderOpportunities(items) {
       <details>
         <summary>Reasons</summary>
         <p class="muted">${item.reasons?.length ? item.reasons.join(", ") : "No blocking reasons."}</p>
+        ${opportunityExecutionSummary(item) ? `<p class="muted">${opportunityExecutionSummary(item)}</p>` : ""}
         <p class="muted">As of ${dateTime(item.as_of)}</p>
       </details>
     </article>
@@ -626,23 +850,41 @@ function bindOperatorControls(refresh) {
 }
 
 async function refreshScreen() {
-  const [payload, runtime] = await Promise.all([loadDashboard(), loadRuntime()]);
-  const readiness = payload.readiness || {
-    overall_status: "shadow_only",
-    shadow_count: 0,
-    paper_active_count: 0,
-    live_micro_count: 0,
-    live_scaled_count: 0,
-    quarantined_count: 0,
-    lanes: [],
-  };
-  renderBankrolls(payload.bankrolls || []);
-  renderReadiness(readiness);
-  renderLiveSync(payload.live_sync || null);
-  renderOperatorState(runtime, readiness);
-  renderLiveExceptions(payload);
-  renderTrades(payload.open_trades || []);
-  renderOpportunities(payload.opportunities || []);
+  if (refreshPromise) {
+    return refreshPromise;
+  }
+
+  refreshPromise = (async () => {
+    const [payload, runtime] = await Promise.all([loadDashboard(), loadRuntime()]);
+    const family = currentFamily();
+    document.getElementById("hero-title").textContent = family === "weather"
+      ? "Weather family budgets, readiness, and paper flow."
+      : "Capital, readiness, and live risk in one screen.";
+    document.getElementById("family-link-crypto").classList.toggle("active", family === "crypto");
+    document.getElementById("family-link-weather").classList.toggle("active", family === "weather");
+    const readiness = payload.readiness || {
+      overall_status: "shadow_only",
+      shadow_count: 0,
+      paper_active_count: 0,
+      live_micro_count: 0,
+      live_scaled_count: 0,
+      quarantined_count: 0,
+      lanes: [],
+    };
+    renderBankrolls(payload.bankrolls || []);
+    renderReadiness(readiness);
+    renderLiveSync(payload.live_sync || null);
+    renderOperatorState(runtime, readiness);
+    renderLiveExceptions(payload);
+    renderTrades(payload.open_trades || []);
+    renderOpportunities(payload.opportunities || []);
+  })();
+
+  try {
+    await refreshPromise;
+  } finally {
+    refreshPromise = null;
+  }
 }
 
 refreshScreen()
@@ -660,3 +902,9 @@ refreshScreen()
     document.getElementById("trade-list").innerHTML = "";
     document.getElementById("opportunity-list").innerHTML = "";
   });
+
+window.setInterval(() => {
+  refreshScreen().catch((error) => {
+    console.error("auto refresh failed", error);
+  });
+}, AUTO_REFRESH_MS);

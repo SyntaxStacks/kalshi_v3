@@ -1,6 +1,6 @@
 use anyhow::Result;
 use chrono::{DateTime, NaiveDateTime, Utc};
-use common::{AppConfig, LaneState, PromotionState, StrategyFamily, lane_key};
+use common::{AppConfig, LaneState, MarketFamily, PromotionState, StrategyFamily, lane_key};
 use market_models::{
     BASELINE_LOGIT_V1, FeatureVector, TRAINED_LINEAR_CONTRARIAN_V1, TRAINED_LINEAR_V1,
     TrainedLinearWeights, supported_models,
@@ -60,13 +60,31 @@ async fn training_pass(config: &AppConfig, storage: &storage::Storage) -> Result
         info!(imported, "historical_replay_examples_imported");
     }
 
-    let snapshots = storage.list_recent_feature_snapshots(None, 5000).await?;
+    let mut snapshots = storage
+        .list_recent_feature_snapshots(Some(MarketFamily::Crypto), None, 5000)
+        .await?;
+    snapshots.extend(
+        storage
+            .list_recent_feature_snapshots(Some(MarketFamily::Weather), None, 5000)
+            .await?,
+    );
     let mut by_symbol: BTreeMap<String, Vec<_>> = BTreeMap::new();
+    let mut weather_by_symbol: BTreeMap<String, Vec<_>> = BTreeMap::new();
     for snapshot in snapshots {
-        by_symbol
-            .entry(snapshot.symbol.to_lowercase())
-            .or_default()
-            .push(snapshot);
+        match snapshot.market_family {
+            MarketFamily::Weather => {
+                weather_by_symbol
+                    .entry(snapshot.symbol.to_lowercase())
+                    .or_default()
+                    .push(snapshot);
+            }
+            _ => {
+                by_symbol
+                    .entry(snapshot.symbol.to_lowercase())
+                    .or_default()
+                    .push(snapshot);
+            }
+        }
     }
 
     let mut updated = 0usize;
@@ -81,6 +99,7 @@ async fn training_pass(config: &AppConfig, storage: &storage::Storage) -> Result
 
         let mut examples: Vec<ReplayExample> = storage
             .list_historical_replay_examples(
+                MarketFamily::Crypto,
                 &symbol,
                 StrategyFamily::DirectionalSettlement,
                 100_000,
@@ -166,6 +185,7 @@ async fn training_pass(config: &AppConfig, storage: &storage::Storage) -> Result
         storage
             .upsert_trained_model_artifact(
                 TRAINED_LINEAR_V1,
+                MarketFamily::Crypto,
                 StrategyFamily::DirectionalSettlement,
                 Some(&symbol),
                 "trained_linear_symbol_v1",
@@ -262,6 +282,7 @@ async fn training_pass(config: &AppConfig, storage: &storage::Storage) -> Result
         storage
             .upsert_lane_state(&LaneState {
                 lane_key: champion_lane,
+                market_family: MarketFamily::Crypto,
                 promotion_state,
                 promotion_reason: Some(promotion_reason(
                     config,
@@ -287,6 +308,50 @@ async fn training_pass(config: &AppConfig, storage: &storage::Storage) -> Result
                     paper_metrics.realized_pnl,
                 ),
                 current_champion_model: Some(champion.model_name.clone()),
+            })
+            .await?;
+        updated += 1;
+    }
+
+    for (symbol, snapshots) in weather_by_symbol {
+        let latest = snapshots
+            .iter()
+            .max_by(|left, right| left.created_at.cmp(&right.created_at))
+            .cloned();
+        let Some(latest) = latest else {
+            continue;
+        };
+        let promotion_state = if config.weather_paper_trading_enabled
+            && latest.weather_forecast_temperature_f.is_some()
+            && latest.weather_reference_confidence.unwrap_or_default() >= 0.25
+        {
+            PromotionState::PaperActive
+        } else {
+            PromotionState::Shadow
+        };
+        storage
+            .upsert_lane_state(&LaneState {
+                lane_key: lane_key(
+                    "kalshi",
+                    &symbol,
+                    latest.window_minutes as u32,
+                    "buy_yes",
+                    StrategyFamily::DirectionalSettlement,
+                    "weather_threshold_v1",
+                ),
+                market_family: MarketFamily::Weather,
+                promotion_state,
+                promotion_reason: Some(if matches!(promotion_state, PromotionState::PaperActive) {
+                    "weather_paper_only_rollout".to_string()
+                } else {
+                    "weather_reference_not_ready".to_string()
+                }),
+                recent_pnl: 0.0,
+                recent_brier: 0.0,
+                recent_execution_quality: latest.venue_quality_score,
+                recent_replay_expectancy: 0.0,
+                quarantine_reason: None,
+                current_champion_model: Some("weather_threshold_v1".to_string()),
             })
             .await?;
         updated += 1;
@@ -324,6 +389,7 @@ async fn persist_model_benchmark_run(
         .insert_model_benchmark_run(
             &ModelBenchmarkRunInsert {
                 lane_key: lane_key.to_string(),
+                market_family: MarketFamily::Crypto,
                 symbol: symbol.to_string(),
                 strategy_family,
                 source: source.to_string(),
@@ -367,6 +433,7 @@ async fn persist_calibration(
         };
         storage
             .upsert_probability_calibration(
+                MarketFamily::Crypto,
                 symbol,
                 strategy_family,
                 model_name,
@@ -686,6 +753,7 @@ fn load_v2_historical_batch(
         Ok(HistoricalReplayExampleInsert {
             source: "v2_sqlite".to_string(),
             source_key: format!("v2_sqlite:kalshi:{snapshot_id}"),
+            market_family: MarketFamily::Crypto,
             exchange: "kalshi".to_string(),
             symbol,
             strategy_family: StrategyFamily::DirectionalSettlement,

@@ -1,6 +1,6 @@
 use anyhow::Result;
 use common::{
-    AppConfig, StrategyFamily, TradeMode, kalshi_api_key_id, kalshi_private_key,
+    AppConfig, MarketFamily, StrategyFamily, TradeMode, kalshi_api_key_id, kalshi_private_key,
     kalshi_sign_rest_request, kalshi_timestamp_ms,
 };
 use reqwest::{Client, StatusCode};
@@ -16,6 +16,12 @@ struct LiveKalshiClient {
     api_base: String,
     api_key_id: String,
     private_key: RsaPrivateKey,
+}
+
+#[derive(Clone)]
+struct PublicKalshiClient {
+    http: Client,
+    api_base: String,
 }
 
 struct LiveFillExecution {
@@ -94,6 +100,7 @@ async fn main() -> Result<()> {
     let config = AppConfig::load()?;
     let storage = storage::Storage::connect(&config.database_url).await?;
     storage.migrate().await?;
+    let public_client = build_public_client(&config)?;
     let live_client = build_live_client(&config)?;
     storage
         .upsert_worker_started(
@@ -117,6 +124,7 @@ async fn main() -> Result<()> {
         interval.tick().await;
         match execute_once(
             &storage,
+            &public_client,
             live_client.as_ref(),
             config.live_order_placement_enabled,
             &config.live_entry_time_in_force,
@@ -171,6 +179,7 @@ async fn main() -> Result<()> {
 
 async fn execute_once(
     storage: &storage::Storage,
+    public_client: &PublicKalshiClient,
     live_client: Option<&LiveKalshiClient>,
     live_order_placement_enabled_config: bool,
     live_entry_time_in_force: &str,
@@ -221,13 +230,18 @@ async fn execute_once(
         .effective_live_order_placement_enabled(live_order_placement_enabled_config)
         .await?;
 
-    let mut paper_remaining = storage
-        .latest_portfolio_bankroll(TradeMode::Paper)
+    let mut paper_crypto_remaining = storage
+        .latest_family_bankroll(TradeMode::Paper, MarketFamily::Crypto)
+        .await?
+        .map(|card| card.deployable_balance.max(0.0))
+        .unwrap_or(0.0);
+    let mut paper_weather_remaining = storage
+        .latest_family_bankroll(TradeMode::Paper, MarketFamily::Weather)
         .await?
         .map(|card| card.deployable_balance.max(0.0))
         .unwrap_or(0.0);
     let mut live_remaining = storage
-        .latest_portfolio_bankroll(TradeMode::Live)
+        .latest_family_bankroll(TradeMode::Live, MarketFamily::Crypto)
         .await?
         .map(|card| card.deployable_balance.max(0.0))
         .unwrap_or(0.0);
@@ -251,7 +265,10 @@ async fn execute_once(
         let theoretical_entry_price = contract_price_for_side(&intent.side, intent.market_prob);
         let position_notional = intent.recommended_size.max(0.0);
         let remaining_budget = match intent.mode {
-            TradeMode::Paper => paper_remaining,
+            TradeMode::Paper => match intent.market_family {
+                MarketFamily::Weather => paper_weather_remaining,
+                _ => paper_crypto_remaining,
+            },
             TradeMode::Live => live_remaining,
         };
         if position_notional <= 0.0 || remaining_budget + f64::EPSILON < position_notional {
@@ -272,7 +289,18 @@ async fn execute_once(
                 storage
                     .open_trade_from_intent(&intent, quantity, theoretical_entry_price)
                     .await?;
-                paper_remaining = (paper_remaining - (quantity * theoretical_entry_price)).max(0.0);
+                match intent.market_family {
+                    MarketFamily::Weather => {
+                        paper_weather_remaining =
+                            (paper_weather_remaining - (quantity * theoretical_entry_price))
+                                .max(0.0);
+                    }
+                    _ => {
+                        paper_crypto_remaining =
+                            (paper_crypto_remaining - (quantity * theoretical_entry_price))
+                                .max(0.0);
+                    }
+                }
                 opened += 1;
             }
             TradeMode::Live => {
@@ -472,11 +500,41 @@ async fn execute_once(
     let mut closed = 0usize;
     for trade in open_trades {
         let now = chrono::Utc::now();
+        let trade_age_seconds = (chrono::Utc::now() - trade.created_at).num_seconds();
+        if should_force_reconcile_stale_paper_crypto_trade(&trade, trade_age_seconds) {
+            if let Some(settlement) =
+                settle_paper_crypto_trade_from_market_result(public_client, &trade).await?
+            {
+                close_trade_for_mode(
+                    storage,
+                    live_client,
+                    &trade,
+                    settlement.exit_price,
+                    &settlement.status,
+                    settlement.realized_pnl,
+                    live_exit_time_in_force,
+                )
+                .await?;
+                closed += 1;
+                continue;
+            }
+            close_trade_for_mode(
+                storage,
+                live_client,
+                &trade,
+                trade.entry_price,
+                "stale_trade_reconcile",
+                0.0,
+                live_exit_time_in_force,
+            )
+            .await?;
+            closed += 1;
+            continue;
+        }
         if let Some(snapshot) = storage
             .latest_feature_snapshot_for_market(trade.market_id)
             .await?
         {
-            let trade_age_seconds = (chrono::Utc::now() - trade.created_at).num_seconds();
             if trade.expires_at.is_none() && trade_age_seconds >= 20 * 60 {
                 let status = "expiry_reconcile";
                 if trade.mode == TradeMode::Live && live_trade_has_active_exit_order(&trade) {
@@ -1409,7 +1467,11 @@ async fn close_trade_for_mode(
 ) -> Result<()> {
     match trade.mode {
         TradeMode::Paper => {
-            let realized_pnl = (theoretical_exit_price - trade.entry_price) * trade.quantity;
+            let realized_pnl = if status == "market_result_reconcile" {
+                fallback_realized_pnl
+            } else {
+                (theoretical_exit_price - trade.entry_price) * trade.quantity
+            };
             storage
                 .close_trade(trade.trade_id, theoretical_exit_price, realized_pnl, status)
                 .await?;
@@ -1459,6 +1521,14 @@ async fn close_trade_for_mode(
     Ok(())
 }
 
+fn build_public_client(config: &AppConfig) -> Result<PublicKalshiClient> {
+    let http = Client::builder().user_agent("kalshi-v3/0.1").build()?;
+    Ok(PublicKalshiClient {
+        http,
+        api_base: config.kalshi_api_base.trim_end_matches('/').to_string(),
+    })
+}
+
 fn build_live_client(config: &AppConfig) -> Result<Option<LiveKalshiClient>> {
     if !config.live_trading_enabled {
         return Ok(None);
@@ -1475,6 +1545,68 @@ fn build_live_client(config: &AppConfig) -> Result<Option<LiveKalshiClient>> {
         api_base: config.kalshi_api_base.trim_end_matches('/').to_string(),
         api_key_id,
         private_key,
+    }))
+}
+
+struct SettlementReconcile {
+    exit_price: f64,
+    realized_pnl: f64,
+    status: String,
+}
+
+async fn settle_paper_crypto_trade_from_market_result(
+    public_client: &PublicKalshiClient,
+    trade: &OpenTradeForExit,
+) -> Result<Option<SettlementReconcile>> {
+    if trade.mode != TradeMode::Paper || trade.market_family != MarketFamily::Crypto {
+        return Ok(None);
+    }
+    let Some(market_ticker) = trade.market_ticker.as_deref() else {
+        return Ok(None);
+    };
+    let url = format!("{}/markets/{}", public_client.api_base, market_ticker);
+    let payload: serde_json::Value = public_client
+        .http
+        .get(url)
+        .header("Accept", "application/json")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let Some(market) = payload.get("market") else {
+        return Ok(None);
+    };
+    let status = market
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !matches!(status.as_str(), "finalized" | "settled" | "resolved") {
+        return Ok(None);
+    }
+    let result = market
+        .get("result")
+        .and_then(serde_json::Value::as_str)
+        .map(|value| value.to_ascii_lowercase());
+    let resolved_yes = match result.as_deref() {
+        Some("yes") => Some(true),
+        Some("no") => Some(false),
+        _ => market
+            .get("settlement_value_dollars")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|raw| raw.parse::<f64>().ok())
+            .map(|value| value >= 0.5),
+    };
+    let Some(resolved_yes) = resolved_yes else {
+        return Ok(None);
+    };
+    let exit_price = settlement_contract_price(&trade.side, resolved_yes);
+    let realized_pnl = (exit_price - trade.entry_price) * trade.quantity;
+    Ok(Some(SettlementReconcile {
+        exit_price,
+        realized_pnl,
+        status: "market_result_reconcile".to_string(),
     }))
 }
 
@@ -1812,6 +1944,15 @@ fn contract_price_for_side(side: &str, market_prob: f64) -> f64 {
     }
 }
 
+fn settlement_contract_price(side: &str, resolved_yes: bool) -> f64 {
+    match (side == "buy_no", resolved_yes) {
+        (true, true) => 0.0,
+        (true, false) => 1.0,
+        (false, true) => 1.0,
+        (false, false) => 0.0,
+    }
+}
+
 fn exit_status_label(strategy_family: StrategyFamily, should_timeout: bool) -> &'static str {
     match (strategy_family, should_timeout) {
         (StrategyFamily::PreSettlementScalp, true) => "timeout_exit",
@@ -1950,6 +2091,25 @@ fn proportional_entry_fee(total_entry_fee: f64, exit_quantity: f64, total_quanti
     }
 }
 
+fn should_force_reconcile_stale_paper_crypto_trade(
+    trade: &OpenTradeForExit,
+    trade_age_seconds: i64,
+) -> bool {
+    trade.mode == TradeMode::Paper
+        && trade.market_family == MarketFamily::Crypto
+        && trade_age_seconds >= paper_crypto_trade_age_limit_seconds(&trade.lane_key)
+}
+
+fn paper_crypto_trade_age_limit_seconds(lane_key: &str) -> i64 {
+    let window_minutes = lane_key
+        .split(':')
+        .nth(2)
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(15)
+        .max(1);
+    (window_minutes * 60 + 5 * 60).max(20 * 60)
+}
+
 fn parse_fp(raw: &str) -> f64 {
     raw.parse::<f64>().unwrap_or_default()
 }
@@ -1963,6 +2123,7 @@ mod tests {
         OpenTradeForExit {
             trade_id: 1,
             market_id: 1,
+            market_family: MarketFamily::Crypto,
             market_ticker: Some("KXBTC15M-TEST".to_string()),
             lane_key: "kalshi:btc:15:buy_yes:directional_settlement:settlement_anchor_v3"
                 .to_string(),
@@ -2000,5 +2161,32 @@ mod tests {
             next_replacement_client_order_id(Some("v3-live-entry-10-r1"), "fallback"),
             "v3-live-entry-10-r2"
         );
+    }
+
+    #[test]
+    fn stale_crypto_paper_trade_uses_lane_window_cap() {
+        assert_eq!(
+            paper_crypto_trade_age_limit_seconds(
+                "kalshi:btc:15:buy_yes:directional_settlement:trained_linear_v1"
+            ),
+            1200
+        );
+    }
+
+    #[test]
+    fn stale_crypto_paper_trade_detection_ignores_live_trades() {
+        let mut trade = sample_open_trade(None);
+        trade.mode = TradeMode::Paper;
+        assert!(should_force_reconcile_stale_paper_crypto_trade(&trade, 1900));
+        trade.mode = TradeMode::Live;
+        assert!(!should_force_reconcile_stale_paper_crypto_trade(&trade, 1900));
+    }
+
+    #[test]
+    fn settlement_contract_price_matches_yes_and_no_contracts() {
+        assert_eq!(settlement_contract_price("buy_yes", true), 1.0);
+        assert_eq!(settlement_contract_price("buy_yes", false), 0.0);
+        assert_eq!(settlement_contract_price("buy_no", true), 0.0);
+        assert_eq!(settlement_contract_price("buy_no", false), 1.0);
     }
 }

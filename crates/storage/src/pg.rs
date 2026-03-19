@@ -3,9 +3,10 @@ use chrono::{DateTime, Utc};
 use common::{
     BankrollCard, DashboardSnapshot, LaneInspectionSnapshot, LaneReplaySummary, LaneState,
     LaneTradeCard, LiveExceptionSnapshot, LiveExchangeSyncSummary, LiveFillCard, LiveIntentCard,
-    LiveOrderCard, LivePositionCard, LiveTradeExceptionCard, MarketFeatureSnapshotRecord,
-    ModelInference, OpenTradeSummary, OperatorControlState, OpportunityCard, OpportunityDecision,
-    PromotionState, ReadinessSummary, ReplayBenchmarkCard, StrategyFamily, TradeMode,
+    LiveOrderCard, LivePositionCard, LiveTradeExceptionCard, MarketFamily,
+    MarketFeatureSnapshotRecord, ModelInference, OpenTradeSummary, OperatorActionEvent,
+    OperatorControlState, OpportunityCard, OpportunityDecision, PromotionState,
+    ReadinessSummary, ReplayBenchmarkCard, StrategyFamily, TradeMode,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -21,6 +22,7 @@ pub struct PendingExecutionIntent {
     pub intent_id: i64,
     pub decision_id: i64,
     pub market_id: i64,
+    pub market_family: MarketFamily,
     pub lane_key: String,
     pub strategy_family: StrategyFamily,
     pub side: String,
@@ -37,6 +39,7 @@ pub struct ActiveLiveExecutionIntent {
     pub intent_id: i64,
     pub decision_id: i64,
     pub market_id: i64,
+    pub market_family: MarketFamily,
     pub lane_key: String,
     pub strategy_family: StrategyFamily,
     pub side: String,
@@ -58,6 +61,7 @@ pub struct ActiveLiveExecutionIntent {
 pub struct OpenTradeForExit {
     pub trade_id: i64,
     pub market_id: i64,
+    pub market_family: MarketFamily,
     pub market_ticker: Option<String>,
     pub lane_key: String,
     pub side: String,
@@ -78,6 +82,7 @@ pub struct OpenTradeForExit {
 #[derive(Debug, Clone)]
 pub struct OpenLiveTradeForReconciliation {
     pub trade_id: i64,
+    pub market_family: MarketFamily,
     pub lane_key: String,
     pub market_ticker: String,
     pub side: String,
@@ -111,8 +116,14 @@ pub struct TradeExitProgress {
 pub struct ClosedTradeNotification {
     pub trade_id: i64,
     pub lane_key: String,
+    pub market_family: MarketFamily,
     pub strategy_family: StrategyFamily,
     pub mode: TradeMode,
+    pub market_ticker: Option<String>,
+    pub market_title: Option<String>,
+    pub side: Option<String>,
+    pub status: String,
+    pub close_reason: Option<String>,
     pub quantity: f64,
     pub entry_price: f64,
     pub exit_price: f64,
@@ -123,6 +134,7 @@ pub struct ClosedTradeNotification {
 #[derive(Debug, Clone)]
 pub struct SymbolLanePolicy {
     pub lane_key: String,
+    pub market_family: MarketFamily,
     pub promotion_state: PromotionState,
     pub promotion_reason: Option<String>,
     pub recent_pnl: f64,
@@ -161,6 +173,7 @@ pub struct ProbabilityCalibrationCard {
 #[derive(Debug, Clone)]
 pub struct TrainedModelArtifactCard {
     pub model_name: String,
+    pub market_family: MarketFamily,
     pub strategy_family: StrategyFamily,
     pub symbol: Option<String>,
     pub feature_version: String,
@@ -172,6 +185,7 @@ pub struct TrainedModelArtifactCard {
 
 #[derive(Debug, Clone)]
 pub struct HistoricalReplayExampleCard {
+    pub market_family: MarketFamily,
     pub lane_key: String,
     pub time_to_expiry_bucket: String,
     pub target_yes_probability: f64,
@@ -182,6 +196,7 @@ pub struct HistoricalReplayExampleCard {
 #[derive(Debug, Clone)]
 pub struct ModelBenchmarkRunInsert {
     pub lane_key: String,
+    pub market_family: MarketFamily,
     pub symbol: String,
     pub strategy_family: StrategyFamily,
     pub source: String,
@@ -283,19 +298,61 @@ impl Storage {
         &self,
         initial_paper_bankroll: f64,
         initial_live_bankroll: f64,
+        initial_paper_crypto_budget: f64,
+        initial_paper_weather_budget: f64,
+        initial_live_crypto_budget: f64,
+        initial_live_weather_budget: f64,
     ) -> Result<()> {
-        self.ensure_bootstrap_bankroll("paper", initial_paper_bankroll, SqlTradeMode::Paper)
-            .await?;
-        self.ensure_bootstrap_bankroll("live", initial_live_bankroll, SqlTradeMode::Live)
-            .await?;
+        self.ensure_bootstrap_bankroll(
+            portfolio_scope(TradeMode::Paper, MarketFamily::All),
+            MarketFamily::All,
+            initial_paper_bankroll,
+            SqlTradeMode::Paper,
+        )
+        .await?;
+        self.ensure_bootstrap_bankroll(
+            portfolio_scope(TradeMode::Live, MarketFamily::All),
+            MarketFamily::All,
+            initial_live_bankroll,
+            SqlTradeMode::Live,
+        )
+        .await?;
+        self.ensure_bootstrap_bankroll(
+            portfolio_scope(TradeMode::Paper, MarketFamily::Crypto),
+            MarketFamily::Crypto,
+            initial_paper_crypto_budget,
+            SqlTradeMode::Paper,
+        )
+        .await?;
+        self.ensure_bootstrap_bankroll(
+            portfolio_scope(TradeMode::Paper, MarketFamily::Weather),
+            MarketFamily::Weather,
+            initial_paper_weather_budget,
+            SqlTradeMode::Paper,
+        )
+        .await?;
+        self.ensure_bootstrap_bankroll(
+            portfolio_scope(TradeMode::Live, MarketFamily::Crypto),
+            MarketFamily::Crypto,
+            initial_live_crypto_budget,
+            SqlTradeMode::Live,
+        )
+        .await?;
+        self.ensure_bootstrap_bankroll(
+            portfolio_scope(TradeMode::Live, MarketFamily::Weather),
+            MarketFamily::Weather,
+            initial_live_weather_budget,
+            SqlTradeMode::Live,
+        )
+        .await?;
         Ok(())
     }
 
-    pub async fn dashboard_snapshot(&self) -> Result<DashboardSnapshot> {
-        let bankrolls = self.list_latest_bankrolls().await?;
-        let lanes = self.list_lane_states().await?;
-        let open_trades = self.list_open_trades().await?;
-        let opportunities = self.list_latest_opportunities(6).await?;
+    pub async fn dashboard_snapshot(&self, family: Option<MarketFamily>) -> Result<DashboardSnapshot> {
+        let bankrolls = self.list_latest_bankrolls(family).await?;
+        let lanes = self.list_lane_states(family).await?;
+        let open_trades = self.list_open_trades(family).await?;
+        let opportunities = self.list_latest_opportunities(family, 6).await?;
         let live_sync = self.latest_live_exchange_sync_summary().await?;
         let live_exceptions = self.live_exception_snapshot().await?;
 
@@ -310,6 +367,7 @@ impl Storage {
         };
 
         Ok(DashboardSnapshot {
+            market_family: family,
             bankrolls,
             readiness,
             open_trades,
@@ -326,14 +384,15 @@ impl Storage {
         sqlx::query(
             r#"
             insert into market_feature_snapshot (
-                market_id, exchange, symbol, window_minutes, seconds_to_expiry, time_to_expiry_bucket,
+                market_id, market_family, exchange, symbol, window_minutes, seconds_to_expiry, time_to_expiry_bucket,
                 feature_version, venue_features_json, settlement_features_json, external_reference_json,
                 venue_quality_json, created_at
             )
-            values ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10::jsonb, $11::jsonb, $12)
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb, $11::jsonb, $12::jsonb, $13)
             "#,
         )
         .bind(snapshot.market_id)
+        .bind(SqlMarketFamily::from(snapshot.market_family))
         .bind(&snapshot.exchange)
         .bind(&snapshot.symbol)
         .bind(snapshot.window_minutes)
@@ -360,6 +419,12 @@ impl Storage {
             "averaging_window_progress": snapshot.averaging_window_progress,
             "threshold_distance_bps_proxy": snapshot.threshold_distance_bps_proxy,
             "last_minute_avg_proxy": snapshot.last_minute_avg_proxy,
+            "weather_city": snapshot.weather_city,
+            "weather_contract_kind": snapshot.weather_contract_kind,
+            "weather_market_date": snapshot.weather_market_date,
+            "weather_strike_type": snapshot.weather_strike_type,
+            "weather_floor_strike": snapshot.weather_floor_strike,
+            "weather_cap_strike": snapshot.weather_cap_strike,
         }))
         .bind(json!({
             "reference_price": snapshot.reference_price,
@@ -368,6 +433,10 @@ impl Storage {
             "reference_yes_prob": snapshot.reference_yes_prob,
             "reference_gap_bps": snapshot.reference_gap_bps,
             "reference_age_seconds": snapshot.reference_age_seconds,
+            "weather_forecast_temperature_f": snapshot.weather_forecast_temperature_f,
+            "weather_observation_temperature_f": snapshot.weather_observation_temperature_f,
+            "weather_reference_confidence": snapshot.weather_reference_confidence,
+            "weather_reference_source": snapshot.weather_reference_source,
         }))
         .bind(json!({
             "spread_bps": snapshot.spread_bps,
@@ -421,7 +490,7 @@ impl Storage {
             return Ok(0);
         }
         const MAX_BIND_PARAMS: usize = 60_000;
-        const PARAMS_PER_ROW: usize = 14;
+        const PARAMS_PER_ROW: usize = 15;
         let chunk_size = (MAX_BIND_PARAMS / PARAMS_PER_ROW).max(1);
         let mut inserted = 0usize;
 
@@ -429,7 +498,7 @@ impl Storage {
             let mut builder = QueryBuilder::<Postgres>::new(
                 r#"
                 insert into historical_replay_example (
-                    source, source_key, exchange, symbol, strategy_family, market_id, market_slug,
+                    source, source_key, market_family, exchange, symbol, strategy_family, market_id, market_slug,
                     recorded_at, resolved_yes_probability, market_prob, time_to_expiry_bucket,
                     feature_version, feature_vector_json, metadata_json
                 )
@@ -438,6 +507,7 @@ impl Storage {
             builder.push_values(chunk, |mut b, row| {
                 b.push_bind(&row.source)
                     .push_bind(&row.source_key)
+                    .push_bind(SqlMarketFamily::from(row.market_family))
                     .push_bind(&row.exchange)
                     .push_bind(&row.symbol)
                     .push_bind(SqlStrategyFamily::from(row.strategy_family))
@@ -461,13 +531,14 @@ impl Storage {
 
     pub async fn list_historical_replay_examples(
         &self,
+        market_family: MarketFamily,
         symbol: &str,
         strategy_family: StrategyFamily,
         limit: i64,
     ) -> Result<Vec<HistoricalReplayExampleCard>> {
         let rows = sqlx::query_as::<_, HistoricalReplayExampleRow>(
             r#"
-            select lane_key, time_to_expiry_bucket, resolved_yes_probability, market_prob, feature_vector_json
+            select market_family, lane_key, time_to_expiry_bucket, resolved_yes_probability, market_prob, feature_vector_json
             from (
                 select
                     format(
@@ -476,19 +547,22 @@ impl Storage {
                         strategy_family,
                         coalesce(metadata_json->>'champion_hint', 'baseline_logit_v1')
                     ) as lane_key,
+                    market_family,
                     time_to_expiry_bucket,
                     resolved_yes_probability,
                     market_prob,
                     feature_vector_json,
                     recorded_at
                 from historical_replay_example
-                where symbol = $1
-                  and strategy_family = $2
+                where market_family = $1
+                  and symbol = $2
+                  and strategy_family = $3
                 order by recorded_at asc
-                limit $3
+                limit $4
             ) ranked
             "#,
         )
+        .bind(SqlMarketFamily::from(market_family))
         .bind(symbol.to_lowercase())
         .bind(SqlStrategyFamily::from(strategy_family))
         .bind(limit)
@@ -507,14 +581,15 @@ impl Storage {
         let run_id = sqlx::query_scalar::<_, i64>(
             r#"
             insert into model_benchmark_run (
-                lane_key, symbol, strategy_family, source, example_count,
+                lane_key, market_family, symbol, strategy_family, source, example_count,
                 champion_model_name, details_json
             )
-            values ($1, $2, $3, $4, $5, $6, $7::jsonb)
+            values ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
             returning id
             "#,
         )
         .bind(&run.lane_key)
+        .bind(SqlMarketFamily::from(run.market_family))
         .bind(&run.symbol)
         .bind(SqlStrategyFamily::from(run.strategy_family))
         .bind(&run.source)
@@ -617,6 +692,7 @@ impl Storage {
                 select distinct on (market_id)
                     id,
                     market_id,
+                    market_family,
                     exchange,
                     symbol,
                     window_minutes,
@@ -629,12 +705,58 @@ impl Storage {
                     venue_quality_json,
                     created_at
                 from market_feature_snapshot
+                where created_at >= now() - interval '72 hours'
                 order by market_id, created_at desc, id desc
+            ),
+            front_crypto as (
+                select distinct on (symbol, window_minutes)
+                    id,
+                    market_id,
+                    market_family,
+                    exchange,
+                    symbol,
+                    window_minutes,
+                    seconds_to_expiry,
+                    time_to_expiry_bucket,
+                    feature_version,
+                    venue_features_json,
+                    settlement_features_json,
+                    external_reference_json,
+                    venue_quality_json,
+                    created_at
+                from latest
+                where market_family = 'crypto'
+                  and seconds_to_expiry > 0
+                order by symbol, window_minutes, seconds_to_expiry asc, created_at desc, id desc
+            ),
+            other_latest as (
+                select
+                    id,
+                    market_id,
+                    market_family,
+                    exchange,
+                    symbol,
+                    window_minutes,
+                    seconds_to_expiry,
+                    time_to_expiry_bucket,
+                    feature_version,
+                    venue_features_json,
+                    settlement_features_json,
+                    external_reference_json,
+                    venue_quality_json,
+                    created_at
+                from latest
+                where market_family <> 'crypto'
+                order by created_at desc, id desc
+                limit $1
             )
             select *
-            from latest
-            order by created_at desc
-            limit $1
+            from (
+                select * from front_crypto
+                union all
+                select * from other_latest
+            ) decision_feed
+            order by created_at desc, id desc
             "#,
         )
         .bind(limit)
@@ -653,6 +775,7 @@ impl Storage {
             select
                 id,
                 market_id,
+                market_family,
                 exchange,
                 symbol,
                 window_minutes,
@@ -686,6 +809,7 @@ impl Storage {
             select
                 id,
                 market_id,
+                market_family,
                 exchange,
                 symbol,
                 window_minutes,
@@ -733,15 +857,16 @@ impl Storage {
         let id = sqlx::query_scalar(
             r#"
             insert into model_inference (
-                market_id, lane_key, strategy_family, model_name, raw_score, raw_probability_yes,
+                market_id, market_family, lane_key, strategy_family, model_name, raw_score, raw_probability_yes,
                 calibrated_probability_yes, raw_confidence, calibrated_confidence, feature_version,
                 rationale_json
             )
-            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb)
             returning id
             "#,
         )
         .bind(inference.market_id)
+        .bind(SqlMarketFamily::from(inference.market_family))
         .bind(&inference.lane_key)
         .bind(SqlStrategyFamily::from(inference.strategy_family))
         .bind(&inference.model_name)
@@ -759,6 +884,7 @@ impl Storage {
 
     pub async fn upsert_probability_calibration(
         &self,
+        market_family: MarketFamily,
         symbol: &str,
         strategy_family: StrategyFamily,
         model_name: &str,
@@ -769,16 +895,18 @@ impl Storage {
         sqlx::query(
             r#"
             insert into probability_calibration (
-                symbol, strategy_family, model_name, expiry_bucket, mean_error, sample_count, updated_at
+                symbol, market_family, strategy_family, model_name, expiry_bucket, mean_error, sample_count, updated_at
             )
-            values ($1, $2, $3, $4, $5, $6, now())
+            values ($1, $2, $3, $4, $5, $6, $7, now())
             on conflict (symbol, strategy_family, model_name, expiry_bucket) do update
             set mean_error = excluded.mean_error,
+                market_family = excluded.market_family,
                 sample_count = excluded.sample_count,
                 updated_at = now()
             "#,
         )
         .bind(symbol.to_lowercase())
+        .bind(SqlMarketFamily::from(market_family))
         .bind(SqlStrategyFamily::from(strategy_family))
         .bind(model_name)
         .bind(expiry_bucket)
@@ -791,6 +919,7 @@ impl Storage {
 
     pub async fn latest_probability_calibration(
         &self,
+        market_family: MarketFamily,
         symbol: &str,
         strategy_family: StrategyFamily,
         model_name: &str,
@@ -801,12 +930,14 @@ impl Storage {
             select mean_error, sample_count
             from probability_calibration
             where symbol = $1
-              and strategy_family = $2
-              and model_name = $3
-              and expiry_bucket = $4
+              and market_family = $2
+              and strategy_family = $3
+              and model_name = $4
+              and expiry_bucket = $5
             "#,
         )
         .bind(symbol.to_lowercase())
+        .bind(SqlMarketFamily::from(market_family))
         .bind(SqlStrategyFamily::from(strategy_family))
         .bind(model_name)
         .bind(expiry_bucket)
@@ -818,6 +949,7 @@ impl Storage {
     pub async fn upsert_trained_model_artifact(
         &self,
         model_name: &str,
+        market_family: MarketFamily,
         strategy_family: StrategyFamily,
         symbol: Option<&str>,
         feature_version: &str,
@@ -828,10 +960,10 @@ impl Storage {
         sqlx::query(
             r#"
             insert into trained_model_artifact (
-                model_name, strategy_family, symbol, feature_version, sample_count, weights_json, metrics_json, updated_at
+                model_name, market_family, strategy_family, symbol, feature_version, sample_count, weights_json, metrics_json, updated_at
             )
-            values ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, now())
-            on conflict (model_name, strategy_family, symbol) do update
+            values ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, now())
+            on conflict (model_name, strategy_family, market_family, coalesce(symbol, '')) do update
             set feature_version = excluded.feature_version,
                 sample_count = excluded.sample_count,
                 weights_json = excluded.weights_json,
@@ -840,6 +972,7 @@ impl Storage {
             "#,
         )
         .bind(model_name)
+        .bind(SqlMarketFamily::from(market_family))
         .bind(SqlStrategyFamily::from(strategy_family))
         .bind(symbol.map(|value| value.to_lowercase()))
         .bind(feature_version)
@@ -854,21 +987,24 @@ impl Storage {
     pub async fn latest_trained_model_artifact(
         &self,
         model_name: &str,
+        market_family: MarketFamily,
         strategy_family: StrategyFamily,
         symbol: Option<&str>,
     ) -> Result<Option<TrainedModelArtifactCard>> {
         let row = sqlx::query_as::<_, TrainedModelArtifactRow>(
             r#"
-            select model_name, strategy_family, symbol, feature_version, sample_count, weights_json, metrics_json, updated_at
+            select model_name, market_family, strategy_family, symbol, feature_version, sample_count, weights_json, metrics_json, updated_at
             from trained_model_artifact
             where model_name = $1
-              and strategy_family = $2
-              and symbol is not distinct from $3
+              and market_family = $2
+              and strategy_family = $3
+              and symbol is not distinct from $4
             order by updated_at desc, id desc
             limit 1
             "#,
         )
         .bind(model_name)
+        .bind(SqlMarketFamily::from(market_family))
         .bind(SqlStrategyFamily::from(strategy_family))
         .bind(symbol.map(|value| value.to_lowercase()))
         .fetch_optional(&self.pool)
@@ -880,14 +1016,15 @@ impl Storage {
         let id = sqlx::query_scalar(
             r#"
             insert into opportunity_decision (
-                market_id, lane_key, strategy_family, model_name, side, market_prob, model_prob, edge,
+                market_id, market_family, lane_key, strategy_family, model_name, side, market_prob, model_prob, edge,
                 confidence, approved, reasons_json, recommended_size
             )
-            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12)
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13)
             returning id
             "#,
         )
         .bind(decision.market_id)
+        .bind(SqlMarketFamily::from(decision.market_family))
         .bind(&decision.lane_key)
         .bind(SqlStrategyFamily::from(decision.strategy_family))
         .bind(&decision.model_name)
@@ -907,7 +1044,7 @@ impl Storage {
     pub async fn upsert_lane_state(&self, lane: &LaneState) -> Result<()> {
         let previous = sqlx::query_as::<_, LaneStateRow>(
             r#"
-            select lane_key, promotion_state, promotion_reason, recent_pnl, recent_brier,
+            select lane_key, market_family, promotion_state, promotion_reason, recent_pnl, recent_brier,
                    recent_execution_quality, recent_replay_expectancy, quarantine_reason, current_champion_model
             from lane_state
             where lane_key = $1
@@ -920,12 +1057,13 @@ impl Storage {
         sqlx::query(
             r#"
             insert into lane_state (
-                lane_key, promotion_state, recent_pnl, recent_brier, recent_execution_quality,
+                lane_key, market_family, promotion_state, recent_pnl, recent_brier, recent_execution_quality,
                 recent_replay_expectancy, quarantine_reason, promotion_reason, current_champion_model, updated_at
             )
-            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
             on conflict (lane_key) do update
-            set promotion_state = excluded.promotion_state,
+            set market_family = excluded.market_family,
+                promotion_state = excluded.promotion_state,
                 recent_pnl = excluded.recent_pnl,
                 recent_brier = excluded.recent_brier,
                 recent_execution_quality = excluded.recent_execution_quality,
@@ -937,6 +1075,7 @@ impl Storage {
             "#,
         )
         .bind(&lane.lane_key)
+        .bind(SqlMarketFamily::from(lane.market_family))
         .bind(SqlPromotionState::from(lane.promotion_state))
         .bind(lane.recent_pnl)
         .bind(lane.recent_brier)
@@ -959,12 +1098,13 @@ impl Storage {
             sqlx::query(
                 r#"
                 insert into lane_state_transition (
-                    lane_key, from_state, to_state, from_reason, to_reason, current_champion_model, details_json
+                    lane_key, market_family, from_state, to_state, from_reason, to_reason, current_champion_model, details_json
                 )
-                values ($1, $2, $3, $4, $5, $6, $7::jsonb)
+                values ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
                 "#,
             )
             .bind(&lane.lane_key)
+            .bind(SqlMarketFamily::from(lane.market_family))
             .bind(previous.as_ref().map(|row| row.promotion_state.as_key()))
             .bind(SqlPromotionState::from(lane.promotion_state).as_key())
             .bind(previous.as_ref().and_then(|row| row.promotion_reason.clone()))
@@ -985,6 +1125,7 @@ impl Storage {
 
     pub async fn latest_lane_policy_for_symbol(
         &self,
+        market_family: MarketFamily,
         symbol: &str,
         strategy_family: StrategyFamily,
     ) -> Result<Option<SymbolLanePolicy>> {
@@ -996,16 +1137,18 @@ impl Storage {
         };
         let row = sqlx::query_as::<_, LaneStateRow>(
             r#"
-            select lane_key, promotion_state, promotion_reason, recent_pnl, recent_brier, recent_execution_quality,
+            select lane_key, market_family, promotion_state, promotion_reason, recent_pnl, recent_brier, recent_execution_quality,
                    recent_replay_expectancy, quarantine_reason, current_champion_model
             from lane_state
-            where lane_key like $1
+            where market_family = $1
               and lane_key like $2
+              and lane_key like $3
               and current_champion_model is not null
             order by updated_at desc
             limit 1
             "#,
         )
+        .bind(SqlMarketFamily::from(market_family))
         .bind(pattern)
         .bind(format!("%:{}:%", family))
         .fetch_optional(&self.pool)
@@ -1014,16 +1157,24 @@ impl Storage {
     }
 
     pub async fn latest_portfolio_bankroll(&self, mode: TradeMode) -> Result<Option<BankrollCard>> {
+        self.latest_family_bankroll(mode, MarketFamily::All).await
+    }
+
+    pub async fn latest_family_bankroll(
+        &self,
+        mode: TradeMode,
+        market_family: MarketFamily,
+    ) -> Result<Option<BankrollCard>> {
         let scope = match mode {
-            TradeMode::Paper => "paper",
-            TradeMode::Live => "live",
+            TradeMode::Paper => portfolio_scope(TradeMode::Paper, market_family),
+            TradeMode::Live => portfolio_scope(TradeMode::Live, market_family),
         };
         let row = sqlx::query_as::<_, BankrollRow>(
             r#"
-            select scope, mode, strategy_family, bankroll, deployable_balance, open_exposure,
+            select scope, market_family, mode, strategy_family, bankroll, deployable_balance, open_exposure,
                    realized_pnl, unrealized_pnl, created_at
             from bankroll_snapshot
-            where scope = $1 and mode = $2 and strategy_family = $3
+            where scope = $1 and mode = $2 and strategy_family = $3 and market_family = $4
             order by created_at desc, id desc
             limit 1
             "#,
@@ -1031,6 +1182,7 @@ impl Storage {
         .bind(scope)
         .bind(SqlTradeMode::from(mode))
         .bind(SqlStrategyFamily::Portfolio)
+        .bind(SqlMarketFamily::from(market_family))
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(Into::into))
@@ -1158,19 +1310,20 @@ impl Storage {
         open_exposure: f64,
     ) -> Result<()> {
         let scope = match mode {
-            TradeMode::Paper => "paper",
-            TradeMode::Live => "live",
+            TradeMode::Paper => portfolio_scope(TradeMode::Paper, MarketFamily::All),
+            TradeMode::Live => portfolio_scope(TradeMode::Live, MarketFamily::All),
         };
         sqlx::query(
             r#"
             insert into bankroll_snapshot (
-                scope, mode, strategy_family, bankroll, deployable_balance, open_exposure,
+                scope, market_family, mode, strategy_family, bankroll, deployable_balance, open_exposure,
                 realized_pnl, unrealized_pnl
             )
-            values ($1, $2, $3, $4, $5, $6, 0, 0)
+            values ($1, $2, $3, $4, $5, $6, $7, 0, 0)
             "#,
         )
         .bind(scope)
+        .bind(SqlMarketFamily::All)
         .bind(SqlTradeMode::from(mode))
         .bind(SqlStrategyFamily::Portfolio)
         .bind(bankroll.max(0.0))
@@ -1420,6 +1573,98 @@ impl Storage {
         Ok(row.into())
     }
 
+    pub async fn record_operator_action_event(
+        &self,
+        action: &str,
+        actor: &str,
+        note: Option<&str>,
+        payload_json: &serde_json::Value,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            insert into operator_action_event (
+                action,
+                actor,
+                note,
+                payload_json
+            )
+            values ($1, $2, $3, $4::jsonb)
+            "#,
+        )
+        .bind(action)
+        .bind(actor)
+        .bind(note)
+        .bind(payload_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_recent_operator_action_events(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<OperatorActionEvent>> {
+        let rows = sqlx::query_as::<_, OperatorActionEventRow>(
+            r#"
+            select id, action, actor, note, payload_json, created_at
+            from operator_action_event
+            order by created_at desc, id desc
+            limit $1
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    pub async fn notification_delivery_exists(
+        &self,
+        notification_kind: &str,
+        fingerprint: &str,
+    ) -> Result<bool> {
+        let delivered = sqlx::query_scalar::<_, bool>(
+            r#"
+            select exists(
+                select 1
+                from notification_delivery
+                where notification_kind = $1
+                  and fingerprint = $2
+            )
+            "#,
+        )
+        .bind(notification_kind)
+        .bind(fingerprint)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(delivered)
+    }
+
+    pub async fn record_notification_delivery(
+        &self,
+        notification_kind: &str,
+        fingerprint: &str,
+        payload_json: &serde_json::Value,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            insert into notification_delivery (
+                notification_kind,
+                fingerprint,
+                payload_json
+            )
+            values ($1, $2, $3::jsonb)
+            on conflict (notification_kind, fingerprint) do nothing
+            "#,
+        )
+        .bind(notification_kind)
+        .bind(fingerprint)
+        .bind(payload_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn effective_live_order_placement_enabled(
         &self,
         config_enabled: bool,
@@ -1565,9 +1810,9 @@ impl Storage {
     }
 
     pub async fn lane_inspection_snapshot(&self, lane_key: &str) -> Result<LaneInspectionSnapshot> {
-        let lane_state = sqlx::query_as::<_, LaneStateRow>(
+        let lane_state: Option<LaneState> = sqlx::query_as::<_, LaneStateRow>(
             r#"
-            select lane_key, promotion_state, promotion_reason, recent_pnl, recent_brier, recent_execution_quality,
+            select lane_key, market_family, promotion_state, promotion_reason, recent_pnl, recent_brier, recent_execution_quality,
                    recent_replay_expectancy, quarantine_reason, current_champion_model
             from lane_state
             where lane_key = $1
@@ -1580,11 +1825,44 @@ impl Storage {
 
         let opportunity_rows = sqlx::query(
             r#"
-            select lane_key, strategy_family, side, market_prob, model_prob, edge, confidence,
-                   approved, reasons_json, created_at
-            from opportunity_decision
-            where lane_key = $1
-            order by created_at desc, id desc
+            select
+                od.id,
+                od.lane_key,
+                od.market_family,
+                od.strategy_family,
+                od.side,
+                od.market_prob,
+                od.model_prob,
+                od.edge,
+                od.confidence,
+                od.approved,
+                od.reasons_json,
+                od.created_at,
+                latest_intent.status as execution_status,
+                case
+                    when overlapping_trade.id is not null then 'existing_open_trade_for_lane'
+                    else latest_intent.last_error
+                end as execution_note
+            from opportunity_decision od
+            left join lateral (
+                select id
+                from trade_lifecycle tl
+                where tl.lane_key = od.lane_key
+                  and tl.created_at <= od.created_at
+                  and coalesce(tl.closed_at, od.created_at + interval '100 years') >= od.created_at
+                  and tl.status not in ('closed', 'cancelled')
+                order by tl.created_at desc, tl.id desc
+                limit 1
+            ) overlapping_trade on true
+            left join lateral (
+                select status, last_error
+                from execution_intent ei
+                where ei.decision_id = od.id
+                order by ei.created_at desc, ei.id desc
+                limit 1
+            ) latest_intent on true
+            where od.lane_key = $1
+            order by od.created_at desc, od.id desc
             limit 8
             "#,
         )
@@ -1598,6 +1876,7 @@ impl Storage {
             let reasons_json: serde_json::Value = row.try_get("reasons_json")?;
             recent_opportunities.push(OpportunityCard {
                 lane_key: row.try_get("lane_key")?,
+                market_family: parse_market_family(&row.try_get::<String, _>("market_family")?),
                 strategy_family,
                 side: row.try_get("side")?,
                 market_prob: row.try_get("market_prob")?,
@@ -1614,6 +1893,8 @@ impl Storage {
                             .collect()
                     })
                     .unwrap_or_default(),
+                execution_status: row.try_get("execution_status")?,
+                execution_note: row.try_get("execution_note")?,
                 as_of: row.try_get("created_at")?,
             });
         }
@@ -1635,6 +1916,10 @@ impl Storage {
 
         Ok(LaneInspectionSnapshot {
             lane_key: lane_key.to_string(),
+            market_family: match &lane_state {
+                Some(lane) => lane.market_family,
+                None => MarketFamily::Crypto,
+            },
             lane_state,
             recent_opportunities,
             recent_trades: trade_rows.into_iter().map(Into::into).collect(),
@@ -1734,6 +2019,24 @@ impl Storage {
         Ok(exists)
     }
 
+    pub async fn has_active_execution_intent_for_lane(&self, lane_key: &str) -> Result<bool> {
+        let exists = sqlx::query_scalar::<_, bool>(
+            r#"
+            select exists(
+                select 1
+                from execution_intent ei
+                join opportunity_decision od on od.id = ei.decision_id
+                where od.lane_key = $1
+                  and ei.status in ('pending', 'submitted', 'acknowledged', 'partially_filled', 'cancel_pending')
+            )
+            "#,
+        )
+        .bind(lane_key)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(exists)
+    }
+
     pub async fn open_exposure_for_mode_and_lane(
         &self,
         mode: TradeMode,
@@ -1781,6 +2084,7 @@ impl Storage {
     pub async fn insert_execution_intent(
         &self,
         decision_id: i64,
+        market_family: MarketFamily,
         mode: TradeMode,
         entry_style: &str,
         target_ladder_json: &[f64],
@@ -1791,14 +2095,15 @@ impl Storage {
         let id = sqlx::query_scalar(
             r#"
             insert into execution_intent (
-                decision_id, mode, entry_style, target_ladder_json, timeout_seconds,
+                decision_id, market_family, mode, entry_style, target_ladder_json, timeout_seconds,
                 force_exit_buffer_seconds, stop_conditions_json, status
             )
-            values ($1, $2, $3, $4::jsonb, $5, $6, $7::jsonb, 'pending')
+            values ($1, $2, $3, $4, $5::jsonb, $6, $7, $8::jsonb, 'pending')
             returning id
             "#,
         )
         .bind(decision_id)
+        .bind(SqlMarketFamily::from(market_family))
         .bind(SqlTradeMode::from(mode))
         .bind(entry_style)
         .bind(json!(target_ladder_json))
@@ -1820,6 +2125,7 @@ impl Storage {
                 ei.id as intent_id,
                 ei.decision_id,
                 od.market_id,
+                od.market_family,
                 od.lane_key,
                 od.strategy_family,
                 od.side,
@@ -1854,6 +2160,7 @@ impl Storage {
                 ei.id as intent_id,
                 ei.decision_id,
                 od.market_id,
+                od.market_family,
                 od.lane_key,
                 od.strategy_family,
                 od.side,
@@ -1884,6 +2191,7 @@ impl Storage {
                 ei.id as intent_id,
                 ei.decision_id,
                 od.market_id,
+                od.market_family,
                 od.lane_key,
                 od.strategy_family,
                 od.side,
@@ -1974,23 +2282,24 @@ impl Storage {
         extra_metadata: &serde_json::Value,
         status_on_open: &str,
     ) -> Result<i64> {
-        let expires_at = self
-            .latest_feature_snapshot_for_market(intent.market_id)
-            .await?
-            .map(|snapshot| {
-                snapshot.created_at + chrono::Duration::seconds(snapshot.seconds_to_expiry as i64)
-            });
+        let snapshot = self.latest_feature_snapshot_for_market(intent.market_id).await?;
+        let expires_at = snapshot.as_ref().map(|snapshot| {
+            snapshot.created_at + chrono::Duration::seconds(snapshot.seconds_to_expiry as i64)
+        });
+        let market_ticker = extra_metadata
+            .get("market_ticker")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned)
+            .or_else(|| snapshot.as_ref().map(|snapshot| snapshot.market_ticker.clone()));
         let metadata = json!({
             "market_id": intent.market_id,
             "side": intent.side,
             "intent_id": intent.intent_id,
             "timeout_seconds": intent.timeout_seconds,
             "force_exit_buffer_seconds": intent.force_exit_buffer_seconds,
+            "market_ticker": market_ticker,
             "expires_at": expires_at,
         });
-        let market_ticker = extra_metadata
-            .get("market_ticker")
-            .and_then(serde_json::Value::as_str);
         let entry_fee = json_f64(extra_metadata, "entry_fee");
         let entry_exchange_order_id = extra_metadata
             .get("entry_order_id")
@@ -2004,28 +2313,29 @@ impl Storage {
         let id = sqlx::query_scalar(
             r#"
             insert into trade_lifecycle (
-                decision_id, lane_key, strategy_family, mode, status, quantity, entry_price,
+                decision_id, market_family, lane_key, strategy_family, mode, status, quantity, entry_price,
                 market_id, market_ticker, side, timeout_seconds, force_exit_buffer_seconds,
                 expires_at, entry_fee, entry_exchange_order_id, entry_client_order_id,
                 entry_fill_status, metadata_json
             )
             values (
-                $1, $2, $3, $4, 'open', $5, $6,
-                $7, $8, $9, $10, $11,
-                $12, $13, $14, $15,
-                $16, $17::jsonb
+                $1, $2, $3, $4, $5, 'open', $6, $7,
+                $8, $9, $10, $11, $12,
+                $13, $14, $15, $16,
+                $17, $18::jsonb
             )
             returning id
             "#,
         )
         .bind(intent.decision_id)
+        .bind(SqlMarketFamily::from(intent.market_family))
         .bind(&intent.lane_key)
         .bind(SqlStrategyFamily::from(intent.strategy_family))
         .bind(SqlTradeMode::from(intent.mode))
         .bind(quantity)
         .bind(entry_price)
         .bind(intent.market_id)
-        .bind(market_ticker)
+        .bind(market_ticker.as_deref())
         .bind(&intent.side)
         .bind(intent.timeout_seconds)
         .bind(intent.force_exit_buffer_seconds)
@@ -2042,7 +2352,7 @@ impl Storage {
             status_on_open,
             None,
             &ExecutionIntentStateUpdate {
-                market_ticker: market_ticker.map(ToOwned::to_owned),
+                market_ticker: market_ticker.clone(),
                 side: Some(intent.side.clone()),
                 details_json: json!({
                     "trade_id": id,
@@ -2204,6 +2514,7 @@ impl Storage {
             select
                 id,
                 decision_id,
+                market_family,
                 lane_key,
                 strategy_family,
                 mode,
@@ -2237,6 +2548,7 @@ impl Storage {
             r#"
             select
                 id,
+                market_family,
                 lane_key,
                 market_ticker,
                 side,
@@ -2761,19 +3073,34 @@ impl Storage {
         let rows = sqlx::query_as::<_, ClosedTradeNotificationRow>(
             r#"
             select
-                id,
-                lane_key,
-                strategy_family,
-                mode,
-                quantity,
-                entry_price,
-                exit_price,
-                realized_pnl,
-                closed_at
-            from trade_lifecycle
-            where closed_at is not null
-              and coalesce(metadata_json->>'notified', 'false') <> 'true'
-            order by closed_at asc
+                tl.id,
+                tl.lane_key,
+                tl.market_family,
+                tl.strategy_family,
+                tl.mode,
+                coalesce(tl.market_ticker, latest_snapshot.market_ticker, tl.metadata_json->>'market_ticker') as market_ticker,
+                latest_snapshot.market_title as market_title,
+                coalesce(tl.side, tl.metadata_json->>'side') as side,
+                tl.status,
+                coalesce(tl.metadata_json->>'exit_reason', tl.metadata_json->>'close_reason') as close_reason,
+                tl.quantity,
+                tl.entry_price,
+                tl.exit_price,
+                tl.realized_pnl,
+                tl.closed_at
+            from trade_lifecycle tl
+            left join lateral (
+                select
+                    venue_features_json->>'market_ticker' as market_ticker,
+                    venue_features_json->>'market_title' as market_title
+                from market_feature_snapshot mfs
+                where mfs.market_id = tl.market_id
+                order by mfs.created_at desc, mfs.id desc
+                limit 1
+            ) latest_snapshot on true
+            where tl.closed_at is not null
+              and coalesce(tl.metadata_json->>'notified', 'false') <> 'true'
+            order by tl.closed_at asc, tl.id asc
             limit $1
             "#,
         )
@@ -2799,6 +3126,7 @@ impl Storage {
 
     pub async fn list_recent_feature_snapshots(
         &self,
+        market_family: Option<MarketFamily>,
         symbol: Option<&str>,
         limit: i64,
     ) -> Result<Vec<MarketFeatureSnapshotRecord>> {
@@ -2808,6 +3136,7 @@ impl Storage {
                 select
                     id,
                     market_id,
+                    market_family,
                     exchange,
                     symbol,
                     window_minutes,
@@ -2821,11 +3150,13 @@ impl Storage {
                     created_at
                 from market_feature_snapshot
                 where symbol = $1
-                order by created_at asc, id asc
-                limit $2
+                  and ($2::text is null or market_family = $2)
+                order by created_at desc, id desc
+                limit $3
                 "#,
             )
             .bind(symbol)
+            .bind(market_family.map(|value| SqlMarketFamily::from(value).as_key().to_string()))
             .bind(limit)
             .fetch_all(&self.pool)
             .await?
@@ -2835,6 +3166,7 @@ impl Storage {
                 select
                     id,
                     market_id,
+                    market_family,
                     exchange,
                     symbol,
                     window_minutes,
@@ -2847,93 +3179,126 @@ impl Storage {
                     venue_quality_json,
                     created_at
                 from market_feature_snapshot
-                order by created_at asc, id asc
-                limit $1
+                where ($1::text is null or market_family = $1)
+                order by created_at desc, id desc
+                limit $2
                 "#,
             )
+            .bind(market_family.map(|value| SqlMarketFamily::from(value).as_key().to_string()))
             .bind(limit)
             .fetch_all(&self.pool)
             .await?
         };
 
-        rows.into_iter().map(TryInto::try_into).collect()
+        rows.into_iter().rev().map(TryInto::try_into).collect()
     }
 
     pub async fn champion_model_for_symbol(
         &self,
+        market_family: MarketFamily,
         symbol: &str,
         strategy_family: StrategyFamily,
     ) -> Result<Option<String>> {
         Ok(self
-            .latest_lane_policy_for_symbol(symbol, strategy_family)
+            .latest_lane_policy_for_symbol(market_family, symbol, strategy_family)
             .await?
             .and_then(|policy| policy.current_champion_model))
     }
 
     pub async fn reconcile_bankroll_for_mode(&self, mode: TradeMode) -> Result<()> {
-        let scope = match mode {
-            TradeMode::Paper => "paper",
-            TradeMode::Live => "live",
-        };
-        let base_bankroll = self
-            .bootstrap_bankroll(scope, mode)
-            .await?
-            .unwrap_or_default();
-        let aggregates = sqlx::query_as::<_, TradeAggregateRow>(
-            r#"
-            select
-                coalesce(sum(
-                    case
-                        when closed_at is null and status not in ('closed', 'cancelled')
-                        then quantity * entry_price
-                        else 0
-                    end
-                ), 0) as open_exposure,
-                coalesce(sum(
-                    case
-                        when closed_at is not null then coalesce(realized_pnl, 0)
-                        else 0
-                    end
-                ), 0) as realized_pnl
-            from trade_lifecycle
-            where mode = $1
-            "#,
-        )
-        .bind(SqlTradeMode::from(mode))
-        .fetch_one(&self.pool)
-        .await?;
-        let bankroll = (base_bankroll + aggregates.realized_pnl).max(0.0);
-        let deployable_balance = (bankroll - aggregates.open_exposure).max(0.0);
-        sqlx::query(
-            r#"
-            insert into bankroll_snapshot (
-                scope, mode, strategy_family, bankroll, deployable_balance, open_exposure,
-                realized_pnl, unrealized_pnl
+        for family in [MarketFamily::All, MarketFamily::Crypto, MarketFamily::Weather] {
+            let scope = portfolio_scope(mode, family);
+            let base_bankroll = self
+                .bootstrap_bankroll(scope, mode, family)
+                .await?
+                .unwrap_or_default();
+            let aggregates = if family == MarketFamily::All {
+                sqlx::query_as::<_, TradeAggregateRow>(
+                    r#"
+                    select
+                        coalesce(sum(
+                            case
+                                when closed_at is null and status not in ('closed', 'cancelled')
+                                then quantity * entry_price
+                                else 0
+                            end
+                        ), 0) as open_exposure,
+                        coalesce(sum(
+                            case
+                                when closed_at is not null then coalesce(realized_pnl, 0)
+                                else 0
+                            end
+                        ), 0) as realized_pnl
+                    from trade_lifecycle
+                    where mode = $1
+                    "#,
+                )
+                .bind(SqlTradeMode::from(mode))
+                .fetch_one(&self.pool)
+                .await?
+            } else {
+                sqlx::query_as::<_, TradeAggregateRow>(
+                    r#"
+                    select
+                        coalesce(sum(
+                            case
+                                when closed_at is null and status not in ('closed', 'cancelled')
+                                then quantity * entry_price
+                                else 0
+                            end
+                        ), 0) as open_exposure,
+                        coalesce(sum(
+                            case
+                                when closed_at is not null then coalesce(realized_pnl, 0)
+                                else 0
+                            end
+                        ), 0) as realized_pnl
+                    from trade_lifecycle
+                    where mode = $1
+                      and market_family = $2
+                    "#,
+                )
+                .bind(SqlTradeMode::from(mode))
+                .bind(SqlMarketFamily::from(family))
+                .fetch_one(&self.pool)
+                .await?
+            };
+            let bankroll = (base_bankroll + aggregates.realized_pnl).max(0.0);
+            let deployable_balance = (bankroll - aggregates.open_exposure).max(0.0);
+            sqlx::query(
+                r#"
+                insert into bankroll_snapshot (
+                    scope, market_family, mode, strategy_family, bankroll, deployable_balance, open_exposure,
+                    realized_pnl, unrealized_pnl
+                )
+                values ($1, $2, $3, $4, $5, $6, $7, $8, 0)
+                "#,
             )
-            values ($1, $2, $3, $4, $5, $6, $7, 0)
-            "#,
-        )
-        .bind(scope)
-        .bind(SqlTradeMode::from(mode))
-        .bind(SqlStrategyFamily::Portfolio)
-        .bind(bankroll)
-        .bind(deployable_balance)
-        .bind(aggregates.open_exposure)
-        .bind(aggregates.realized_pnl)
-        .execute(&self.pool)
-        .await?;
+            .bind(scope)
+            .bind(SqlMarketFamily::from(family))
+            .bind(SqlTradeMode::from(mode))
+            .bind(SqlStrategyFamily::Portfolio)
+            .bind(bankroll)
+            .bind(deployable_balance)
+            .bind(aggregates.open_exposure)
+            .bind(aggregates.realized_pnl)
+            .execute(&self.pool)
+            .await?;
+        }
         Ok(())
     }
 
-    async fn list_latest_bankrolls(&self) -> Result<Vec<BankrollCard>> {
+    async fn list_latest_bankrolls(&self, family: Option<MarketFamily>) -> Result<Vec<BankrollCard>> {
         let rows = sqlx::query_as::<_, BankrollRow>(
             r#"
-            select scope, mode, strategy_family, bankroll, deployable_balance, open_exposure,
+            select scope, market_family, mode, strategy_family, bankroll, deployable_balance, open_exposure,
                    realized_pnl, unrealized_pnl, created_at
             from bankroll_snapshot
+            where ($1::text is null or market_family = $1 or market_family = 'all')
             order by created_at desc
             "#,
         )
+        .bind(family.map(|value| SqlMarketFamily::from(value).as_key().to_string()))
         .fetch_all(&self.pool)
         .await
         .unwrap_or_default();
@@ -2942,8 +3307,9 @@ impl Storage {
         let mut out = Vec::new();
         for row in rows {
             let key = format!(
-                "{}:{}:{}",
+                "{}:{}:{}:{}",
                 row.scope,
+                row.market_family.as_key(),
                 row.mode.as_key(),
                 row.strategy_family.as_key()
             );
@@ -2954,12 +3320,13 @@ impl Storage {
         Ok(out)
     }
 
-    async fn list_lane_states(&self) -> Result<Vec<LaneState>> {
+    async fn list_lane_states(&self, family: Option<MarketFamily>) -> Result<Vec<LaneState>> {
         let rows = sqlx::query_as::<_, LaneStateRow>(
             r#"
             with ranked as (
                 select
                     lane_key,
+                    market_family,
                     promotion_state,
                     promotion_reason,
                     recent_pnl,
@@ -2969,12 +3336,13 @@ impl Storage {
                     quarantine_reason,
                     current_champion_model,
                     row_number() over (
-                        partition by split_part(lane_key, ':', 2), split_part(lane_key, ':', 5)
+                        partition by market_family, split_part(lane_key, ':', 2), split_part(lane_key, ':', 5)
                         order by updated_at desc
                     ) as rn
                 from lane_state
+                where ($1::text is null or market_family = $1)
             )
-            select lane_key, promotion_state, promotion_reason, recent_pnl, recent_brier, recent_execution_quality,
+            select lane_key, market_family, promotion_state, promotion_reason, recent_pnl, recent_brier, recent_execution_quality,
                    recent_replay_expectancy, quarantine_reason, current_champion_model
             from ranked
             where rn = 1
@@ -2992,54 +3360,124 @@ impl Storage {
             limit 8
             "#,
         )
+        .bind(family.map(|value| SqlMarketFamily::from(value).as_key().to_string()))
         .fetch_all(&self.pool)
         .await
         .unwrap_or_default();
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
-    async fn list_open_trades(&self) -> Result<Vec<OpenTradeSummary>> {
+    async fn list_open_trades(&self, family: Option<MarketFamily>) -> Result<Vec<OpenTradeSummary>> {
         let rows = sqlx::query_as::<_, OpenTradeRow>(
             r#"
-            select id, lane_key, strategy_family, mode, quantity, entry_price, created_at, status
-            from trade_lifecycle
-            where closed_at is null and status not in ('closed', 'cancelled')
-            order by created_at desc
+            select
+                tl.id,
+                tl.lane_key,
+                tl.market_family,
+                tl.strategy_family,
+                tl.mode,
+                coalesce(
+                    tl.market_ticker,
+                    latest_snapshot.market_ticker,
+                    tl.metadata_json->>'market_ticker'
+                ) as market_ticker,
+                coalesce(
+                    tl.metadata_json->>'market_title',
+                    latest_snapshot.market_title
+                ) as market_title,
+                latest_snapshot.weather_city as weather_city,
+                latest_snapshot.weather_contract_kind as weather_contract_kind,
+                latest_snapshot.weather_market_date as weather_market_date,
+                latest_snapshot.weather_strike_type as weather_strike_type,
+                latest_snapshot.weather_floor_strike as weather_floor_strike,
+                latest_snapshot.weather_cap_strike as weather_cap_strike,
+                tl.quantity,
+                tl.entry_price,
+                tl.created_at,
+                tl.status
+            from trade_lifecycle tl
+            left join lateral (
+                select
+                    venue_features_json->>'market_ticker' as market_ticker,
+                    venue_features_json->>'market_title' as market_title,
+                    settlement_features_json->>'weather_city' as weather_city,
+                    settlement_features_json->>'weather_contract_kind' as weather_contract_kind,
+                    settlement_features_json->>'weather_market_date' as weather_market_date,
+                    settlement_features_json->>'weather_strike_type' as weather_strike_type,
+                    (settlement_features_json->>'weather_floor_strike')::double precision as weather_floor_strike,
+                    (settlement_features_json->>'weather_cap_strike')::double precision as weather_cap_strike
+                from market_feature_snapshot mfs
+                where mfs.market_id = tl.market_id
+                order by mfs.created_at desc, mfs.id desc
+                limit 1
+            ) latest_snapshot on true
+            where tl.closed_at is null and tl.status not in ('closed', 'cancelled')
+              and ($1::text is null or tl.market_family = $1)
+            order by tl.created_at desc, tl.id desc
             limit 12
             "#,
         )
+        .bind(family.map(|value| SqlMarketFamily::from(value).as_key().to_string()))
         .fetch_all(&self.pool)
         .await
         .unwrap_or_default();
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
-    async fn list_latest_opportunities(&self, limit: i64) -> Result<Vec<OpportunityCard>> {
+    async fn list_latest_opportunities(&self, family: Option<MarketFamily>, limit: i64) -> Result<Vec<OpportunityCard>> {
+        let freshness_cutoff = Utc::now() - opportunity_card_freshness_window(family);
         let rows = sqlx::query(
             r#"
             with ranked as (
                 select
-                    id,
-                    lane_key,
-                    strategy_family,
-                    side,
-                    market_prob,
-                    model_prob,
-                    edge,
-                    confidence,
-                    approved,
-                    reasons_json,
-                    created_at,
-                    row_number() over (partition by lane_key order by created_at desc, id desc) as rn
-                from opportunity_decision
+                    od.id,
+                    od.lane_key,
+                    od.market_family,
+                    od.strategy_family,
+                    od.side,
+                    od.market_prob,
+                    od.model_prob,
+                    od.edge,
+                    od.confidence,
+                    od.approved,
+                    od.reasons_json,
+                    od.created_at,
+                    latest_intent.status as execution_status,
+                    case
+                        when overlapping_trade.id is not null then 'existing_open_trade_for_lane'
+                        else latest_intent.last_error
+                    end as execution_note,
+                    row_number() over (partition by od.lane_key order by od.created_at desc, od.id desc) as rn
+                from opportunity_decision od
+                left join lateral (
+                    select id
+                    from trade_lifecycle tl
+                    where tl.lane_key = od.lane_key
+                      and tl.created_at <= od.created_at
+                      and coalesce(tl.closed_at, od.created_at + interval '100 years') >= od.created_at
+                      and tl.status not in ('closed', 'cancelled')
+                    order by tl.created_at desc, tl.id desc
+                    limit 1
+                ) overlapping_trade on true
+                left join lateral (
+                    select status, last_error
+                    from execution_intent ei
+                    where ei.decision_id = od.id
+                    order by ei.created_at desc, ei.id desc
+                    limit 1
+                ) latest_intent on true
+                where ($1::text is null or od.market_family = $1)
+                  and od.created_at >= $2
             )
-            select id, lane_key, strategy_family, side, market_prob, model_prob, edge, confidence, approved, reasons_json, created_at, rn
+            select id, lane_key, market_family, strategy_family, side, market_prob, model_prob, edge, confidence, approved, reasons_json, created_at, execution_status, execution_note, rn
             from ranked
             where rn = 1
             order by created_at desc
-            limit $1
+            limit $3
             "#,
         )
+        .bind(family.map(|value| SqlMarketFamily::from(value).as_key().to_string()))
+        .bind(freshness_cutoff)
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
@@ -3051,6 +3489,7 @@ impl Storage {
             let reasons_json: serde_json::Value = row.try_get("reasons_json")?;
             opportunities.push(OpportunityCard {
                 lane_key: row.try_get("lane_key")?,
+                market_family: parse_market_family(&row.try_get::<String, _>("market_family")?),
                 strategy_family,
                 side: row.try_get("side")?,
                 market_prob: row.try_get("market_prob")?,
@@ -3067,6 +3506,8 @@ impl Storage {
                             .collect()
                     })
                     .unwrap_or_default(),
+                execution_status: row.try_get("execution_status")?,
+                execution_note: row.try_get("execution_note")?,
                 as_of: row.try_get("created_at")?,
             });
         }
@@ -3076,19 +3517,21 @@ impl Storage {
     async fn insert_bankroll_seed(
         &self,
         scope: &str,
+        market_family: MarketFamily,
         bankroll: f64,
         mode: SqlTradeMode,
     ) -> Result<()> {
         sqlx::query(
             r#"
             insert into bankroll_snapshot (
-                scope, mode, strategy_family, bankroll, deployable_balance, open_exposure,
+                scope, market_family, mode, strategy_family, bankroll, deployable_balance, open_exposure,
                 realized_pnl, unrealized_pnl
             )
-            values ($1, $2, $3, $4, $4, 0, 0, 0)
+            values ($1, $2, $3, $4, $5, $5, 0, 0, 0)
             "#,
         )
         .bind(scope)
+        .bind(SqlMarketFamily::from(market_family))
         .bind(mode)
         .bind(SqlStrategyFamily::Portfolio)
         .bind(bankroll)
@@ -3100,6 +3543,7 @@ impl Storage {
     async fn ensure_bootstrap_bankroll(
         &self,
         scope: &str,
+        market_family: MarketFamily,
         bankroll: f64,
         mode: SqlTradeMode,
     ) -> Result<()> {
@@ -3107,10 +3551,11 @@ impl Storage {
             r#"
             select count(*)
             from bankroll_snapshot
-            where scope = $1 and mode = $2 and strategy_family = $3
+            where scope = $1 and market_family = $2 and mode = $3 and strategy_family = $4
             "#,
         )
         .bind(scope)
+        .bind(SqlMarketFamily::from(market_family))
         .bind(mode)
         .bind(SqlStrategyFamily::Portfolio)
         .fetch_one(&self.pool)
@@ -3118,7 +3563,7 @@ impl Storage {
         .unwrap_or(0);
 
         if snapshot_count == 0 {
-            self.insert_bankroll_seed(scope, bankroll, mode).await?;
+            self.insert_bankroll_seed(scope, market_family, bankroll, mode).await?;
             return Ok(());
         }
 
@@ -3127,12 +3572,13 @@ impl Storage {
                 r#"
                 select id, open_exposure, realized_pnl, unrealized_pnl
                 from bankroll_snapshot
-                where scope = $1 and mode = $2 and strategy_family = $3
+                where scope = $1 and market_family = $2 and mode = $3 and strategy_family = $4
                 order by created_at desc
                 limit 1
                 "#,
             )
             .bind(scope)
+            .bind(SqlMarketFamily::from(market_family))
             .bind(mode)
             .bind(SqlStrategyFamily::Portfolio)
             .fetch_optional(&self.pool)
@@ -3162,17 +3608,23 @@ impl Storage {
         Ok(())
     }
 
-    async fn bootstrap_bankroll(&self, scope: &str, mode: TradeMode) -> Result<Option<f64>> {
+    async fn bootstrap_bankroll(
+        &self,
+        scope: &str,
+        mode: TradeMode,
+        market_family: MarketFamily,
+    ) -> Result<Option<f64>> {
         let bankroll = sqlx::query_scalar::<_, f64>(
             r#"
             select bankroll
             from bankroll_snapshot
-            where scope = $1 and mode = $2 and strategy_family = $3
+            where scope = $1 and market_family = $2 and mode = $3 and strategy_family = $4
             order by created_at asc, id asc
             limit 1
             "#,
         )
         .bind(scope)
+        .bind(SqlMarketFamily::from(market_family))
         .bind(SqlTradeMode::from(mode))
         .bind(SqlStrategyFamily::Portfolio)
         .fetch_optional(&self.pool)
@@ -3186,6 +3638,25 @@ fn count_state(lanes: &[LaneState], state: PromotionState) -> i64 {
         .iter()
         .filter(|lane| lane.promotion_state == state)
         .count() as i64
+}
+
+fn portfolio_scope(mode: TradeMode, market_family: MarketFamily) -> &'static str {
+    match (mode, market_family) {
+        (TradeMode::Paper, MarketFamily::All) => "paper",
+        (TradeMode::Live, MarketFamily::All) => "live",
+        (TradeMode::Paper, MarketFamily::Crypto) => "paper_crypto",
+        (TradeMode::Paper, MarketFamily::Weather) => "paper_weather",
+        (TradeMode::Live, MarketFamily::Crypto) => "live_crypto",
+        (TradeMode::Live, MarketFamily::Weather) => "live_weather",
+    }
+}
+
+fn opportunity_card_freshness_window(family: Option<MarketFamily>) -> chrono::Duration {
+    match family {
+        Some(MarketFamily::Crypto) => chrono::Duration::minutes(10),
+        Some(MarketFamily::Weather) => chrono::Duration::minutes(30),
+        _ => chrono::Duration::minutes(20),
+    }
 }
 
 fn overall_readiness_status(lanes: &[LaneState]) -> String {
@@ -3221,6 +3692,7 @@ fn overall_readiness_status(lanes: &[LaneState]) -> String {
 #[derive(sqlx::FromRow)]
 struct BankrollRow {
     scope: String,
+    market_family: SqlMarketFamily,
     mode: SqlTradeMode,
     strategy_family: SqlStrategyFamily,
     bankroll: f64,
@@ -3234,6 +3706,7 @@ struct BankrollRow {
 #[derive(sqlx::FromRow)]
 struct LaneStateRow {
     lane_key: String,
+    market_family: SqlMarketFamily,
     promotion_state: SqlPromotionState,
     promotion_reason: Option<String>,
     recent_pnl: f64,
@@ -3248,8 +3721,17 @@ struct LaneStateRow {
 struct OpenTradeRow {
     id: i64,
     lane_key: String,
+    market_family: SqlMarketFamily,
     strategy_family: SqlStrategyFamily,
     mode: SqlTradeMode,
+    market_ticker: Option<String>,
+    market_title: Option<String>,
+    weather_city: Option<String>,
+    weather_contract_kind: Option<String>,
+    weather_market_date: Option<String>,
+    weather_strike_type: Option<String>,
+    weather_floor_strike: Option<f64>,
+    weather_cap_strike: Option<f64>,
     quantity: f64,
     entry_price: f64,
     created_at: DateTime<Utc>,
@@ -3259,6 +3741,7 @@ struct OpenTradeRow {
 #[derive(sqlx::FromRow)]
 struct LaneTradeRow {
     id: i64,
+    market_family: SqlMarketFamily,
     status: String,
     mode: SqlTradeMode,
     quantity: f64,
@@ -3273,6 +3756,7 @@ struct LaneTradeRow {
 struct OpportunityRow {
     id: i64,
     lane_key: String,
+    market_family: SqlMarketFamily,
     strategy_family: SqlStrategyFamily,
     side: String,
     market_prob: f64,
@@ -3281,6 +3765,8 @@ struct OpportunityRow {
     confidence: f64,
     approved: bool,
     reasons_json: serde_json::Value,
+    execution_status: Option<String>,
+    execution_note: Option<String>,
     created_at: DateTime<Utc>,
     rn: i32,
 }
@@ -3327,6 +3813,7 @@ struct ProbabilityCalibrationRow {
 #[derive(sqlx::FromRow)]
 struct TrainedModelArtifactRow {
     model_name: String,
+    market_family: SqlMarketFamily,
     strategy_family: SqlStrategyFamily,
     symbol: Option<String>,
     feature_version: String,
@@ -3340,6 +3827,7 @@ struct TrainedModelArtifactRow {
 pub struct HistoricalReplayExampleInsert {
     pub source: String,
     pub source_key: String,
+    pub market_family: MarketFamily,
     pub exchange: String,
     pub symbol: String,
     pub strategy_family: StrategyFamily,
@@ -3356,6 +3844,7 @@ pub struct HistoricalReplayExampleInsert {
 
 #[derive(sqlx::FromRow)]
 struct HistoricalReplayExampleRow {
+    market_family: SqlMarketFamily,
     lane_key: String,
     time_to_expiry_bucket: String,
     resolved_yes_probability: f64,
@@ -3407,6 +3896,7 @@ struct OperatorControlStateRow {
 struct FeatureSnapshotRow {
     id: i64,
     market_id: i64,
+    market_family: SqlMarketFamily,
     exchange: String,
     symbol: String,
     window_minutes: i32,
@@ -3425,6 +3915,7 @@ struct PendingExecutionIntentRow {
     intent_id: i64,
     decision_id: i64,
     market_id: i64,
+    market_family: SqlMarketFamily,
     lane_key: String,
     strategy_family: SqlStrategyFamily,
     side: String,
@@ -3441,6 +3932,7 @@ struct ActiveLiveExecutionIntentRow {
     intent_id: i64,
     decision_id: i64,
     market_id: i64,
+    market_family: SqlMarketFamily,
     lane_key: String,
     strategy_family: SqlStrategyFamily,
     side: String,
@@ -3462,6 +3954,7 @@ struct ActiveLiveExecutionIntentRow {
 struct OpenTradeForExitRow {
     id: i64,
     decision_id: Option<i64>,
+    market_family: SqlMarketFamily,
     lane_key: String,
     strategy_family: SqlStrategyFamily,
     mode: SqlTradeMode,
@@ -3483,6 +3976,7 @@ struct OpenTradeForExitRow {
 #[derive(sqlx::FromRow)]
 struct OpenLiveTradeForReconciliationRow {
     id: i64,
+    market_family: SqlMarketFamily,
     lane_key: String,
     market_ticker: String,
     side: String,
@@ -3514,13 +4008,29 @@ struct TradeExitProgressRow {
 struct ClosedTradeNotificationRow {
     id: i64,
     lane_key: String,
+    market_family: SqlMarketFamily,
     strategy_family: SqlStrategyFamily,
     mode: SqlTradeMode,
+    market_ticker: Option<String>,
+    market_title: Option<String>,
+    side: Option<String>,
+    status: String,
+    close_reason: Option<String>,
     quantity: f64,
     entry_price: f64,
     exit_price: Option<f64>,
     realized_pnl: Option<f64>,
     closed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(sqlx::FromRow)]
+struct OperatorActionEventRow {
+    id: i64,
+    action: String,
+    actor: Option<String>,
+    note: Option<String>,
+    payload_json: serde_json::Value,
+    created_at: DateTime<Utc>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -3608,6 +4118,44 @@ struct LiveIntentRow {
     fill_status: Option<String>,
     created_at: DateTime<Utc>,
     last_transition_at: DateTime<Utc>,
+}
+
+#[derive(sqlx::Type, Clone, Copy)]
+#[sqlx(type_name = "text", rename_all = "snake_case")]
+enum SqlMarketFamily {
+    All,
+    Crypto,
+    Weather,
+}
+
+impl SqlMarketFamily {
+    fn as_key(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Crypto => "crypto",
+            Self::Weather => "weather",
+        }
+    }
+}
+
+impl From<SqlMarketFamily> for MarketFamily {
+    fn from(value: SqlMarketFamily) -> Self {
+        match value {
+            SqlMarketFamily::All => MarketFamily::All,
+            SqlMarketFamily::Crypto => MarketFamily::Crypto,
+            SqlMarketFamily::Weather => MarketFamily::Weather,
+        }
+    }
+}
+
+impl From<MarketFamily> for SqlMarketFamily {
+    fn from(value: MarketFamily) -> Self {
+        match value {
+            MarketFamily::All => SqlMarketFamily::All,
+            MarketFamily::Crypto => SqlMarketFamily::Crypto,
+            MarketFamily::Weather => SqlMarketFamily::Weather,
+        }
+    }
 }
 
 #[derive(sqlx::Type, Clone, Copy)]
@@ -3732,6 +4280,7 @@ impl From<BankrollRow> for BankrollCard {
     fn from(value: BankrollRow) -> Self {
         Self {
             scope: value.scope,
+            market_family: value.market_family.into(),
             mode: value.mode.into(),
             strategy_family: value.strategy_family.into(),
             bankroll: value.bankroll,
@@ -3748,6 +4297,7 @@ impl From<LaneStateRow> for LaneState {
     fn from(value: LaneStateRow) -> Self {
         Self {
             lane_key: value.lane_key,
+            market_family: value.market_family.into(),
             promotion_state: value.promotion_state.into(),
             promotion_reason: value.promotion_reason,
             recent_pnl: value.recent_pnl,
@@ -3764,6 +4314,7 @@ impl From<LaneStateRow> for SymbolLanePolicy {
     fn from(value: LaneStateRow) -> Self {
         Self {
             lane_key: value.lane_key,
+            market_family: value.market_family.into(),
             promotion_state: value.promotion_state.into(),
             promotion_reason: value.promotion_reason,
             recent_pnl: value.recent_pnl,
@@ -3781,8 +4332,17 @@ impl From<OpenTradeRow> for OpenTradeSummary {
         Self {
             trade_id: value.id,
             lane_key: value.lane_key,
+            market_family: value.market_family.into(),
             strategy_family: value.strategy_family.into(),
             mode: value.mode.into(),
+            market_ticker: value.market_ticker,
+            market_title: value.market_title,
+            weather_city: value.weather_city,
+            weather_contract_kind: value.weather_contract_kind,
+            weather_market_date: value.weather_market_date,
+            weather_strike_type: value.weather_strike_type,
+            weather_floor_strike: value.weather_floor_strike,
+            weather_cap_strike: value.weather_cap_strike,
             quantity: value.quantity,
             entry_price: value.entry_price,
             created_at: value.created_at,
@@ -3795,6 +4355,7 @@ impl From<LaneTradeRow> for LaneTradeCard {
     fn from(value: LaneTradeRow) -> Self {
         Self {
             trade_id: value.id,
+            market_family: value.market_family.into(),
             status: value.status,
             mode: value.mode.into(),
             quantity: value.quantity,
@@ -3813,6 +4374,7 @@ impl From<OpportunityRow> for OpportunityCard {
         let _ = value.rn;
         Self {
             lane_key: value.lane_key,
+            market_family: value.market_family.into(),
             strategy_family: value.strategy_family.into(),
             side: value.side,
             market_prob: value.market_prob,
@@ -3830,6 +4392,8 @@ impl From<OpportunityRow> for OpportunityCard {
                         .collect()
                 })
                 .unwrap_or_default(),
+            execution_status: value.execution_status,
+            execution_note: value.execution_note,
             as_of: value.created_at,
         }
     }
@@ -3846,6 +4410,7 @@ impl TryFrom<FeatureSnapshotRow> for MarketFeatureSnapshotRecord {
         let quality = value.venue_quality_json;
         Ok(Self {
             market_id: value.market_id,
+            market_family: value.market_family.into(),
             market_ticker: json_text(&venue, "market_ticker"),
             market_title: json_text(&venue, "market_title"),
             feature_version: value.feature_version,
@@ -3876,6 +4441,25 @@ impl TryFrom<FeatureSnapshotRow> for MarketFeatureSnapshotRecord {
             last_minute_avg_proxy: json_f64(&settlement, "last_minute_avg_proxy"),
             market_data_age_seconds: json_i32(&quality, "market_data_age_seconds"),
             reference_age_seconds: json_i32(&external, "reference_age_seconds"),
+            weather_city: json_optional_text(&settlement, "weather_city"),
+            weather_contract_kind: json_optional_text(&settlement, "weather_contract_kind"),
+            weather_market_date: json_optional_text(&settlement, "weather_market_date"),
+            weather_strike_type: json_optional_text(&settlement, "weather_strike_type"),
+            weather_floor_strike: json_optional_f64(&settlement, "weather_floor_strike"),
+            weather_cap_strike: json_optional_f64(&settlement, "weather_cap_strike"),
+            weather_forecast_temperature_f: json_optional_f64(
+                &external,
+                "weather_forecast_temperature_f",
+            ),
+            weather_observation_temperature_f: json_optional_f64(
+                &external,
+                "weather_observation_temperature_f",
+            ),
+            weather_reference_confidence: json_optional_f64(
+                &external,
+                "weather_reference_confidence",
+            ),
+            weather_reference_source: json_optional_text(&external, "weather_reference_source"),
             created_at: value.created_at,
         })
     }
@@ -3887,6 +4471,7 @@ impl TryFrom<HistoricalReplayExampleRow> for HistoricalReplayExampleCard {
     fn try_from(value: HistoricalReplayExampleRow) -> Result<Self, Self::Error> {
         let features = &value.feature_vector_json;
         Ok(Self {
+            market_family: value.market_family.into(),
             lane_key: value.lane_key,
             time_to_expiry_bucket: value.time_to_expiry_bucket,
             target_yes_probability: value.resolved_yes_probability,
@@ -3914,6 +4499,7 @@ impl From<PendingExecutionIntentRow> for PendingExecutionIntent {
             intent_id: value.intent_id,
             decision_id: value.decision_id,
             market_id: value.market_id,
+            market_family: value.market_family.into(),
             lane_key: value.lane_key,
             strategy_family: value.strategy_family.into(),
             side: value.side,
@@ -3933,6 +4519,7 @@ impl From<ActiveLiveExecutionIntentRow> for ActiveLiveExecutionIntent {
             intent_id: value.intent_id,
             decision_id: value.decision_id,
             market_id: value.market_id,
+            market_family: value.market_family.into(),
             lane_key: value.lane_key,
             strategy_family: value.strategy_family.into(),
             side: value.side,
@@ -3958,6 +4545,7 @@ impl From<OpenTradeForExitRow> for OpenTradeForExit {
         Self {
             trade_id: value.id,
             market_id: value.market_id,
+            market_family: value.market_family.into(),
             market_ticker: value.market_ticker,
             lane_key: value.lane_key,
             side: value.side,
@@ -3981,6 +4569,7 @@ impl From<OpenLiveTradeForReconciliationRow> for OpenLiveTradeForReconciliation 
     fn from(value: OpenLiveTradeForReconciliationRow) -> Self {
         Self {
             trade_id: value.id,
+            market_family: value.market_family.into(),
             lane_key: value.lane_key,
             market_ticker: value.market_ticker,
             side: value.side,
@@ -4001,13 +4590,32 @@ impl From<ClosedTradeNotificationRow> for ClosedTradeNotification {
         Self {
             trade_id: value.id,
             lane_key: value.lane_key,
+            market_family: value.market_family.into(),
             strategy_family: value.strategy_family.into(),
             mode: value.mode.into(),
+            market_ticker: value.market_ticker,
+            market_title: value.market_title,
+            side: value.side,
+            status: value.status,
+            close_reason: value.close_reason,
             quantity: value.quantity,
             entry_price: value.entry_price,
             exit_price: value.exit_price.unwrap_or_default(),
             realized_pnl: value.realized_pnl.unwrap_or_default(),
             closed_at: value.closed_at.unwrap_or_else(Utc::now),
+        }
+    }
+}
+
+impl From<OperatorActionEventRow> for OperatorActionEvent {
+    fn from(value: OperatorActionEventRow) -> Self {
+        Self {
+            id: value.id,
+            action: value.action,
+            actor: value.actor,
+            note: value.note,
+            payload_json: value.payload_json,
+            created_at: value.created_at,
         }
     }
 }
@@ -4061,6 +4669,7 @@ impl TryFrom<TrainedModelArtifactRow> for TrainedModelArtifactCard {
     fn try_from(value: TrainedModelArtifactRow) -> Result<Self, Self::Error> {
         Ok(Self {
             model_name: value.model_name,
+            market_family: value.market_family.into(),
             strategy_family: StrategyFamily::from(value.strategy_family),
             symbol: value.symbol,
             feature_version: value.feature_version,
@@ -4182,12 +4791,23 @@ fn json_f64(value: &serde_json::Value, key: &str) -> f64 {
         .unwrap_or_default()
 }
 
+fn json_optional_f64(value: &serde_json::Value, key: &str) -> Option<f64> {
+    value.get(key).and_then(serde_json::Value::as_f64)
+}
+
 fn json_text(value: &serde_json::Value, key: &str) -> String {
     value
         .get(key)
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default()
         .to_string()
+}
+
+fn json_optional_text(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
 }
 
 fn json_i32(value: &serde_json::Value, key: &str) -> i32 {
@@ -4218,6 +4838,14 @@ fn parse_strategy_family(value: &str) -> StrategyFamily {
     }
 }
 
+fn parse_market_family(value: &str) -> MarketFamily {
+    match value {
+        "crypto" => MarketFamily::Crypto,
+        "weather" => MarketFamily::Weather,
+        _ => MarketFamily::All,
+    }
+}
+
 fn live_trade_needs_attention(
     trade: &OpenLiveTradeForReconciliation,
     snapshot: &LiveTradeReconciliationSnapshot,
@@ -4234,5 +4862,24 @@ fn proportional_entry_fee(total_entry_fee: f64, exit_quantity: f64, total_quanti
         0.0
     } else {
         (total_entry_fee * (exit_quantity / total_quantity)).max(0.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::opportunity_card_freshness_window;
+    use common::MarketFamily;
+
+    #[test]
+    fn opportunity_card_freshness_is_family_aware() {
+        assert_eq!(
+            opportunity_card_freshness_window(Some(MarketFamily::Crypto)).num_minutes(),
+            10
+        );
+        assert_eq!(
+            opportunity_card_freshness_window(Some(MarketFamily::Weather)).num_minutes(),
+            30
+        );
+        assert_eq!(opportunity_card_freshness_window(None).num_minutes(), 20);
     }
 }

@@ -14,6 +14,12 @@ pub struct AppConfig {
     pub reference_price_mode: String,
     pub reference_price_source: String,
     pub reference_averaging_window_seconds: u32,
+    pub nws_api_base: String,
+    pub open_meteo_geocode_api_base: String,
+    pub weather_series_category: String,
+    pub weather_series_title_patterns: Vec<String>,
+    pub weather_series_poll_limit: usize,
+    pub weather_reference_refresh_seconds: u64,
     pub kalshi_api_base: String,
     pub kalshi_ws_url: String,
     pub kalshi_api_key_id: Option<String>,
@@ -23,11 +29,16 @@ pub struct AppConfig {
     pub v2_reference_sqlite_path: Option<String>,
     pub coinbase_ws_url: String,
     pub paper_trading_enabled: bool,
+    pub weather_paper_trading_enabled: bool,
     pub live_trading_enabled: bool,
     pub live_order_placement_enabled: bool,
     pub discord_webhook_url: Option<String>,
     pub initial_paper_bankroll: f64,
     pub initial_live_bankroll: f64,
+    pub initial_paper_crypto_budget: f64,
+    pub initial_paper_weather_budget: f64,
+    pub initial_live_crypto_budget: f64,
+    pub initial_live_weather_budget: f64,
     pub kalshi_series_tickers: Vec<String>,
     pub reference_symbols: Vec<String>,
     pub market_poll_seconds: u64,
@@ -91,6 +102,23 @@ impl AppConfig {
             "REFERENCE_AVERAGING_WINDOW_SECONDS",
             self.reference_averaging_window_seconds,
         )?;
+        self.nws_api_base =
+            env_string("NWS_API_BASE").unwrap_or_else(|| self.nws_api_base.clone());
+        self.open_meteo_geocode_api_base = env_string("OPEN_METEO_GEOCODE_API_BASE")
+            .unwrap_or_else(|| self.open_meteo_geocode_api_base.clone());
+        self.weather_series_category = env_string("WEATHER_SERIES_CATEGORY")
+            .unwrap_or_else(|| self.weather_series_category.clone());
+        self.weather_series_title_patterns = env_csv("WEATHER_SERIES_TITLE_PATTERNS")
+            .filter(|values| !values.is_empty())
+            .unwrap_or_else(|| self.weather_series_title_patterns.clone());
+        self.weather_series_poll_limit = env_parse(
+            "WEATHER_SERIES_POLL_LIMIT",
+            self.weather_series_poll_limit,
+        )?;
+        self.weather_reference_refresh_seconds = env_parse(
+            "WEATHER_REFERENCE_REFRESH_SECONDS",
+            self.weather_reference_refresh_seconds,
+        )?;
         self.kalshi_api_base =
             env_string("KALSHI_API_BASE").unwrap_or_else(|| self.kalshi_api_base.clone());
         self.kalshi_ws_url =
@@ -109,6 +137,10 @@ impl AppConfig {
             env_string("COINBASE_WS_URL").unwrap_or_else(|| self.coinbase_ws_url.clone());
         self.paper_trading_enabled =
             env_parse("PAPER_TRADING_ENABLED", self.paper_trading_enabled)?;
+        self.weather_paper_trading_enabled = env_parse(
+            "WEATHER_PAPER_TRADING_ENABLED",
+            self.weather_paper_trading_enabled,
+        )?;
         self.live_trading_enabled = env_parse("LIVE_TRADING_ENABLED", self.live_trading_enabled)?;
         self.live_order_placement_enabled = env_parse(
             "LIVE_ORDER_PLACEMENT_ENABLED",
@@ -120,6 +152,18 @@ impl AppConfig {
             env_parse("INITIAL_PAPER_BANKROLL", self.initial_paper_bankroll)?;
         self.initial_live_bankroll =
             env_parse("INITIAL_LIVE_BANKROLL", self.initial_live_bankroll)?;
+        self.initial_paper_crypto_budget = env_parse(
+            "INITIAL_PAPER_CRYPTO_BUDGET",
+            self.initial_paper_crypto_budget,
+        )?;
+        self.initial_paper_weather_budget = env_parse(
+            "INITIAL_PAPER_WEATHER_BUDGET",
+            self.initial_paper_weather_budget,
+        )?;
+        self.initial_live_crypto_budget =
+            env_parse("INITIAL_LIVE_CRYPTO_BUDGET", self.initial_live_crypto_budget)?;
+        self.initial_live_weather_budget =
+            env_parse("INITIAL_LIVE_WEATHER_BUDGET", self.initial_live_weather_budget)?;
         self.kalshi_series_tickers = env_csv("KALSHI_SERIES_TICKERS")
             .filter(|values| !values.is_empty())
             .unwrap_or_else(|| self.kalshi_series_tickers.clone());
