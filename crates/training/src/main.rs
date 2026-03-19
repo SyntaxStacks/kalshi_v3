@@ -364,6 +364,9 @@ async fn persist_model_benchmark_run(
             sample_count: result.sample_count as i32,
             trade_count: result.trade_count as i32,
             win_rate: result.win_rate,
+            fill_rate: result.fill_rate,
+            slippage_bps: result.slippage_bps,
+            edge_realization_ratio: result.edge_realization_ratio,
         })
         .collect::<Vec<_>>();
     storage

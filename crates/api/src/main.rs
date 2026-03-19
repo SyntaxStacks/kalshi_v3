@@ -174,6 +174,7 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
         .map(|sync| (Utc::now() - sync.synced_at).num_seconds().max(0))
         .unwrap_or(-1);
     let operator_control = state.storage.operator_control_state().await.ok().flatten();
+    let execution_quality = state.storage.execution_quality_summary(None).await.ok();
     let effective_live_order_placement_enabled = state
         .storage
         .effective_live_order_placement_enabled(state.config.live_order_placement_enabled)
@@ -263,6 +264,45 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
             0.0
         },
     );
+
+    if let Some(quality) = execution_quality {
+        append_help(
+            &mut out,
+            "kalshi_v3_replay_edge_realization_ratio",
+            "Average replay edge realization ratio across latest champion lanes.",
+            "gauge",
+        );
+        append_metric(
+            &mut out,
+            "kalshi_v3_replay_edge_realization_ratio",
+            &[],
+            quality.replay_edge_realization_ratio,
+        );
+        append_help(
+            &mut out,
+            "kalshi_v3_recent_expected_fill_probability",
+            "Average expected fill probability across recent processed execution intents.",
+            "gauge",
+        );
+        append_metric(
+            &mut out,
+            "kalshi_v3_recent_expected_fill_probability",
+            &[],
+            quality.recent_expected_fill_probability,
+        );
+        append_help(
+            &mut out,
+            "kalshi_v3_recent_actual_fill_rate",
+            "Average realized fill rate across recent processed execution intents.",
+            "gauge",
+        );
+        append_metric(
+            &mut out,
+            "kalshi_v3_recent_actual_fill_rate",
+            &[],
+            quality.recent_actual_fill_rate,
+        );
+    }
 
     append_help(
         &mut out,
@@ -519,6 +559,7 @@ async fn runtime(State(state): State<AppState>) -> Json<serde_json::Value> {
         .await
         .ok()
         .flatten();
+    let execution_quality = state.storage.execution_quality_summary(None).await.ok();
     let live_exchange_sync_age_seconds = live_exchange_sync
         .as_ref()
         .map(|sync| (Utc::now() - sync.synced_at).num_seconds().max(0));
@@ -568,6 +609,7 @@ async fn runtime(State(state): State<AppState>) -> Json<serde_json::Value> {
         "live_bankroll_age_seconds": live_bankroll_age_seconds,
         "live_exchange_sync_age_seconds": live_exchange_sync_age_seconds,
         "live_exchange_sync": live_exchange_sync,
+        "execution_quality": execution_quality,
         "intent_status_counts": intent_status_counts,
         "alarms": alarms,
         "acceptance_gates": acceptance_gates,
@@ -1497,8 +1539,8 @@ mod tests {
     };
     use chrono::{Duration, Utc};
     use common::{
-        AppConfig, DashboardSnapshot, LaneState, LiveExceptionSnapshot, LiveExchangeSyncSummary,
-        MarketFamily, PromotionState, ReadinessSummary, RuntimeAlarm,
+        AppConfig, DashboardSnapshot, ExecutionQualitySummary, LaneState, LiveExceptionSnapshot,
+        LiveExchangeSyncSummary, MarketFamily, PromotionState, ReadinessSummary, RuntimeAlarm,
     };
     use serde_json::json;
     use storage::WorkerStatusCard;
@@ -1644,6 +1686,19 @@ mod tests {
             },
             open_trades: Vec::new(),
             opportunities: Vec::new(),
+            execution_quality: ExecutionQualitySummary {
+                as_of: Utc::now(),
+                replay_lane_count: 1,
+                replay_trade_count: 4,
+                replay_edge_realization_ratio: 1.0,
+                replay_fill_rate: 0.6,
+                replay_slippage_bps: 12.0,
+                recent_intent_count: 10,
+                recent_filled_count: 6,
+                recent_expected_fill_intent_count: 8,
+                recent_expected_fill_probability: 0.58,
+                recent_actual_fill_rate: 0.60,
+            },
             live_sync: None,
             live_exceptions: LiveExceptionSnapshot {
                 operator_control: None,

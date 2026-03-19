@@ -417,6 +417,68 @@ function renderLiveSync(sync) {
   `;
 }
 
+function pct(value) {
+  return `${((Number(value) || 0) * 100).toFixed(1)}%`;
+}
+
+function ratio(value) {
+  return (Number(value) || 0).toFixed(2);
+}
+
+function executionQualityTone(summary) {
+  if (!summary) return "warn";
+  const gap = Math.abs((summary.recent_expected_fill_probability || 0) - (summary.recent_actual_fill_rate || 0));
+  if ((summary.replay_edge_realization_ratio || 0) < 0 || gap > 0.30) return "bad";
+  if ((summary.replay_edge_realization_ratio || 0) < 0.5 || gap > 0.15) return "warn";
+  return "good";
+}
+
+function renderExecutionQuality(summary) {
+  const badge = document.getElementById("execution-quality-badge");
+  const strip = document.getElementById("execution-quality-strip");
+  const root = document.getElementById("execution-quality-list");
+  if (!summary) {
+    badge.textContent = "Unavailable";
+    badge.className = "readiness-badge warn";
+    strip.innerHTML = "";
+    root.innerHTML = `<div class="empty">Execution quality metrics are not available yet. Replay and processed execution intents will populate this panel.</div>`;
+    return;
+  }
+
+  const tone = executionQualityTone(summary);
+  const fillGap = (summary.recent_actual_fill_rate || 0) - (summary.recent_expected_fill_probability || 0);
+  badge.textContent = titleCase(tone === "good" ? "Aligned" : tone === "warn" ? "Watch" : "Drift");
+  badge.className = `readiness-badge ${tone}`;
+  strip.innerHTML = `
+    <div class="state-pill"><span class="eyebrow">Replay Edge Realization</span><strong>${ratio(summary.replay_edge_realization_ratio)}</strong></div>
+    <div class="state-pill"><span class="eyebrow">Replay Fill Rate</span><strong>${pct(summary.replay_fill_rate)}</strong></div>
+    <div class="state-pill"><span class="eyebrow">Expected Fill</span><strong>${pct(summary.recent_expected_fill_probability)}</strong></div>
+    <div class="state-pill"><span class="eyebrow">Actual Fill</span><strong>${pct(summary.recent_actual_fill_rate)}</strong></div>
+  `;
+  root.innerHTML = `
+    <section class="lane-card">
+      <header>
+        <div>
+          <p class="eyebrow">Replay truth</p>
+          <strong>${summary.replay_lane_count} champion lane${summary.replay_lane_count === 1 ? "" : "s"}</strong>
+        </div>
+        <div class="chip ${tone}">As of ${dateTime(summary.as_of)}</div>
+      </header>
+      <dl class="metric-grid">
+        <div class="metric"><dt>Edge realization</dt><dd class="${summary.replay_edge_realization_ratio >= 1 ? "good" : summary.replay_edge_realization_ratio < 0 ? "bad" : ""}">${ratio(summary.replay_edge_realization_ratio)}</dd></div>
+        <div class="metric"><dt>Replay slippage</dt><dd class="mono">${summary.replay_slippage_bps.toFixed(1)} bps</dd></div>
+        <div class="metric"><dt>Replay trades</dt><dd class="mono">${summary.replay_trade_count}</dd></div>
+        <div class="metric"><dt>Recent intents</dt><dd class="mono">${summary.recent_intent_count}</dd></div>
+        <div class="metric"><dt>Filled intents</dt><dd class="mono">${summary.recent_filled_count}</dd></div>
+        <div class="metric"><dt>Measured expected fills</dt><dd class="mono">${summary.recent_expected_fill_intent_count}</dd></div>
+      </dl>
+      <p class="${Math.abs(fillGap) > 0.15 ? "bad" : "muted"}">Expected fill ${pct(summary.recent_expected_fill_probability)} vs actual fill ${pct(summary.recent_actual_fill_rate)} (${fillGap >= 0 ? "+" : ""}${pct(fillGap)} gap).</p>
+      ${summary.recent_expected_fill_intent_count === 0 ? `<p class="muted">Recent intents were opened before queue-aware fill probabilities were persisted, so expected-fill confidence is not measured yet for this sample.</p>` : ""}
+      ${summary.replay_trade_count === 0 ? `<p class="muted">Latest replay champions abstained on these lanes, so replay fill and edge-realization metrics are currently zero by construction.</p>` : ""}
+    </section>
+  `;
+}
+
 function freshnessLabel(seconds, staleAfter) {
   if (seconds == null) return { label: "Unknown", tone: "warn" };
   if (seconds > staleAfter) return { label: `Stale ${seconds}s`, tone: "bad" };
@@ -875,6 +937,7 @@ async function refreshScreen() {
     renderReadiness(readiness);
     renderLiveSync(payload.live_sync || null);
     renderOperatorState(runtime, readiness);
+    renderExecutionQuality(payload.execution_quality || runtime?.execution_quality || null);
     renderLiveExceptions(payload);
     renderTrades(payload.open_trades || []);
     renderOpportunities(payload.opportunities || []);

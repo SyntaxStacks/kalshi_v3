@@ -430,6 +430,9 @@ pub struct ReplayBenchmarkCard {
     pub sample_count: i32,
     pub trade_count: i32,
     pub win_rate: f64,
+    pub fill_rate: f64,
+    pub slippage_bps: f64,
+    pub edge_realization_ratio: f64,
     pub source: String,
     pub created_at: DateTime<Utc>,
 }
@@ -453,12 +456,28 @@ pub struct LaneInspectionSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionQualitySummary {
+    pub as_of: DateTime<Utc>,
+    pub replay_lane_count: i64,
+    pub replay_trade_count: i64,
+    pub replay_edge_realization_ratio: f64,
+    pub replay_fill_rate: f64,
+    pub replay_slippage_bps: f64,
+    pub recent_intent_count: i64,
+    pub recent_filled_count: i64,
+    pub recent_expected_fill_intent_count: i64,
+    pub recent_expected_fill_probability: f64,
+    pub recent_actual_fill_rate: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DashboardSnapshot {
     pub market_family: Option<MarketFamily>,
     pub bankrolls: Vec<BankrollCard>,
     pub readiness: ReadinessSummary,
     pub open_trades: Vec<OpenTradeSummary>,
     pub opportunities: Vec<OpportunityCard>,
+    pub execution_quality: ExecutionQualitySummary,
     pub live_sync: Option<LiveExchangeSyncSummary>,
     pub live_exceptions: LiveExceptionSnapshot,
 }

@@ -1,12 +1,12 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use common::{
-    BankrollCard, DashboardSnapshot, LaneInspectionSnapshot, LaneReplaySummary, LaneState,
-    LaneTradeCard, LiveExceptionSnapshot, LiveExchangeSyncSummary, LiveFillCard, LiveIntentCard,
-    LiveOrderCard, LivePositionCard, LiveTradeExceptionCard, MarketFamily,
-    MarketFeatureSnapshotRecord, ModelInference, OpenTradeSummary, OperatorActionEvent,
-    OperatorControlState, OpportunityCard, OpportunityDecision, PromotionState, ReadinessSummary,
-    ReplayBenchmarkCard, StrategyFamily, TradeMode,
+    BankrollCard, DashboardSnapshot, ExecutionQualitySummary, LaneInspectionSnapshot,
+    LaneReplaySummary, LaneState, LaneTradeCard, LiveExceptionSnapshot, LiveExchangeSyncSummary,
+    LiveFillCard, LiveIntentCard, LiveOrderCard, LivePositionCard, LiveTradeExceptionCard,
+    MarketFamily, MarketFeatureSnapshotRecord, ModelInference, OpenTradeSummary,
+    OperatorActionEvent, OperatorControlState, OpportunityCard, OpportunityDecision,
+    PromotionState, ReadinessSummary, ReplayBenchmarkCard, StrategyFamily, TradeMode,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -218,6 +218,9 @@ pub struct ModelBenchmarkResultInsert {
     pub sample_count: i32,
     pub trade_count: i32,
     pub win_rate: f64,
+    pub fill_rate: f64,
+    pub slippage_bps: f64,
+    pub edge_realization_ratio: f64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -360,6 +363,7 @@ impl Storage {
         let lanes = self.list_lane_states(family).await?;
         let open_trades = self.list_open_trades(family).await?;
         let opportunities = self.list_latest_opportunities(family, 6).await?;
+        let execution_quality = self.execution_quality_summary(family).await?;
         let live_sync = self.latest_live_exchange_sync_summary().await?;
         let live_exceptions = self.live_exception_snapshot().await?;
 
@@ -379,6 +383,7 @@ impl Storage {
             readiness,
             open_trades,
             opportunities,
+            execution_quality,
             live_sync,
             live_exceptions,
         })
@@ -622,7 +627,8 @@ impl Storage {
                 r#"
                 insert into model_benchmark_result (
                     run_id, model_name, rank, brier, execution_pnl,
-                    sample_count, trade_count, win_rate
+                    sample_count, trade_count, win_rate, fill_rate, slippage_bps,
+                    edge_realization_ratio
                 )
                 "#,
             );
@@ -634,7 +640,10 @@ impl Storage {
                     .push_bind(result.execution_pnl)
                     .push_bind(result.sample_count)
                     .push_bind(result.trade_count)
-                    .push_bind(result.win_rate);
+                    .push_bind(result.win_rate)
+                    .push_bind(result.fill_rate)
+                    .push_bind(result.slippage_bps)
+                    .push_bind(result.edge_realization_ratio);
             });
             builder.build().execute(&mut *tx).await?;
         }
@@ -670,6 +679,7 @@ impl Storage {
         let results = sqlx::query_as::<_, ModelBenchmarkResultRow>(
             r#"
             select model_name, rank, brier, execution_pnl, sample_count, trade_count, win_rate
+                 , fill_rate, slippage_bps, edge_realization_ratio
             from model_benchmark_result
             where run_id = $1
             order by rank asc, model_name asc
@@ -693,11 +703,113 @@ impl Storage {
                     sample_count: row.sample_count,
                     trade_count: row.trade_count,
                     win_rate: row.win_rate,
+                    fill_rate: row.fill_rate,
+                    slippage_bps: row.slippage_bps,
+                    edge_realization_ratio: row.edge_realization_ratio,
                     source: source.clone(),
                     created_at,
                 })
                 .collect(),
         }))
+    }
+
+    pub async fn execution_quality_summary(
+        &self,
+        family: Option<MarketFamily>,
+    ) -> Result<ExecutionQualitySummary> {
+        let family_key = family.map(|value| SqlMarketFamily::from(value).as_key().to_string());
+        let replay_row = sqlx::query(
+            r#"
+            with latest_runs as (
+                select distinct on (lane_key)
+                    id,
+                    lane_key,
+                    created_at
+                from model_benchmark_run
+                where ($1::text is null or market_family = $1)
+                order by lane_key, created_at desc, id desc
+            )
+            select
+                count(*)::bigint as replay_lane_count,
+                coalesce(sum(mbr.trade_count), 0)::bigint as replay_trade_count,
+                coalesce(avg(mbr.fill_rate), 0)::double precision as replay_fill_rate,
+                coalesce(avg(mbr.slippage_bps), 0)::double precision as replay_slippage_bps,
+                coalesce(avg(mbr.edge_realization_ratio), 0)::double precision as replay_edge_realization_ratio,
+                max(lr.created_at) as replay_as_of
+            from latest_runs lr
+            join model_benchmark_result mbr on mbr.run_id = lr.id
+            where mbr.rank = 1
+            "#,
+        )
+        .bind(&family_key)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let intent_row = sqlx::query(
+            r#"
+            with recent as (
+                select
+                    ei.id,
+                    ei.status,
+                    ei.processed_at,
+                    ei.stop_conditions_json
+                from execution_intent ei
+                where ei.processed_at is not null
+                  and ($1::text is null or ei.market_family = $1)
+                order by ei.processed_at desc, ei.id desc
+                limit 200
+            ),
+            expected as (
+                select
+                    recent.id,
+                    max(
+                        case
+                            when item like 'fill_probability:%'
+                            then nullif(split_part(item, ':', 2), '')::double precision
+                            else null
+                        end
+                    ) as expected_fill_probability
+                from recent
+                left join lateral jsonb_array_elements_text(recent.stop_conditions_json) item on true
+                group by recent.id
+            )
+            select
+                count(*)::bigint as recent_intent_count,
+                count(*) filter (where recent.status in ('opened', 'filled', 'partially_filled'))::bigint as recent_filled_count,
+                count(expected.expected_fill_probability)::bigint as recent_expected_fill_intent_count,
+                coalesce(avg(coalesce(expected.expected_fill_probability, 0)), 0)::double precision as recent_expected_fill_probability,
+                coalesce(avg(
+                    case
+                        when recent.status in ('opened', 'filled', 'partially_filled') then 1.0
+                        else 0.0
+                    end
+                ), 0)::double precision as recent_actual_fill_rate,
+                max(recent.processed_at) as intent_as_of
+            from recent
+            left join expected on expected.id = recent.id
+            "#,
+        )
+        .bind(&family_key)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let replay_as_of = replay_row.try_get::<Option<DateTime<Utc>>, _>("replay_as_of")?;
+        let intent_as_of = intent_row.try_get::<Option<DateTime<Utc>>, _>("intent_as_of")?;
+        Ok(ExecutionQualitySummary {
+            as_of: replay_as_of.or(intent_as_of).unwrap_or_else(Utc::now),
+            replay_lane_count: replay_row.try_get("replay_lane_count")?,
+            replay_trade_count: replay_row.try_get("replay_trade_count")?,
+            replay_edge_realization_ratio: replay_row.try_get("replay_edge_realization_ratio")?,
+            replay_fill_rate: replay_row.try_get("replay_fill_rate")?,
+            replay_slippage_bps: replay_row.try_get("replay_slippage_bps")?,
+            recent_intent_count: intent_row.try_get("recent_intent_count")?,
+            recent_filled_count: intent_row.try_get("recent_filled_count")?,
+            recent_expected_fill_intent_count: intent_row
+                .try_get("recent_expected_fill_intent_count")?,
+            recent_expected_fill_probability: intent_row
+                .try_get("recent_expected_fill_probability")?,
+            recent_actual_fill_rate: intent_row.try_get("recent_actual_fill_rate")?,
+        })
     }
 
     pub async fn list_latest_feature_snapshots(
@@ -3918,6 +4030,9 @@ struct ModelBenchmarkResultRow {
     sample_count: i32,
     trade_count: i32,
     win_rate: f64,
+    fill_rate: f64,
+    slippage_bps: f64,
+    edge_realization_ratio: f64,
 }
 
 #[derive(sqlx::FromRow)]
