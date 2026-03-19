@@ -302,6 +302,15 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
                         snapshot.seconds_to_expiry.max(7_200),
                         900,
                         &["expiry_exit".to_string()],
+                        None,
+                        None,
+                        None,
+                        None,
+                        paper_contract_count(
+                            recommended_size,
+                            contract_price_for_side(side, snapshot.market_prob),
+                        ),
+                        Some(PromotionState::PaperActive),
                     )
                     .await?;
                 paper_weather_remaining = (paper_weather_remaining - recommended_size).max(0.0);
@@ -651,6 +660,23 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
                     snapshot.seconds_to_expiry.max(120),
                     45,
                     &stop_conditions,
+                    Some(execution_score.fill_probability),
+                    Some(execution_score.expected_slippage_bps),
+                    Some(execution_score_size_ahead(
+                        &snapshot,
+                        queue_snapshot.as_ref(),
+                        side,
+                    )),
+                    Some("queue_fill_v1"),
+                    match intent_mode {
+                        TradeMode::Paper => {
+                            paper_contract_count(recommended_size, theoretical_entry_price)
+                        }
+                        TradeMode::Live => {
+                            live_contract_count(recommended_size, theoretical_entry_price)
+                        }
+                    },
+                    promotion_state,
                 )
                 .await?;
             match intent_mode {
@@ -803,6 +829,14 @@ fn live_contract_count(position_notional: f64, contract_price: f64) -> f64 {
         0.0
     } else {
         (position_notional / contract_price.max(0.05)).floor()
+    }
+}
+
+fn paper_contract_count(position_notional: f64, contract_price: f64) -> f64 {
+    if contract_price <= 0.0 {
+        0.0
+    } else {
+        (position_notional / contract_price.max(0.05)).max(1.0)
     }
 }
 

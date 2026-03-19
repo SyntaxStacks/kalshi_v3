@@ -427,9 +427,16 @@ function ratio(value) {
 
 function executionQualityTone(summary) {
   if (!summary) return "warn";
-  const gap = Math.abs((summary.recent_expected_fill_probability || 0) - (summary.recent_actual_fill_rate || 0));
-  if ((summary.replay_edge_realization_ratio || 0) < 0 || gap > 0.30) return "bad";
-  if ((summary.replay_edge_realization_ratio || 0) < 0.5 || gap > 0.15) return "warn";
+  if (!summary.live_sample_sufficient) return "warn";
+  const gap = Math.abs(
+    (summary.recent_live_predicted_fill_probability_mean || 0) -
+      (summary.recent_live_filled_quantity_ratio || 0)
+  );
+  const replayEdge = summary.replay_sample_sufficient
+    ? (summary.replay_trade_weighted_edge_realization_ratio_diag || 0)
+    : null;
+  if ((replayEdge != null && replayEdge < 0) || gap > 0.30) return "bad";
+  if ((replayEdge != null && replayEdge < 0.5) || gap > 0.15) return "warn";
   return "good";
 }
 
@@ -441,40 +448,47 @@ function renderExecutionQuality(summary) {
     badge.textContent = "Unavailable";
     badge.className = "readiness-badge warn";
     strip.innerHTML = "";
-    root.innerHTML = `<div class="empty">Execution quality metrics are not available yet. Replay and processed execution intents will populate this panel.</div>`;
+    root.innerHTML = `<div class="empty">Execution truth is not available yet. Once typed live fill outcomes exist, this panel will move out of diagnostic mode.</div>`;
     return;
   }
 
   const tone = executionQualityTone(summary);
-  const fillGap = (summary.recent_actual_fill_rate || 0) - (summary.recent_expected_fill_probability || 0);
-  badge.textContent = titleCase(tone === "good" ? "Aligned" : tone === "warn" ? "Watch" : "Drift");
+  const fillGap =
+    (summary.recent_live_filled_quantity_ratio || 0) -
+    (summary.recent_live_predicted_fill_probability_mean || 0);
+  badge.textContent = summary.live_sample_sufficient
+    ? titleCase(tone === "good" ? "Aligned" : tone === "warn" ? "Watch" : "Drift")
+    : "Insufficient Sample";
   badge.className = `readiness-badge ${tone}`;
   strip.innerHTML = `
-    <div class="state-pill"><span class="eyebrow">Replay Edge Realization</span><strong>${ratio(summary.replay_edge_realization_ratio)}</strong></div>
-    <div class="state-pill"><span class="eyebrow">Replay Fill Rate</span><strong>${pct(summary.replay_fill_rate)}</strong></div>
-    <div class="state-pill"><span class="eyebrow">Expected Fill</span><strong>${pct(summary.recent_expected_fill_probability)}</strong></div>
-    <div class="state-pill"><span class="eyebrow">Actual Fill</span><strong>${pct(summary.recent_actual_fill_rate)}</strong></div>
+    <div class="state-pill"><span class="eyebrow">Replay Edge Realization</span><strong>${summary.replay_trade_weighted_edge_realization_ratio_diag == null ? "Diagnostic Only" : ratio(summary.replay_trade_weighted_edge_realization_ratio_diag)}</strong></div>
+    <div class="state-pill"><span class="eyebrow">Replay Fill Rate</span><strong>${summary.replay_trade_weighted_fill_rate_diag == null ? "Diagnostic Only" : pct(summary.replay_trade_weighted_fill_rate_diag)}</strong></div>
+    <div class="state-pill"><span class="eyebrow">Predicted Fill Probability</span><strong>${summary.recent_live_predicted_fill_probability_mean == null ? "Diagnostic Only" : pct(summary.recent_live_predicted_fill_probability_mean)}</strong></div>
+    <div class="state-pill"><span class="eyebrow">Filled Quantity Ratio</span><strong>${summary.recent_live_filled_quantity_ratio == null ? "Diagnostic Only" : pct(summary.recent_live_filled_quantity_ratio)}</strong></div>
   `;
   root.innerHTML = `
     <section class="lane-card">
       <header>
         <div>
-          <p class="eyebrow">Replay truth</p>
+          <p class="eyebrow">Execution truth</p>
           <strong>${summary.replay_lane_count} champion lane${summary.replay_lane_count === 1 ? "" : "s"}</strong>
         </div>
-        <div class="chip ${tone}">As of ${dateTime(summary.as_of)}</div>
+        <div class="chip ${summary.live_sample_sufficient ? tone : "warn"}">${summary.live_sample_sufficient ? `As of ${dateTime(summary.as_of)}` : "Diagnostic Only"}</div>
       </header>
       <dl class="metric-grid">
-        <div class="metric"><dt>Edge realization</dt><dd class="${summary.replay_edge_realization_ratio >= 1 ? "good" : summary.replay_edge_realization_ratio < 0 ? "bad" : ""}">${ratio(summary.replay_edge_realization_ratio)}</dd></div>
-        <div class="metric"><dt>Replay slippage</dt><dd class="mono">${summary.replay_slippage_bps.toFixed(1)} bps</dd></div>
+        <div class="metric"><dt>Edge realization</dt><dd class="${(summary.replay_trade_weighted_edge_realization_ratio_diag || 0) >= 1 ? "good" : (summary.replay_trade_weighted_edge_realization_ratio_diag || 0) < 0 ? "bad" : ""}">${summary.replay_trade_weighted_edge_realization_ratio_diag == null ? "Diagnostic Only" : ratio(summary.replay_trade_weighted_edge_realization_ratio_diag)}</dd></div>
+        <div class="metric"><dt>Replay slippage</dt><dd class="mono">${summary.replay_trade_weighted_slippage_bps_diag == null ? "Diagnostic Only" : `${summary.replay_trade_weighted_slippage_bps_diag.toFixed(1)} bps`}</dd></div>
         <div class="metric"><dt>Replay trades</dt><dd class="mono">${summary.replay_trade_count}</dd></div>
-        <div class="metric"><dt>Recent intents</dt><dd class="mono">${summary.recent_intent_count}</dd></div>
-        <div class="metric"><dt>Filled intents</dt><dd class="mono">${summary.recent_filled_count}</dd></div>
-        <div class="metric"><dt>Measured expected fills</dt><dd class="mono">${summary.recent_expected_fill_intent_count}</dd></div>
+        <div class="metric"><dt>Terminal live intents</dt><dd class="mono">${summary.recent_live_terminal_intent_count}</dd></div>
+        <div class="metric"><dt>Live intents with fills</dt><dd class="mono">${summary.recent_live_intents_with_fill_count}</dd></div>
+        <div class="metric"><dt>Predicted live sample</dt><dd class="mono">${summary.recent_live_predicted_fill_sample_count}</dd></div>
       </dl>
-      <p class="${Math.abs(fillGap) > 0.15 ? "bad" : "muted"}">Expected fill ${pct(summary.recent_expected_fill_probability)} vs actual fill ${pct(summary.recent_actual_fill_rate)} (${fillGap >= 0 ? "+" : ""}${pct(fillGap)} gap).</p>
-      ${summary.recent_expected_fill_intent_count === 0 ? `<p class="muted">Recent intents were opened before queue-aware fill probabilities were persisted, so expected-fill confidence is not measured yet for this sample.</p>` : ""}
-      ${summary.replay_trade_count === 0 ? `<p class="muted">Latest replay champions abstained on these lanes, so replay fill and edge-realization metrics are currently zero by construction.</p>` : ""}
+      ${
+        summary.live_sample_sufficient && summary.recent_live_predicted_fill_probability_mean != null && summary.recent_live_filled_quantity_ratio != null
+          ? `<p class="${Math.abs(fillGap) > 0.15 ? "bad" : "muted"}">Predicted fill ${pct(summary.recent_live_predicted_fill_probability_mean)} vs filled quantity ratio ${pct(summary.recent_live_filled_quantity_ratio)} (${fillGap >= 0 ? "+" : ""}${pct(fillGap)} gap).</p>`
+          : `<p class="muted">Diagnostic only. Live execution truth stays humble until there are at least 20 terminal live intents, 20 comparable live forecasts, and non-zero realized fills.</p>`
+      }
+      ${!summary.replay_sample_sufficient ? `<p class="muted">Replay metrics remain diagnostic only until trade-weighted replay has at least 50 trades.</p>` : ""}
     </section>
   `;
 }

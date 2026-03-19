@@ -460,14 +460,19 @@ pub struct ExecutionQualitySummary {
     pub as_of: DateTime<Utc>,
     pub replay_lane_count: i64,
     pub replay_trade_count: i64,
-    pub replay_edge_realization_ratio: f64,
-    pub replay_fill_rate: f64,
-    pub replay_slippage_bps: f64,
-    pub recent_intent_count: i64,
-    pub recent_filled_count: i64,
-    pub recent_expected_fill_intent_count: i64,
-    pub recent_expected_fill_probability: f64,
-    pub recent_actual_fill_rate: f64,
+    // Trade-weighted replay metrics are diagnostic until they are proven comparable to live execution.
+    pub replay_trade_weighted_edge_realization_ratio_diag: Option<f64>,
+    pub replay_trade_weighted_fill_rate_diag: Option<f64>,
+    pub replay_trade_weighted_slippage_bps_diag: Option<f64>,
+    // Live execution truth is quantity-based and excludes ambiguous statuses like `opened`.
+    pub recent_live_terminal_intent_count: i64,
+    pub recent_live_intents_with_fill_count: i64,
+    pub recent_live_predicted_fill_sample_count: i64,
+    pub recent_live_predicted_fill_probability_mean: Option<f64>,
+    pub recent_live_filled_quantity_ratio: Option<f64>,
+    pub recent_live_actual_fill_hit_rate: Option<f64>,
+    pub live_sample_sufficient: bool,
+    pub replay_sample_sufficient: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -34,6 +34,22 @@ pub struct PendingExecutionIntent {
     pub entry_style: String,
     pub timeout_seconds: i32,
     pub force_exit_buffer_seconds: i32,
+    // Typed execution forecast semantics. Null means the forecast was not computed for this intent.
+    pub predicted_fill_probability: Option<f64>,
+    pub predicted_slippage_bps: Option<f64>,
+    pub predicted_queue_ahead: Option<f64>,
+    pub execution_forecast_version: Option<String>,
+    // Quantity truth is stored separately from status because `opened` is not fill truth.
+    pub submitted_quantity: f64,
+    pub accepted_quantity: f64,
+    pub filled_quantity: f64,
+    pub cancelled_quantity: f64,
+    pub rejected_quantity: f64,
+    pub avg_fill_price: Option<f64>,
+    pub first_fill_at: Option<DateTime<Utc>>,
+    pub last_fill_at: Option<DateTime<Utc>>,
+    pub terminal_outcome: Option<String>,
+    pub promotion_state_at_creation: Option<PromotionState>,
     pub stop_conditions_json: Vec<String>,
     pub created_at: DateTime<Utc>,
 }
@@ -58,6 +74,13 @@ pub struct ActiveLiveExecutionIntent {
     pub client_order_id: Option<String>,
     pub exchange_order_id: Option<String>,
     pub fill_status: Option<String>,
+    pub submitted_quantity: f64,
+    pub accepted_quantity: f64,
+    pub filled_quantity: f64,
+    pub cancelled_quantity: f64,
+    pub rejected_quantity: f64,
+    pub avg_fill_price: Option<f64>,
+    pub terminal_outcome: Option<String>,
     pub last_transition_at: DateTime<Utc>,
 }
 
@@ -230,6 +253,14 @@ pub struct ExecutionIntentStateUpdate {
     pub client_order_id: Option<String>,
     pub exchange_order_id: Option<String>,
     pub fill_status: Option<String>,
+    pub accepted_quantity: Option<f64>,
+    pub filled_quantity: Option<f64>,
+    pub cancelled_quantity: Option<f64>,
+    pub rejected_quantity: Option<f64>,
+    pub avg_fill_price: Option<f64>,
+    pub first_fill_at: Option<DateTime<Utc>>,
+    pub last_fill_at: Option<DateTime<Utc>>,
+    pub terminal_outcome: Option<String>,
     pub details_json: serde_json::Value,
 }
 
@@ -718,7 +749,9 @@ impl Storage {
         family: Option<MarketFamily>,
     ) -> Result<ExecutionQualitySummary> {
         let family_key = family.map(|value| SqlMarketFamily::from(value).as_key().to_string());
-        let replay_row = sqlx::query(
+        // Replay metrics are trade-weighted diagnostics. Live execution truth is quantity-based and
+        // intentionally excludes ambiguous statuses like `opened`.
+        let replay_rows = sqlx::query_as::<_, ReplayExecutionQualityRow>(
             r#"
             with latest_runs as (
                 select distinct on (lane_key)
@@ -730,85 +763,59 @@ impl Storage {
                 order by lane_key, created_at desc, id desc
             )
             select
-                count(*)::bigint as replay_lane_count,
-                coalesce(sum(mbr.trade_count), 0)::bigint as replay_trade_count,
-                coalesce(avg(mbr.fill_rate), 0)::double precision as replay_fill_rate,
-                coalesce(avg(mbr.slippage_bps), 0)::double precision as replay_slippage_bps,
-                coalesce(avg(mbr.edge_realization_ratio), 0)::double precision as replay_edge_realization_ratio,
-                max(lr.created_at) as replay_as_of
+                lr.created_at as replay_as_of,
+                mbr.trade_count,
+                mbr.fill_rate,
+                mbr.slippage_bps,
+                mbr.edge_realization_ratio
             from latest_runs lr
             join model_benchmark_result mbr on mbr.run_id = lr.id
             where mbr.rank = 1
             "#,
         )
         .bind(&family_key)
-        .fetch_one(&self.pool)
+        .fetch_all(&self.pool)
         .await?;
 
-        let intent_row = sqlx::query(
+        let intent_rows = sqlx::query_as::<_, LiveExecutionQualityRow>(
             r#"
-            with recent as (
-                select
-                    ei.id,
-                    ei.status,
-                    ei.processed_at,
-                    ei.stop_conditions_json
-                from execution_intent ei
-                where ei.processed_at is not null
-                  and ($1::text is null or ei.market_family = $1)
-                order by ei.processed_at desc, ei.id desc
-                limit 200
-            ),
-            expected as (
-                select
-                    recent.id,
-                    max(
-                        case
-                            when item like 'fill_probability:%'
-                            then nullif(split_part(item, ':', 2), '')::double precision
-                            else null
-                        end
-                    ) as expected_fill_probability
-                from recent
-                left join lateral jsonb_array_elements_text(recent.stop_conditions_json) item on true
-                group by recent.id
-            )
             select
-                count(*)::bigint as recent_intent_count,
-                count(*) filter (where recent.status in ('opened', 'filled', 'partially_filled'))::bigint as recent_filled_count,
-                count(expected.expected_fill_probability)::bigint as recent_expected_fill_intent_count,
-                coalesce(avg(coalesce(expected.expected_fill_probability, 0)), 0)::double precision as recent_expected_fill_probability,
-                coalesce(avg(
-                    case
-                        when recent.status in ('opened', 'filled', 'partially_filled') then 1.0
-                        else 0.0
-                    end
-                ), 0)::double precision as recent_actual_fill_rate,
-                max(recent.processed_at) as intent_as_of
-            from recent
-            left join expected on expected.id = recent.id
+                ei.processed_at,
+                ei.predicted_fill_probability,
+                ei.submitted_quantity,
+                ei.filled_quantity
+            from execution_intent ei
+            where ei.processed_at is not null
+              and ei.mode = 'live'
+              and ($1::text is null or ei.market_family = $1)
+              and ei.status in ('filled', 'partially_filled', 'cancelled', 'rejected', 'expired', 'superseded', 'orphaned')
+            order by ei.processed_at desc, ei.id desc
+            limit 500
             "#,
         )
         .bind(&family_key)
-        .fetch_one(&self.pool)
+        .fetch_all(&self.pool)
         .await?;
 
-        let replay_as_of = replay_row.try_get::<Option<DateTime<Utc>>, _>("replay_as_of")?;
-        let intent_as_of = intent_row.try_get::<Option<DateTime<Utc>>, _>("intent_as_of")?;
+        let replay = summarize_replay_execution_quality(&replay_rows);
+        let live = summarize_live_execution_quality(&intent_rows);
         Ok(ExecutionQualitySummary {
-            as_of: replay_as_of.or(intent_as_of).unwrap_or_else(Utc::now),
-            replay_lane_count: replay_row.try_get("replay_lane_count")?,
-            replay_trade_count: replay_row.try_get("replay_trade_count")?,
-            replay_edge_realization_ratio: replay_row.try_get("replay_edge_realization_ratio")?,
-            replay_fill_rate: replay_row.try_get("replay_fill_rate")?,
-            replay_slippage_bps: replay_row.try_get("replay_slippage_bps")?,
-            recent_intent_count: intent_row.try_get("recent_intent_count")?,
-            recent_filled_count: intent_row.try_get("recent_filled_count")?,
-            recent_expected_fill_intent_count: intent_row
-                .try_get("recent_expected_fill_intent_count")?,
-            recent_expected_fill_probability: intent_row
-                .try_get("recent_expected_fill_probability")?,
-            recent_actual_fill_rate: intent_row.try_get("recent_actual_fill_rate")?,
+            as_of: replay.as_of.or(live.as_of).unwrap_or_else(Utc::now),
+            replay_lane_count: replay.replay_lane_count,
+            replay_trade_count: replay.replay_trade_count,
+            replay_trade_weighted_edge_realization_ratio_diag: replay
+                .replay_trade_weighted_edge_realization_ratio_diag,
+            replay_trade_weighted_fill_rate_diag: replay.replay_trade_weighted_fill_rate_diag,
+            replay_trade_weighted_slippage_bps_diag: replay.replay_trade_weighted_slippage_bps_diag,
+            recent_live_terminal_intent_count: live.recent_live_terminal_intent_count,
+            recent_live_intents_with_fill_count: live.recent_live_intents_with_fill_count,
+            recent_live_predicted_fill_sample_count: live.recent_live_predicted_fill_sample_count,
+            recent_live_predicted_fill_probability_mean: live
+                .recent_live_predicted_fill_probability_mean,
+            recent_live_filled_quantity_ratio: live.recent_live_filled_quantity_ratio,
+            recent_live_actual_fill_hit_rate: live.recent_live_actual_fill_hit_rate,
+            live_sample_sufficient: live.live_sample_sufficient,
+            replay_sample_sufficient: replay.replay_sample_sufficient,
         })
     }
 
@@ -2223,14 +2230,22 @@ impl Storage {
         timeout_seconds: i32,
         force_exit_buffer_seconds: i32,
         stop_conditions_json: &[String],
+        predicted_fill_probability: Option<f64>,
+        predicted_slippage_bps: Option<f64>,
+        predicted_queue_ahead: Option<f64>,
+        execution_forecast_version: Option<&str>,
+        submitted_quantity: f64,
+        promotion_state_at_creation: Option<PromotionState>,
     ) -> Result<i64> {
         let id = sqlx::query_scalar(
             r#"
             insert into execution_intent (
                 decision_id, market_family, mode, entry_style, target_ladder_json, timeout_seconds,
-                force_exit_buffer_seconds, stop_conditions_json, status
+                force_exit_buffer_seconds, stop_conditions_json, status,
+                predicted_fill_probability, predicted_slippage_bps, predicted_queue_ahead,
+                execution_forecast_version, submitted_quantity, promotion_state_at_creation
             )
-            values ($1, $2, $3, $4, $5::jsonb, $6, $7, $8::jsonb, 'pending')
+            values ($1, $2, $3, $4, $5::jsonb, $6, $7, $8::jsonb, 'pending', $9, $10, $11, $12, $13, $14)
             returning id
             "#,
         )
@@ -2242,6 +2257,14 @@ impl Storage {
         .bind(timeout_seconds)
         .bind(force_exit_buffer_seconds)
         .bind(json!(stop_conditions_json))
+        .bind(predicted_fill_probability)
+        .bind(predicted_slippage_bps)
+        .bind(predicted_queue_ahead)
+        .bind(execution_forecast_version)
+        .bind(submitted_quantity.max(0.0))
+        .bind(
+            promotion_state_at_creation.map(|value| SqlPromotionState::from(value).as_key().to_string()),
+        )
         .fetch_one(&self.pool)
         .await?;
         Ok(id)
@@ -2269,6 +2292,20 @@ impl Storage {
                 ei.entry_style,
                 ei.timeout_seconds,
                 ei.force_exit_buffer_seconds,
+                ei.predicted_fill_probability,
+                ei.predicted_slippage_bps,
+                ei.predicted_queue_ahead,
+                ei.execution_forecast_version,
+                ei.submitted_quantity,
+                ei.accepted_quantity,
+                ei.filled_quantity,
+                ei.cancelled_quantity,
+                ei.rejected_quantity,
+                ei.avg_fill_price,
+                ei.first_fill_at,
+                ei.last_fill_at,
+                ei.terminal_outcome,
+                ei.promotion_state_at_creation,
                 ei.stop_conditions_json,
                 ei.created_at
             from execution_intent ei
@@ -2308,6 +2345,20 @@ impl Storage {
                 ei.entry_style,
                 ei.timeout_seconds,
                 ei.force_exit_buffer_seconds,
+                ei.predicted_fill_probability,
+                ei.predicted_slippage_bps,
+                ei.predicted_queue_ahead,
+                ei.execution_forecast_version,
+                ei.submitted_quantity,
+                ei.accepted_quantity,
+                ei.filled_quantity,
+                ei.cancelled_quantity,
+                ei.rejected_quantity,
+                ei.avg_fill_price,
+                ei.first_fill_at,
+                ei.last_fill_at,
+                ei.terminal_outcome,
+                ei.promotion_state_at_creation,
                 ei.stop_conditions_json,
                 ei.created_at
             from execution_intent ei
@@ -2346,6 +2397,13 @@ impl Storage {
                 ei.client_order_id,
                 ei.exchange_order_id,
                 ei.fill_status,
+                ei.submitted_quantity,
+                ei.accepted_quantity,
+                ei.filled_quantity,
+                ei.cancelled_quantity,
+                ei.rejected_quantity,
+                ei.avg_fill_price,
+                ei.terminal_outcome,
                 ei.last_transition_at
             from execution_intent ei
             join opportunity_decision od on od.id = ei.decision_id
@@ -2500,6 +2558,18 @@ impl Storage {
             &ExecutionIntentStateUpdate {
                 market_ticker: market_ticker.clone(),
                 side: Some(intent.side.clone()),
+                accepted_quantity: Some(quantity),
+                filled_quantity: Some(quantity),
+                avg_fill_price: Some(entry_price),
+                first_fill_at: Some(Utc::now()),
+                last_fill_at: Some(Utc::now()),
+                terminal_outcome: Some(if intent.mode == TradeMode::Paper {
+                    "paper_filled".to_string()
+                } else if status_on_open == "partially_filled" {
+                    "partially_filled".to_string()
+                } else {
+                    "filled".to_string()
+                }),
                 details_json: json!({
                     "trade_id": id,
                     "status_on_open": status_on_open,
@@ -2591,6 +2661,14 @@ impl Storage {
                 client_order_id = coalesce($6, client_order_id),
                 exchange_order_id = coalesce($7, exchange_order_id),
                 fill_status = coalesce($8, fill_status),
+                accepted_quantity = coalesce($9, accepted_quantity),
+                filled_quantity = coalesce($10, filled_quantity),
+                cancelled_quantity = coalesce($11, cancelled_quantity),
+                rejected_quantity = coalesce($12, rejected_quantity),
+                avg_fill_price = coalesce($13, avg_fill_price),
+                first_fill_at = coalesce($14, first_fill_at),
+                last_fill_at = coalesce($15, last_fill_at),
+                terminal_outcome = coalesce($16, terminal_outcome),
                 submitted_at = case when $2 = 'submitted' and submitted_at is null then now() else submitted_at end,
                 acknowledged_at = case when $2 = 'acknowledged' and acknowledged_at is null then now() else acknowledged_at end,
                 cancelled_at = case when $2 in ('cancelled', 'cancel_pending') and cancelled_at is null then now() else cancelled_at end,
@@ -2607,6 +2685,14 @@ impl Storage {
         .bind(&update.client_order_id)
         .bind(&update.exchange_order_id)
         .bind(&update.fill_status)
+        .bind(update.accepted_quantity)
+        .bind(update.filled_quantity)
+        .bind(update.cancelled_quantity)
+        .bind(update.rejected_quantity)
+        .bind(update.avg_fill_price)
+        .bind(update.first_fill_at)
+        .bind(update.last_fill_at)
+        .bind(&update.terminal_outcome)
         .execute(&self.pool)
         .await?;
 
@@ -4091,6 +4177,20 @@ struct PendingExecutionIntentRow {
     entry_style: String,
     timeout_seconds: i32,
     force_exit_buffer_seconds: i32,
+    predicted_fill_probability: Option<f64>,
+    predicted_slippage_bps: Option<f64>,
+    predicted_queue_ahead: Option<f64>,
+    execution_forecast_version: Option<String>,
+    submitted_quantity: f64,
+    accepted_quantity: f64,
+    filled_quantity: f64,
+    cancelled_quantity: f64,
+    rejected_quantity: f64,
+    avg_fill_price: Option<f64>,
+    first_fill_at: Option<DateTime<Utc>>,
+    last_fill_at: Option<DateTime<Utc>>,
+    terminal_outcome: Option<String>,
+    promotion_state_at_creation: Option<String>,
     stop_conditions_json: serde_json::Value,
     created_at: DateTime<Utc>,
 }
@@ -4115,6 +4215,13 @@ struct ActiveLiveExecutionIntentRow {
     client_order_id: Option<String>,
     exchange_order_id: Option<String>,
     fill_status: Option<String>,
+    submitted_quantity: f64,
+    accepted_quantity: f64,
+    filled_quantity: f64,
+    cancelled_quantity: f64,
+    rejected_quantity: f64,
+    avg_fill_price: Option<f64>,
+    terminal_outcome: Option<String>,
     last_transition_at: DateTime<Utc>,
 }
 
@@ -4286,6 +4393,23 @@ struct LiveIntentRow {
     fill_status: Option<String>,
     created_at: DateTime<Utc>,
     last_transition_at: DateTime<Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+struct ReplayExecutionQualityRow {
+    replay_as_of: DateTime<Utc>,
+    trade_count: i32,
+    fill_rate: f64,
+    slippage_bps: f64,
+    edge_realization_ratio: f64,
+}
+
+#[derive(sqlx::FromRow)]
+struct LiveExecutionQualityRow {
+    processed_at: DateTime<Utc>,
+    predicted_fill_probability: Option<f64>,
+    submitted_quantity: f64,
+    filled_quantity: f64,
 }
 
 #[derive(sqlx::Type, Clone, Copy)]
@@ -4702,6 +4826,23 @@ impl From<PendingExecutionIntentRow> for PendingExecutionIntent {
             entry_style: value.entry_style,
             timeout_seconds: value.timeout_seconds,
             force_exit_buffer_seconds: value.force_exit_buffer_seconds,
+            predicted_fill_probability: value.predicted_fill_probability,
+            predicted_slippage_bps: value.predicted_slippage_bps,
+            predicted_queue_ahead: value.predicted_queue_ahead,
+            execution_forecast_version: value.execution_forecast_version,
+            submitted_quantity: value.submitted_quantity,
+            accepted_quantity: value.accepted_quantity,
+            filled_quantity: value.filled_quantity,
+            cancelled_quantity: value.cancelled_quantity,
+            rejected_quantity: value.rejected_quantity,
+            avg_fill_price: value.avg_fill_price,
+            first_fill_at: value.first_fill_at,
+            last_fill_at: value.last_fill_at,
+            terminal_outcome: value.terminal_outcome,
+            promotion_state_at_creation: value
+                .promotion_state_at_creation
+                .as_deref()
+                .map(parse_promotion_state),
             stop_conditions_json: value
                 .stop_conditions_json
                 .as_array()
@@ -4738,6 +4879,13 @@ impl From<ActiveLiveExecutionIntentRow> for ActiveLiveExecutionIntent {
             client_order_id: value.client_order_id,
             exchange_order_id: value.exchange_order_id,
             fill_status: value.fill_status,
+            submitted_quantity: value.submitted_quantity,
+            accepted_quantity: value.accepted_quantity,
+            filled_quantity: value.filled_quantity,
+            cancelled_quantity: value.cancelled_quantity,
+            rejected_quantity: value.rejected_quantity,
+            avg_fill_price: value.avg_fill_price,
+            terminal_outcome: value.terminal_outcome,
             last_transition_at: value.last_transition_at,
         }
     }
@@ -5050,6 +5198,174 @@ fn parse_market_family(value: &str) -> MarketFamily {
     }
 }
 
+fn parse_promotion_state(value: &str) -> PromotionState {
+    match value {
+        "paper_active" => PromotionState::PaperActive,
+        "live_micro" => PromotionState::LiveMicro,
+        "live_scaled" => PromotionState::LiveScaled,
+        "quarantined" => PromotionState::Quarantined,
+        _ => PromotionState::Shadow,
+    }
+}
+
+#[derive(Default)]
+struct ReplayExecutionQualityAggregate {
+    as_of: Option<DateTime<Utc>>,
+    replay_lane_count: i64,
+    replay_trade_count: i64,
+    replay_trade_weighted_edge_realization_ratio_diag: Option<f64>,
+    replay_trade_weighted_fill_rate_diag: Option<f64>,
+    replay_trade_weighted_slippage_bps_diag: Option<f64>,
+    replay_sample_sufficient: bool,
+}
+
+#[derive(Default)]
+struct LiveExecutionQualityAggregate {
+    as_of: Option<DateTime<Utc>>,
+    recent_live_terminal_intent_count: i64,
+    recent_live_intents_with_fill_count: i64,
+    recent_live_predicted_fill_sample_count: i64,
+    recent_live_predicted_fill_probability_mean: Option<f64>,
+    recent_live_filled_quantity_ratio: Option<f64>,
+    recent_live_actual_fill_hit_rate: Option<f64>,
+    live_sample_sufficient: bool,
+}
+
+fn summarize_replay_execution_quality(
+    rows: &[ReplayExecutionQualityRow],
+) -> ReplayExecutionQualityAggregate {
+    let replay_lane_count = rows.len() as i64;
+    let replay_trade_count = rows
+        .iter()
+        .map(|row| i64::from(row.trade_count.max(0)))
+        .sum::<i64>();
+    let weighted_denominator = rows
+        .iter()
+        .map(|row| f64::from(row.trade_count.max(0)))
+        .sum::<f64>();
+    let trade_weighted_fill_rate =
+        weighted_average_by_trade_count(rows.iter().map(|row| (row.fill_rate, row.trade_count)));
+    let trade_weighted_slippage_bps =
+        weighted_average_by_trade_count(rows.iter().map(|row| (row.slippage_bps, row.trade_count)));
+    let trade_weighted_edge_realization_ratio = weighted_average_by_trade_count(
+        rows.iter()
+            .map(|row| (row.edge_realization_ratio, row.trade_count)),
+    );
+    ReplayExecutionQualityAggregate {
+        as_of: rows.iter().map(|row| row.replay_as_of).max(),
+        replay_lane_count,
+        replay_trade_count,
+        replay_trade_weighted_edge_realization_ratio_diag: trade_weighted_edge_realization_ratio,
+        replay_trade_weighted_fill_rate_diag: trade_weighted_fill_rate,
+        replay_trade_weighted_slippage_bps_diag: trade_weighted_slippage_bps,
+        replay_sample_sufficient: replay_trade_count >= 50
+            && replay_lane_count > 0
+            && weighted_denominator > 0.0,
+    }
+}
+
+fn summarize_live_execution_quality(
+    rows: &[LiveExecutionQualityRow],
+) -> LiveExecutionQualityAggregate {
+    let recent_live_terminal_intent_count = rows.len() as i64;
+    let recent_live_intents_with_fill_count =
+        rows.iter().filter(|row| row.filled_quantity > 0.0).count() as i64;
+    let predicted_rows = rows
+        .iter()
+        .filter(|row| row.predicted_fill_probability.is_some() && row.submitted_quantity > 0.0)
+        .collect::<Vec<_>>();
+    let recent_live_predicted_fill_sample_count = predicted_rows.len() as i64;
+    let recent_live_predicted_fill_probability_mean = if predicted_rows.is_empty() {
+        None
+    } else {
+        Some(
+            predicted_rows
+                .iter()
+                .filter_map(|row| row.predicted_fill_probability)
+                .sum::<f64>()
+                / predicted_rows.len() as f64,
+        )
+    };
+    let submitted_total = rows
+        .iter()
+        .map(|row| row.submitted_quantity.max(0.0))
+        .sum::<f64>();
+    let filled_total = rows
+        .iter()
+        .map(|row| {
+            row.filled_quantity
+                .clamp(0.0, row.submitted_quantity.max(0.0))
+        })
+        .sum::<f64>();
+    let comparable_submitted_total = predicted_rows
+        .iter()
+        .map(|row| row.submitted_quantity.max(0.0))
+        .sum::<f64>();
+    let comparable_filled_ratio = if comparable_submitted_total > 0.0 {
+        Some(
+            predicted_rows
+                .iter()
+                .map(|row| {
+                    row.filled_quantity
+                        .clamp(0.0, row.submitted_quantity.max(0.0))
+                })
+                .sum::<f64>()
+                / comparable_submitted_total,
+        )
+    } else {
+        None
+    };
+    let recent_live_actual_fill_hit_rate = if predicted_rows.is_empty() {
+        None
+    } else {
+        Some(
+            predicted_rows
+                .iter()
+                .filter(|row| row.filled_quantity > 0.0)
+                .count() as f64
+                / predicted_rows.len() as f64,
+        )
+    };
+
+    LiveExecutionQualityAggregate {
+        as_of: rows.iter().map(|row| row.processed_at).max(),
+        recent_live_terminal_intent_count,
+        recent_live_intents_with_fill_count,
+        recent_live_predicted_fill_sample_count,
+        recent_live_predicted_fill_probability_mean,
+        recent_live_filled_quantity_ratio: if submitted_total > 0.0 {
+            Some(filled_total / submitted_total)
+        } else {
+            None
+        },
+        recent_live_actual_fill_hit_rate,
+        live_sample_sufficient: recent_live_terminal_intent_count >= 20
+            && recent_live_predicted_fill_sample_count >= 20
+            && comparable_filled_ratio.unwrap_or_default() > 0.0,
+    }
+}
+
+fn weighted_average_by_trade_count<I>(items: I) -> Option<f64>
+where
+    I: Iterator<Item = (f64, i32)>,
+{
+    let mut weighted_sum = 0.0;
+    let mut denominator = 0.0;
+    for (value, trade_count) in items {
+        let weight = f64::from(trade_count.max(0));
+        if weight <= 0.0 {
+            continue;
+        }
+        weighted_sum += value * weight;
+        denominator += weight;
+    }
+    if denominator > 0.0 {
+        Some(weighted_sum / denominator)
+    } else {
+        None
+    }
+}
+
 fn live_trade_needs_attention(
     trade: &OpenLiveTradeForReconciliation,
     snapshot: &LiveTradeReconciliationSnapshot,
@@ -5071,7 +5387,11 @@ fn proportional_entry_fee(total_entry_fee: f64, exit_quantity: f64, total_quanti
 
 #[cfg(test)]
 mod tests {
-    use super::opportunity_card_freshness_window;
+    use super::{
+        LiveExecutionQualityRow, ReplayExecutionQualityRow, opportunity_card_freshness_window,
+        summarize_live_execution_quality, summarize_replay_execution_quality,
+    };
+    use chrono::Utc;
     use common::MarketFamily;
 
     #[test]
@@ -5085,5 +5405,118 @@ mod tests {
             30
         );
         assert_eq!(opportunity_card_freshness_window(None).num_minutes(), 20);
+    }
+
+    #[test]
+    fn live_execution_summary_excludes_opened_and_preserves_null_forecasts() {
+        let now = Utc::now();
+        let rows = vec![
+            LiveExecutionQualityRow {
+                processed_at: now,
+                predicted_fill_probability: Some(0.8),
+                submitted_quantity: 10.0,
+                filled_quantity: 10.0,
+            },
+            LiveExecutionQualityRow {
+                processed_at: now,
+                predicted_fill_probability: None,
+                submitted_quantity: 5.0,
+                filled_quantity: 0.0,
+            },
+        ];
+        let summary = summarize_live_execution_quality(&rows);
+        assert_eq!(summary.recent_live_terminal_intent_count, 2);
+        assert_eq!(summary.recent_live_predicted_fill_sample_count, 1);
+        assert_eq!(
+            summary.recent_live_predicted_fill_probability_mean,
+            Some(0.8)
+        );
+        assert_eq!(summary.recent_live_filled_quantity_ratio, Some(10.0 / 15.0));
+        assert_eq!(summary.recent_live_actual_fill_hit_rate, Some(1.0));
+    }
+
+    #[test]
+    fn live_execution_summary_handles_partial_fill_quantity_math() {
+        let now = Utc::now();
+        let rows = vec![
+            LiveExecutionQualityRow {
+                processed_at: now,
+                predicted_fill_probability: Some(0.7),
+                submitted_quantity: 10.0,
+                filled_quantity: 3.0,
+            },
+            LiveExecutionQualityRow {
+                processed_at: now,
+                predicted_fill_probability: Some(0.6),
+                submitted_quantity: 5.0,
+                filled_quantity: 5.0,
+            },
+        ];
+        let summary = summarize_live_execution_quality(&rows);
+        assert_eq!(summary.recent_live_filled_quantity_ratio, Some(8.0 / 15.0));
+        assert_eq!(summary.recent_live_actual_fill_hit_rate, Some(1.0));
+    }
+
+    #[test]
+    fn replay_execution_summary_is_trade_weighted() {
+        let now = Utc::now();
+        let rows = vec![
+            ReplayExecutionQualityRow {
+                replay_as_of: now,
+                trade_count: 100,
+                fill_rate: 0.2,
+                slippage_bps: 15.0,
+                edge_realization_ratio: 0.5,
+            },
+            ReplayExecutionQualityRow {
+                replay_as_of: now,
+                trade_count: 1,
+                fill_rate: 1.0,
+                slippage_bps: 1.0,
+                edge_realization_ratio: 2.0,
+            },
+        ];
+        let summary = summarize_replay_execution_quality(&rows);
+        let expected_fill_rate = ((0.2 * 100.0) + 1.0) / 101.0;
+        let expected_edge_realization = ((0.5 * 100.0) + 2.0) / 101.0;
+        assert_eq!(summary.replay_trade_count, 101);
+        assert_eq!(
+            summary.replay_trade_weighted_fill_rate_diag,
+            Some(expected_fill_rate)
+        );
+        assert_eq!(
+            summary.replay_trade_weighted_edge_realization_ratio_diag,
+            Some(expected_edge_realization)
+        );
+    }
+
+    #[test]
+    fn live_execution_summary_requires_real_samples_for_confidence() {
+        let now = Utc::now();
+        let rows = (0..19)
+            .map(|_| LiveExecutionQualityRow {
+                processed_at: now,
+                predicted_fill_probability: Some(0.7),
+                submitted_quantity: 1.0,
+                filled_quantity: 1.0,
+            })
+            .collect::<Vec<_>>();
+        let summary = summarize_live_execution_quality(&rows);
+        assert!(!summary.live_sample_sufficient);
+    }
+
+    #[test]
+    fn live_execution_summary_tolerates_historical_rows_without_backfill() {
+        let rows = vec![LiveExecutionQualityRow {
+            processed_at: Utc::now(),
+            predicted_fill_probability: None,
+            submitted_quantity: 0.0,
+            filled_quantity: 0.0,
+        }];
+        let summary = summarize_live_execution_quality(&rows);
+        assert_eq!(summary.recent_live_terminal_intent_count, 1);
+        assert_eq!(summary.recent_live_predicted_fill_probability_mean, None);
+        assert_eq!(summary.recent_live_filled_quantity_ratio, None);
+        assert!(!summary.live_sample_sufficient);
     }
 }

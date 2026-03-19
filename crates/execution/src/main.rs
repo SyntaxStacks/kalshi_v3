@@ -1,4 +1,5 @@
 use anyhow::Result;
+use chrono::Utc;
 use common::{
     AppConfig, MarketFamily, StrategyFamily, TradeMode, kalshi_api_key_id, kalshi_private_key,
     kalshi_sign_rest_request, kalshi_timestamp_ms,
@@ -332,7 +333,11 @@ async fn execute_once(
                         continue;
                     }
                 }
-                let quantity = (position_notional / theoretical_entry_price.max(0.05)).max(1.0);
+                let quantity = if intent.submitted_quantity > 0.0 {
+                    intent.submitted_quantity
+                } else {
+                    (position_notional / theoretical_entry_price.max(0.05)).max(1.0)
+                };
                 storage
                     .open_trade_from_intent(&intent, quantity, theoretical_entry_price)
                     .await?;
@@ -407,7 +412,11 @@ async fn execute_once(
                     rejected += 1;
                     continue;
                 }
-                let quantity = (position_notional / theoretical_entry_price.max(0.05)).floor();
+                let quantity = if intent.submitted_quantity > 0.0 {
+                    intent.submitted_quantity.floor()
+                } else {
+                    (position_notional / theoretical_entry_price.max(0.05)).floor()
+                };
                 if quantity < 1.0 {
                     storage
                         .mark_execution_intent_status(
@@ -430,6 +439,10 @@ async fn execute_once(
                             market_ticker: Some(snapshot.market_ticker.clone()),
                             side: Some(intent.side.clone()),
                             client_order_id: Some(client_order_id.clone()),
+                            accepted_quantity: Some(0.0),
+                            filled_quantity: Some(0.0),
+                            cancelled_quantity: Some(0.0),
+                            rejected_quantity: Some(0.0),
                             details_json: json!({
                                 "market_ticker": snapshot.market_ticker.clone(),
                                 "quantity": quantity,
@@ -467,6 +480,7 @@ async fn execute_once(
                                         "phase": "entry_acknowledged",
                                         "order_id": fill.order_id.clone(),
                                     }),
+                                    ..Default::default()
                                 },
                             )
                             .await?;
@@ -514,9 +528,27 @@ async fn execute_once(
                                     client_order_id,
                                     exchange_order_id: order_id,
                                     fill_status: status,
+                                    accepted_quantity: Some(if intent_status == "acknowledged" {
+                                        quantity
+                                    } else {
+                                        0.0
+                                    }),
+                                    filled_quantity: Some(0.0),
+                                    cancelled_quantity: Some(if intent_status == "cancelled" {
+                                        quantity
+                                    } else {
+                                        0.0
+                                    }),
+                                    rejected_quantity: Some(if intent_status == "rejected" {
+                                        quantity
+                                    } else {
+                                        0.0
+                                    }),
+                                    terminal_outcome: terminal_outcome_for_status(intent_status),
                                     details_json: json!({
                                         "phase": "entry_no_fill",
                                     }),
+                                    ..Default::default()
                                 },
                             )
                             .await?;
@@ -545,6 +577,7 @@ async fn execute_once(
                                         "phase": "entry_retryable",
                                         "orphaned": orphaned,
                                     }),
+                                    ..Default::default()
                                 },
                             )
                             .await?;
@@ -857,6 +890,7 @@ async fn reconcile_active_live_intents(
                             "phase": "cancel_stale_live_order",
                             "age_seconds": age_seconds,
                         }),
+                        ..Default::default()
                     },
                 )
                 .await?;
@@ -892,6 +926,7 @@ async fn reconcile_active_live_intents(
                                             "phase": "cancel_stale_live_order",
                                             "age_seconds": age_seconds,
                                         }),
+                                        ..Default::default()
                                     },
                                 )
                                 .await?;
@@ -989,6 +1024,40 @@ async fn sync_live_intent_from_exchange(
                     client_order_id: Some(client_order_id),
                     exchange_order_id: Some(order.order_id.clone()),
                     fill_status: Some(order.status.clone()),
+                    accepted_quantity: Some(
+                        if matches!(next_status, "acknowledged" | "partially_filled" | "filled") {
+                            intent.submitted_quantity.max(fill_quantity)
+                        } else {
+                            intent.accepted_quantity
+                        },
+                    ),
+                    filled_quantity: Some(fill_quantity.max(intent.filled_quantity)),
+                    cancelled_quantity: Some(if next_status == "cancelled" {
+                        (intent.submitted_quantity - fill_quantity).max(0.0)
+                    } else {
+                        intent.cancelled_quantity
+                    }),
+                    rejected_quantity: Some(if next_status == "rejected" {
+                        intent.submitted_quantity.max(0.0)
+                    } else {
+                        intent.rejected_quantity
+                    }),
+                    avg_fill_price: if fill_quantity > 0.0 {
+                        Some(fill_price)
+                    } else {
+                        intent.avg_fill_price
+                    },
+                    first_fill_at: if fill_quantity > 0.0 && intent.filled_quantity <= 0.0 {
+                        Some(Utc::now())
+                    } else {
+                        None
+                    },
+                    last_fill_at: if fill_quantity > 0.0 {
+                        Some(Utc::now())
+                    } else {
+                        None
+                    },
+                    terminal_outcome: terminal_outcome_for_status(next_status),
                     details_json: json!({
                         "phase": "live_intent_sync",
                         "fill_quantity": fill_quantity,
@@ -1036,6 +1105,7 @@ async fn replace_live_entry_order(
                         "phase": "replace_live_entry_order",
                         "replaced": false,
                     }),
+                    ..Default::default()
                 },
             )
             .await?;
@@ -1068,6 +1138,7 @@ async fn replace_live_entry_order(
                         "phase": "replace_live_entry_order",
                         "replaced": false,
                     }),
+                    ..Default::default()
                 },
             )
             .await?;
@@ -1132,6 +1203,7 @@ async fn handle_live_entry_placement_result(
                             "phase": "entry_acknowledged",
                             "order_id": fill.order_id.clone(),
                         }),
+                        ..Default::default()
                     },
                 )
                 .await?;
@@ -1191,9 +1263,27 @@ async fn handle_live_entry_placement_result(
                         client_order_id,
                         exchange_order_id: order_id,
                         fill_status: status,
+                        accepted_quantity: Some(if intent_status == "acknowledged" {
+                            intent.submitted_quantity.max(0.0)
+                        } else {
+                            0.0
+                        }),
+                        filled_quantity: Some(intent.filled_quantity.max(0.0)),
+                        cancelled_quantity: Some(if intent_status == "cancelled" {
+                            (intent.submitted_quantity - intent.filled_quantity).max(0.0)
+                        } else {
+                            intent.cancelled_quantity.max(0.0)
+                        }),
+                        rejected_quantity: Some(if intent_status == "rejected" {
+                            intent.submitted_quantity.max(0.0)
+                        } else {
+                            intent.rejected_quantity.max(0.0)
+                        }),
+                        terminal_outcome: terminal_outcome_for_status(intent_status),
                         details_json: json!({
                             "phase": "entry_no_fill",
                         }),
+                        ..Default::default()
                     },
                 )
                 .await?;
@@ -1221,6 +1311,7 @@ async fn handle_live_entry_placement_result(
                             "phase": "entry_retryable",
                             "orphaned": orphaned,
                         }),
+                        ..Default::default()
                     },
                 )
                 .await?;
@@ -2009,7 +2100,10 @@ fn contract_price_for_side(side: &str, market_prob: f64) -> f64 {
 
 fn pending_intent_priority(intent: &storage::PendingExecutionIntent) -> f64 {
     stop_condition_value(&intent.stop_conditions_json, "execution_score_bps").unwrap_or_default()
-        + stop_condition_value(&intent.stop_conditions_json, "fill_probability").unwrap_or_default()
+        + intent
+            .predicted_fill_probability
+            .or_else(|| stop_condition_value(&intent.stop_conditions_json, "fill_probability"))
+            .unwrap_or_default()
             * 25.0
 }
 
@@ -2244,6 +2338,19 @@ fn classify_live_intent_state(order: &KalshiOrder) -> &'static str {
         "rejected"
     } else {
         "submitted"
+    }
+}
+
+fn terminal_outcome_for_status(status: &str) -> Option<String> {
+    match status {
+        "filled" => Some("filled".to_string()),
+        "partially_filled" => Some("partially_filled".to_string()),
+        "cancelled" => Some("cancelled".to_string()),
+        "rejected" => Some("rejected".to_string()),
+        "expired" => Some("expired".to_string()),
+        "superseded" => Some("superseded".to_string()),
+        "orphaned" => Some("orphaned".to_string()),
+        _ => None,
     }
 }
 

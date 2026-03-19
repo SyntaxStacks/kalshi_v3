@@ -266,41 +266,146 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
     );
 
     if let Some(quality) = execution_quality {
+        // These metrics are split into live quantity truth and replay diagnostics so operators do
+        // not mistake paper/opened statuses for exchange-confirmed fills.
         append_help(
             &mut out,
-            "kalshi_v3_replay_edge_realization_ratio",
-            "Average replay edge realization ratio across latest champion lanes.",
+            "kalshi_v3_replay_trade_weighted_edge_realization_ratio_diag",
+            "Trade-weighted replay edge realization ratio across latest champion lanes. Diagnostic only until proven comparable to live.",
             "gauge",
-        );
-        append_metric(
-            &mut out,
-            "kalshi_v3_replay_edge_realization_ratio",
-            &[],
-            quality.replay_edge_realization_ratio,
         );
         append_help(
             &mut out,
-            "kalshi_v3_recent_expected_fill_probability",
-            "Average expected fill probability across recent processed execution intents.",
+            "kalshi_v3_recent_live_predicted_fill_probability_mean",
+            "Mean predicted fill probability across recent comparable live intents. Null forecasts are excluded.",
             "gauge",
-        );
-        append_metric(
-            &mut out,
-            "kalshi_v3_recent_expected_fill_probability",
-            &[],
-            quality.recent_expected_fill_probability,
         );
         append_help(
             &mut out,
-            "kalshi_v3_recent_actual_fill_rate",
-            "Average realized fill rate across recent processed execution intents.",
+            "kalshi_v3_recent_live_filled_quantity_ratio",
+            "Quantity-weighted live fill ratio across recent terminal live intents.",
             "gauge",
+        );
+        append_help(
+            &mut out,
+            "kalshi_v3_recent_live_actual_fill_hit_rate",
+            "Binary live fill hit rate across recent comparable live intents.",
+            "gauge",
+        );
+        append_help(
+            &mut out,
+            "kalshi_v3_recent_live_terminal_intent_count",
+            "Recent terminal live intent count used for execution-truth summaries.",
+            "gauge",
+        );
+        append_help(
+            &mut out,
+            "kalshi_v3_recent_live_predicted_fill_sample_count",
+            "Recent live intent count with non-null predicted fill forecasts.",
+            "gauge",
+        );
+        append_help(
+            &mut out,
+            "kalshi_v3_replay_trade_weighted_fill_rate_diag",
+            "Trade-weighted replay fill rate across champion lanes. Diagnostic only.",
+            "gauge",
+        );
+        append_help(
+            &mut out,
+            "kalshi_v3_replay_trade_weighted_slippage_bps_diag",
+            "Trade-weighted replay slippage across champion lanes. Diagnostic only.",
+            "gauge",
+        );
+        if let Some(value) = quality.replay_trade_weighted_edge_realization_ratio_diag {
+            append_metric(
+                &mut out,
+                "kalshi_v3_replay_trade_weighted_edge_realization_ratio_diag",
+                &[],
+                value,
+            );
+            append_help(
+                &mut out,
+                "kalshi_v3_replay_edge_realization_ratio",
+                "DEPRECATED alias for kalshi_v3_replay_trade_weighted_edge_realization_ratio_diag.",
+                "gauge",
+            );
+            append_metric(
+                &mut out,
+                "kalshi_v3_replay_edge_realization_ratio",
+                &[],
+                value,
+            );
+        }
+        if let Some(value) = quality.replay_trade_weighted_fill_rate_diag {
+            append_metric(
+                &mut out,
+                "kalshi_v3_replay_trade_weighted_fill_rate_diag",
+                &[],
+                value,
+            );
+        }
+        if let Some(value) = quality.replay_trade_weighted_slippage_bps_diag {
+            append_metric(
+                &mut out,
+                "kalshi_v3_replay_trade_weighted_slippage_bps_diag",
+                &[],
+                value,
+            );
+        }
+        if let Some(value) = quality.recent_live_predicted_fill_probability_mean {
+            append_metric(
+                &mut out,
+                "kalshi_v3_recent_live_predicted_fill_probability_mean",
+                &[],
+                value,
+            );
+            append_help(
+                &mut out,
+                "kalshi_v3_recent_expected_fill_probability",
+                "DEPRECATED alias for kalshi_v3_recent_live_predicted_fill_probability_mean.",
+                "gauge",
+            );
+            append_metric(
+                &mut out,
+                "kalshi_v3_recent_expected_fill_probability",
+                &[],
+                value,
+            );
+        }
+        if let Some(value) = quality.recent_live_filled_quantity_ratio {
+            append_metric(
+                &mut out,
+                "kalshi_v3_recent_live_filled_quantity_ratio",
+                &[],
+                value,
+            );
+            append_help(
+                &mut out,
+                "kalshi_v3_recent_actual_fill_rate",
+                "DEPRECATED alias for kalshi_v3_recent_live_filled_quantity_ratio.",
+                "gauge",
+            );
+            append_metric(&mut out, "kalshi_v3_recent_actual_fill_rate", &[], value);
+        }
+        if let Some(value) = quality.recent_live_actual_fill_hit_rate {
+            append_metric(
+                &mut out,
+                "kalshi_v3_recent_live_actual_fill_hit_rate",
+                &[],
+                value,
+            );
+        }
+        append_metric(
+            &mut out,
+            "kalshi_v3_recent_live_terminal_intent_count",
+            &[],
+            quality.recent_live_terminal_intent_count as f64,
         );
         append_metric(
             &mut out,
-            "kalshi_v3_recent_actual_fill_rate",
+            "kalshi_v3_recent_live_predicted_fill_sample_count",
             &[],
-            quality.recent_actual_fill_rate,
+            quality.recent_live_predicted_fill_sample_count as f64,
         );
     }
 
@@ -1690,14 +1795,17 @@ mod tests {
                 as_of: Utc::now(),
                 replay_lane_count: 1,
                 replay_trade_count: 4,
-                replay_edge_realization_ratio: 1.0,
-                replay_fill_rate: 0.6,
-                replay_slippage_bps: 12.0,
-                recent_intent_count: 10,
-                recent_filled_count: 6,
-                recent_expected_fill_intent_count: 8,
-                recent_expected_fill_probability: 0.58,
-                recent_actual_fill_rate: 0.60,
+                replay_trade_weighted_edge_realization_ratio_diag: Some(1.0),
+                replay_trade_weighted_fill_rate_diag: Some(0.6),
+                replay_trade_weighted_slippage_bps_diag: Some(12.0),
+                recent_live_terminal_intent_count: 10,
+                recent_live_intents_with_fill_count: 6,
+                recent_live_predicted_fill_sample_count: 8,
+                recent_live_predicted_fill_probability_mean: Some(0.58),
+                recent_live_filled_quantity_ratio: Some(0.60),
+                recent_live_actual_fill_hit_rate: Some(0.60),
+                live_sample_sufficient: false,
+                replay_sample_sufficient: false,
             },
             live_sync: None,
             live_exceptions: LiveExceptionSnapshot {
