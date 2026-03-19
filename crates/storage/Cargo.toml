@@ -1,0 +1,20 @@
+[package]
+name = "storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+common = { path = "../common" }
+market-models = { path = "../market-models" }
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lib]
+name = "storage"
+path = "src/lib.rs"

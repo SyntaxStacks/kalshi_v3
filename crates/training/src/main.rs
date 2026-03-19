@@ -1,0 +1,653 @@
+use anyhow::Result;
+use chrono::{DateTime, NaiveDateTime, Utc};
+use common::{AppConfig, LaneState, PromotionState, StrategyFamily, lane_key};
+use market_models::{BASELINE_LOGIT_V1, FeatureVector, supported_models};
+use replay::{BenchmarkLeaderboard, ReplayExample, ReplayPolicy, benchmark_model_set};
+use rusqlite::Connection;
+use serde_json::json;
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use storage::{
+    HistoricalReplayExampleInsert, ModelBenchmarkResultInsert, ModelBenchmarkRunInsert,
+};
+use tracing::{info, warn};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let _ = dotenvy::dotenv();
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+
+    let config = AppConfig::load()?;
+    let storage = storage::Storage::connect(&config.database_url).await?;
+    storage.migrate().await?;
+    storage
+        .upsert_worker_started("training", &serde_json::json!({}))
+        .await?;
+
+    info!("training_worker_started");
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    loop {
+        interval.tick().await;
+        match training_pass(&config, &storage).await {
+            Ok(updated) => {
+                storage
+                    .upsert_worker_success(
+                        "training",
+                        &serde_json::json!({"updated_lane_count": updated}),
+                    )
+                    .await?;
+            }
+            Err(error) => {
+                storage
+                    .upsert_worker_failure("training", &error.to_string(), &serde_json::json!({}))
+                    .await?;
+                warn!(error = %error, "training_pass_failed");
+            }
+        }
+    }
+}
+
+async fn training_pass(config: &AppConfig, storage: &storage::Storage) -> Result<usize> {
+    let imported = backfill_historical_examples_from_v2(config, storage).await?;
+    if imported > 0 {
+        info!(imported, "historical_replay_examples_imported");
+    }
+
+    let snapshots = storage.list_recent_feature_snapshots(None, 5000).await?;
+    let mut by_symbol: BTreeMap<String, Vec<_>> = BTreeMap::new();
+    for snapshot in snapshots {
+        by_symbol
+            .entry(snapshot.symbol.to_lowercase())
+            .or_default()
+            .push(snapshot);
+    }
+
+    let mut updated = 0usize;
+    for (symbol, snapshots) in by_symbol {
+        let mut by_market: BTreeMap<i64, Vec<_>> = BTreeMap::new();
+        for snapshot in snapshots {
+            by_market
+                .entry(snapshot.market_id)
+                .or_default()
+                .push(snapshot);
+        }
+
+        let mut examples: Vec<ReplayExample> = storage
+            .list_historical_replay_examples(
+                &symbol,
+                StrategyFamily::DirectionalSettlement,
+                100_000,
+            )
+            .await?
+            .into_iter()
+            .map(|example| ReplayExample {
+                lane_key: example.lane_key,
+                time_to_expiry_bucket: example.time_to_expiry_bucket,
+                target_yes_probability: example.target_yes_probability,
+                market_prob: example.market_prob,
+                features: example.features,
+            })
+            .collect();
+        let resolved_history_exists = !examples.is_empty();
+        if !resolved_history_exists {
+            for (_, mut market_snapshots) in by_market {
+                market_snapshots.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+                for pair in market_snapshots.windows(2) {
+                    let current = &pair[0];
+                    let next = &pair[1];
+                    examples.push(ReplayExample {
+                        lane_key: lane_key(
+                            "kalshi",
+                            &symbol,
+                            current.window_minutes as u32,
+                            "buy_yes",
+                            StrategyFamily::DirectionalSettlement,
+                            BASELINE_LOGIT_V1,
+                        ),
+                        time_to_expiry_bucket: current.time_to_expiry_bucket.clone(),
+                        target_yes_probability: next.market_prob,
+                        market_prob: current.market_prob,
+                        features: FeatureVector {
+                            market_prob: current.market_prob,
+                            reference_yes_prob: current.reference_yes_prob,
+                            reference_gap_bps_scaled: (current.reference_gap_bps / 1_000.0)
+                                .clamp(-1.5, 1.5),
+                            threshold_distance_bps_scaled: (current.threshold_distance_bps_proxy
+                                / 500.0)
+                                .clamp(-1.5, 1.5),
+                            order_book_imbalance: current.order_book_imbalance,
+                            aggressive_buy_ratio: current.aggressive_buy_ratio,
+                            venue_quality_score: current.venue_quality_score,
+                            market_data_age_scaled: (current.market_data_age_seconds as f64 / 20.0)
+                                .clamp(0.0, 1.5),
+                            reference_age_scaled: (current.reference_age_seconds as f64 / 20.0)
+                                .clamp(0.0, 1.5),
+                            averaging_window_progress: current
+                                .averaging_window_progress
+                                .clamp(0.0, 1.0),
+                            seconds_to_expiry_scaled: (current.seconds_to_expiry as f64 / 900.0)
+                                .clamp(0.0, 1.0),
+                        },
+                    });
+                }
+            }
+        }
+        let avg_execution_quality = if examples.is_empty() {
+            0.0
+        } else {
+            examples
+                .iter()
+                .map(|example| example.features.venue_quality_score)
+                .sum::<f64>()
+                / examples.len() as f64
+        };
+
+        if examples.len() < 4 {
+            continue;
+        }
+
+        let lane = lane_key(
+            "kalshi",
+            &symbol,
+            15,
+            "buy_yes",
+            StrategyFamily::DirectionalSettlement,
+            BASELINE_LOGIT_V1,
+        );
+        let Some(leaderboard) = benchmark_model_set(
+            &lane,
+            supported_models(),
+            &examples,
+            ReplayPolicy::directional_default(),
+        ) else {
+            continue;
+        };
+
+        let Some(champion) = pick_champion(&leaderboard) else {
+            continue;
+        };
+        let champion_lane = lane_key(
+            "kalshi",
+            &symbol,
+            15,
+            "buy_yes",
+            StrategyFamily::DirectionalSettlement,
+            &champion.model_name,
+        );
+        persist_model_benchmark_run(
+            storage,
+            &champion_lane,
+            &symbol,
+            StrategyFamily::DirectionalSettlement,
+            if resolved_history_exists {
+                "historical_resolved"
+            } else {
+                "live_recent_snapshots"
+            },
+            examples.len(),
+            &leaderboard,
+        )
+        .await?;
+        let paper_metrics = storage
+            .recent_trade_metrics_for_symbol(
+                &symbol,
+                StrategyFamily::DirectionalSettlement,
+                common::TradeMode::Paper,
+                20,
+            )
+            .await?;
+        let live_metrics = storage
+            .recent_trade_metrics_for_symbol(
+                &symbol,
+                StrategyFamily::DirectionalSettlement,
+                common::TradeMode::Live,
+                10,
+            )
+            .await?;
+        persist_calibration(
+            storage,
+            &symbol,
+            StrategyFamily::DirectionalSettlement,
+            &champion.model_name,
+            &examples,
+        )
+        .await?;
+        let promotion_state = classify_promotion_state(
+            config,
+            champion.brier,
+            champion.execution_pnl,
+            avg_execution_quality,
+            paper_metrics.trade_count,
+            paper_metrics.realized_pnl,
+            live_metrics.trade_count,
+            live_metrics.realized_pnl,
+        );
+        storage
+            .upsert_lane_state(&LaneState {
+                lane_key: champion_lane,
+                promotion_state,
+                promotion_reason: Some(promotion_reason(
+                    config,
+                    promotion_state,
+                    champion.brier,
+                    champion.execution_pnl,
+                    paper_metrics.trade_count,
+                    paper_metrics.realized_pnl,
+                    live_metrics.trade_count,
+                    live_metrics.realized_pnl,
+                )),
+                recent_pnl: paper_metrics.realized_pnl,
+                recent_brier: champion.brier,
+                recent_execution_quality: avg_execution_quality,
+                recent_replay_expectancy: champion.execution_pnl,
+                quarantine_reason: quarantine_reason(
+                    config,
+                    promotion_state,
+                    champion.execution_pnl,
+                    paper_metrics.trade_count,
+                    paper_metrics.realized_pnl,
+                ),
+                current_champion_model: Some(champion.model_name.clone()),
+            })
+            .await?;
+        updated += 1;
+    }
+
+    info!(updated, "training_pass_succeeded");
+    Ok(updated)
+}
+
+async fn persist_model_benchmark_run(
+    storage: &storage::Storage,
+    lane_key: &str,
+    symbol: &str,
+    strategy_family: StrategyFamily,
+    source: &str,
+    example_count: usize,
+    leaderboard: &BenchmarkLeaderboard,
+) -> Result<()> {
+    let champion = leaderboard.champion().map(|row| row.model_name.clone());
+    let results = leaderboard
+        .results
+        .iter()
+        .enumerate()
+        .map(|(index, result)| ModelBenchmarkResultInsert {
+            model_name: result.model_name.clone(),
+            rank: index as i32 + 1,
+            brier: result.brier,
+            execution_pnl: result.execution_pnl,
+            sample_count: result.sample_count as i32,
+            trade_count: result.trade_count as i32,
+            win_rate: result.win_rate,
+        })
+        .collect::<Vec<_>>();
+    storage
+        .insert_model_benchmark_run(
+            &ModelBenchmarkRunInsert {
+                lane_key: lane_key.to_string(),
+                symbol: symbol.to_string(),
+                strategy_family,
+                source: source.to_string(),
+                example_count: example_count as i32,
+                champion_model_name: champion,
+                details_json: json!({
+                    "registry_lane_key": leaderboard.lane_key,
+                    "result_count": leaderboard.results.len(),
+                }),
+            },
+            &results,
+        )
+        .await
+}
+
+async fn persist_calibration(
+    storage: &storage::Storage,
+    symbol: &str,
+    strategy_family: StrategyFamily,
+    model_name: &str,
+    examples: &[ReplayExample],
+) -> Result<()> {
+    let mut grouped: BTreeMap<String, (f64, i32)> = BTreeMap::new();
+    for example in examples {
+        let output = market_models::run_model(model_name, &example.features);
+        let error = example.target_yes_probability - output.probability_yes;
+        let entry = grouped
+            .entry(example.time_to_expiry_bucket.clone())
+            .or_insert((0.0, 0));
+        entry.0 += error;
+        entry.1 += 1;
+    }
+
+    for (expiry_bucket, (sum_error, sample_count)) in grouped {
+        let mean_error = if sample_count > 0 {
+            sum_error / f64::from(sample_count)
+        } else {
+            0.0
+        };
+        storage
+            .upsert_probability_calibration(
+                symbol,
+                strategy_family,
+                model_name,
+                &expiry_bucket,
+                mean_error,
+                sample_count,
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+async fn backfill_historical_examples_from_v2(
+    config: &AppConfig,
+    storage: &storage::Storage,
+) -> Result<usize> {
+    let existing_count = storage.historical_replay_example_count().await?;
+    let Some(path) = config.v2_reference_sqlite_path.clone() else {
+        warn!("historical_replay_examples_skipped_missing_config");
+        return Ok(0);
+    };
+    let sqlite_path = PathBuf::from(path);
+    if !sqlite_path.exists() {
+        warn!(path = %sqlite_path.display(), "historical_replay_examples_skipped_missing_file");
+        return Ok(0);
+    }
+
+    let batch_size = config.historical_import_batch_size.max(500) as usize;
+    info!(
+        path = %sqlite_path.display(),
+        existing_count,
+        batch_size,
+        "historical_replay_examples_import_started"
+    );
+    let offset = existing_count as usize;
+    let path = sqlite_path.clone();
+    let batch: Vec<HistoricalReplayExampleInsert> =
+        tokio::task::spawn_blocking(move || load_v2_historical_batch(path, offset, batch_size))
+            .await??;
+    if batch.is_empty() {
+        if existing_count > 0 {
+            info!(existing_count, "historical_replay_examples_fully_loaded");
+        }
+        return Ok(0);
+    }
+    let inserted = storage.insert_historical_replay_examples(&batch).await?;
+    info!(
+        offset,
+        batch_size,
+        inserted,
+        imported = existing_count + inserted as i64,
+        "historical_replay_examples_batch_loaded"
+    );
+    Ok(inserted)
+}
+
+fn load_v2_historical_batch(
+    sqlite_path: PathBuf,
+    offset: usize,
+    limit: usize,
+) -> Result<Vec<HistoricalReplayExampleInsert>> {
+    let connection = Connection::open(sqlite_path)?;
+    let mut statement = connection.prepare(
+        r#"
+        SELECT
+            s.id,
+            s.market_id,
+            s.market_slug,
+            s.market_prob,
+            s.recorded_at,
+            s.end_date,
+            s.microstructure_json,
+            m.settled_yes_probability
+        FROM market_state_snapshots s
+        JOIN markets m ON m.id = s.market_id
+        WHERE s.exchange = 'kalshi'
+          AND m.settled_yes_probability IS NOT NULL
+        ORDER BY s.recorded_at ASC, s.id ASC
+        LIMIT ?1 OFFSET ?2
+        "#,
+    )?;
+
+    let rows = statement.query_map([limit as i64, offset as i64], |row| {
+        let recorded_at_raw: String = row.get("recorded_at")?;
+        let end_date_raw: Option<String> = row.get("end_date")?;
+        let market_slug: String = row.get("market_slug")?;
+        let market_id: i64 = row.get("market_id")?;
+        let snapshot_id: i64 = row.get("id")?;
+        let market_prob: f64 = row.get::<_, Option<f64>>("market_prob")?.unwrap_or_default();
+        let resolved_yes_probability = row
+            .get::<_, Option<f64>>("settled_yes_probability")?
+            .unwrap_or_default();
+        let micro_raw: Option<String> = row.get("microstructure_json")?;
+        let micro = micro_raw
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .unwrap_or_else(|| json!({}));
+        let recorded_at = parse_v2_datetime(&recorded_at_raw)
+            .ok_or_else(|| rusqlite::Error::InvalidColumnType(0, "recorded_at".into(), rusqlite::types::Type::Text))?;
+        let symbol = parse_symbol(&market_slug, &micro);
+        let seconds_to_expiry = end_date_raw
+            .as_deref()
+            .and_then(parse_v2_datetime)
+            .map(|end_date| (end_date - recorded_at).num_seconds().max(0) as i32)
+            .unwrap_or(900);
+        let reference_yes_prob = micro
+            .get("reference_yes_prob")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(market_prob);
+        let reference_gap_bps = (reference_yes_prob - market_prob) * 10_000.0;
+        let feature_age_seconds = micro
+            .get("feature_age_seconds")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0);
+        let reference_age_seconds = micro
+            .get("coinbase_updated_at")
+            .and_then(serde_json::Value::as_str)
+            .and_then(parse_v2_datetime)
+            .map(|updated| (recorded_at - updated).num_seconds().max(0) as f64)
+            .unwrap_or(feature_age_seconds);
+        let averaging_window_progress = if seconds_to_expiry <= 60 {
+            ((60 - seconds_to_expiry) as f64 / 60.0).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let feature_vector_json = json!({
+            "market_prob": market_prob,
+            "reference_yes_prob": reference_yes_prob,
+            "reference_gap_bps_scaled": (reference_gap_bps / 1_000.0).clamp(-1.5, 1.5),
+            "threshold_distance_bps_scaled": (((market_prob - 0.5) * 10_000.0) / 500.0).clamp(-1.5, 1.5),
+            "order_book_imbalance": 0.0,
+            "aggressive_buy_ratio": 0.5,
+            "venue_quality_score": (1.0 - (feature_age_seconds / 60.0)).clamp(0.2, 0.9),
+            "market_data_age_scaled": (feature_age_seconds / 20.0).clamp(0.0, 1.5),
+            "reference_age_scaled": (reference_age_seconds / 20.0).clamp(0.0, 1.5),
+            "averaging_window_progress": averaging_window_progress,
+            "seconds_to_expiry_scaled": (seconds_to_expiry as f64 / 900.0).clamp(0.0, 1.0),
+        });
+        Ok(HistoricalReplayExampleInsert {
+            source: "v2_sqlite".to_string(),
+            source_key: format!("v2_sqlite:kalshi:{snapshot_id}"),
+            exchange: "kalshi".to_string(),
+            symbol,
+            strategy_family: StrategyFamily::DirectionalSettlement,
+            market_id: Some(market_id),
+            market_slug: market_slug.clone(),
+            recorded_at,
+            resolved_yes_probability,
+            market_prob,
+            time_to_expiry_bucket: time_to_expiry_bucket(seconds_to_expiry),
+            feature_version: "v2_sqlite_import_v1".to_string(),
+            feature_vector_json,
+            metadata_json: json!({
+                "market_slug": market_slug,
+                "source_snapshot_id": snapshot_id,
+                "feature_age_seconds": feature_age_seconds,
+                "reference_yes_prob": reference_yes_prob,
+            }),
+        })
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+fn parse_v2_datetime(raw: &str) -> Option<DateTime<Utc>> {
+    NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f")
+        .ok()
+        .map(|naive| DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
+}
+
+fn parse_symbol(market_slug: &str, micro: &serde_json::Value) -> String {
+    if let Some(product_id) = micro.get("product_id").and_then(serde_json::Value::as_str) {
+        if let Some((symbol, _)) = product_id.split_once('-') {
+            return symbol.to_lowercase();
+        }
+    }
+    let slug = market_slug.to_ascii_lowercase();
+    if slug.contains("btc") {
+        "btc".to_string()
+    } else if slug.contains("eth") {
+        "eth".to_string()
+    } else if slug.contains("sol") {
+        "sol".to_string()
+    } else if slug.contains("xrp") {
+        "xrp".to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+fn time_to_expiry_bucket(seconds_to_expiry: i32) -> String {
+    if seconds_to_expiry < 120 {
+        "under_2m".to_string()
+    } else if seconds_to_expiry < 300 {
+        "2_to_5m".to_string()
+    } else if seconds_to_expiry < 600 {
+        "5_to_10m".to_string()
+    } else {
+        "10m_plus".to_string()
+    }
+}
+
+fn pick_champion(leaderboard: &BenchmarkLeaderboard) -> Option<&replay::ModelBenchmark> {
+    leaderboard.champion()
+}
+
+fn classify_promotion_state(
+    config: &AppConfig,
+    champion_brier: f64,
+    champion_pnl: f64,
+    execution_quality: f64,
+    paper_trade_count: i64,
+    paper_realized_pnl: f64,
+    live_trade_count: i64,
+    live_realized_pnl: f64,
+) -> PromotionState {
+    let replay_is_usable = champion_brier <= config.paper_promotion_max_brier
+        && champion_pnl >= config.paper_promotion_max_negative_replay
+        && execution_quality >= config.min_venue_quality;
+    let paper_behavior_is_ok =
+        paper_trade_count == 0 || paper_realized_pnl >= config.paper_promotion_max_negative_pnl;
+    let live_behavior_is_ok =
+        live_trade_count == 0 || live_realized_pnl >= config.live_demote_max_negative_pnl;
+
+    if paper_trade_count >= 3 && paper_realized_pnl < config.paper_promotion_max_negative_pnl {
+        return PromotionState::Quarantined;
+    }
+    if live_trade_count >= 1 && live_realized_pnl < config.live_demote_max_negative_pnl {
+        return PromotionState::PaperActive;
+    }
+
+    if config.live_trading_enabled
+        && replay_is_usable
+        && live_behavior_is_ok
+        && live_trade_count >= i64::from(config.live_scaled_min_examples)
+        && live_realized_pnl >= config.live_scaled_min_pnl
+        && champion_brier <= config.live_scaled_max_brier
+    {
+        return PromotionState::LiveScaled;
+    }
+
+    if config.live_trading_enabled
+        && replay_is_usable
+        && live_behavior_is_ok
+        && paper_trade_count >= i64::from(config.live_micro_min_examples)
+        && paper_realized_pnl >= config.live_micro_min_pnl
+        && champion_brier <= config.live_micro_max_brier
+    {
+        return PromotionState::LiveMicro;
+    }
+
+    if replay_is_usable && paper_behavior_is_ok {
+        return PromotionState::PaperActive;
+    }
+
+    PromotionState::Shadow
+}
+
+fn quarantine_reason(
+    config: &AppConfig,
+    promotion_state: PromotionState,
+    champion_pnl: f64,
+    paper_trade_count: i64,
+    paper_realized_pnl: f64,
+) -> Option<String> {
+    if promotion_state != PromotionState::Quarantined {
+        return None;
+    }
+    if paper_trade_count >= 3 && paper_realized_pnl < config.paper_promotion_max_negative_pnl {
+        return Some("negative_recent_paper_pnl".to_string());
+    }
+    if champion_pnl < 0.0 {
+        return Some("negative_recent_replay".to_string());
+    }
+    Some("lane_quarantined".to_string())
+}
+
+fn promotion_reason(
+    config: &AppConfig,
+    promotion_state: PromotionState,
+    champion_brier: f64,
+    champion_pnl: f64,
+    paper_trade_count: i64,
+    paper_realized_pnl: f64,
+    live_trade_count: i64,
+    live_realized_pnl: f64,
+) -> String {
+    match promotion_state {
+        PromotionState::LiveScaled => "live_micro_passed_fast_ramp".to_string(),
+        PromotionState::LiveMicro => "paper_ready_for_live_micro".to_string(),
+        PromotionState::PaperActive => {
+            if live_trade_count >= 1 && live_realized_pnl < 0.0 {
+                "live_demoted_to_paper_active".to_string()
+            } else {
+                "paper_ready".to_string()
+            }
+        }
+        PromotionState::Quarantined => {
+            if paper_trade_count >= 3
+                && paper_realized_pnl < config.paper_promotion_max_negative_pnl
+            {
+                "negative_recent_paper_pnl".to_string()
+            } else if champion_pnl < 0.0 {
+                "negative_recent_replay".to_string()
+            } else {
+                "lane_quarantined".to_string()
+            }
+        }
+        PromotionState::Shadow => {
+            if champion_brier > config.paper_promotion_max_brier {
+                "replay_brier_too_high".to_string()
+            } else if champion_pnl < 0.0 {
+                "replay_expectancy_negative".to_string()
+            } else {
+                "awaiting_paper_readiness".to_string()
+            }
+        }
+    }
+}

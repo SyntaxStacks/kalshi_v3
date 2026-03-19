@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Kalshi V3 Operator</title>
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="hero">
+      <div>
+        <p class="eyebrow">Kalshi V3 Operator</p>
+        <h1>Capital, readiness, and live risk in one screen.</h1>
+      </div>
+      <div class="hero-status" id="hero-status">Loading</div>
+    </header>
+
+    <section class="grid">
+      <article class="panel panel-bankrolls">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">Bankrolls</p>
+            <h2>Paper and live capital</h2>
+          </div>
+        </div>
+        <div class="bankroll-list" id="bankroll-list"></div>
+      </article>
+
+      <article class="panel panel-readiness">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">Live readiness</p>
+            <h2>Lane promotion state</h2>
+          </div>
+          <div class="readiness-badge" id="readiness-badge">Loading</div>
+        </div>
+        <div class="state-strip" id="state-strip"></div>
+        <div class="lane-list" id="lane-list"></div>
+      </article>
+
+      <article class="panel panel-readiness">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">Exchange truth</p>
+            <h2>Live sync state</h2>
+          </div>
+          <div class="readiness-badge" id="live-sync-badge">Loading</div>
+        </div>
+        <div class="state-strip" id="live-sync-strip"></div>
+        <div class="lane-list" id="live-sync-list"></div>
+      </article>
+    </section>
+
+    <section class="panel panel-ops">
+      <div class="panel-head">
+        <div>
+          <p class="eyebrow">Operator state</p>
+          <h2>Freshness and intent flow</h2>
+        </div>
+        <div class="readiness-badge" id="ops-badge">Loading</div>
+      </div>
+      <div class="state-strip" id="ops-strip"></div>
+      <div class="lane-list" id="ops-list"></div>
+    </section>
+
+    <section class="panel panel-exceptions">
+      <div class="panel-head">
+        <div>
+          <p class="eyebrow">Live exceptions</p>
+          <h2>Orders, positions, and operator controls</h2>
+        </div>
+        <div class="readiness-badge" id="exceptions-badge">Loading</div>
+      </div>
+      <div class="control-row">
+        <button class="control-button" data-action="retry_live_sync">Retry live sync</button>
+        <button class="control-button" data-action="reconcile_now">Reconcile now</button>
+        <button class="control-button warn" data-action="cancel_pending_live_orders">Cancel pending live</button>
+        <button class="control-button bad" data-action="flatten_live_positions">Flatten live positions</button>
+        <button class="control-button bad" data-action="disable_live">Disable live</button>
+        <button class="control-button" data-action="enable_live">Enable live</button>
+      </div>
+      <div class="control-feedback muted" id="control-feedback">Operator actions will report here.</div>
+      <div class="state-strip" id="exceptions-strip"></div>
+      <div class="lane-list" id="exceptions-list"></div>
+    </section>
+
+    <section class="panel panel-trades">
+      <div class="panel-head">
+        <div>
+          <p class="eyebrow">Open trades</p>
+          <h2>Current risk on the book</h2>
+        </div>
+      </div>
+      <div class="trade-list" id="trade-list"></div>
+    </section>
+
+    <section class="panel panel-opportunities">
+      <div class="panel-head">
+        <div>
+          <p class="eyebrow">Opportunities</p>
+          <h2>Latest decision flow</h2>
+        </div>
+      </div>
+      <div class="trade-list" id="opportunity-list"></div>
+    </section>
+  </main>
+  <script src="/assets/app.js"></script>
+</body>
+</html>

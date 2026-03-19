@@ -1,0 +1,15 @@
+[package]
+name = "replay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+common = { path = "../common" }
+market-models = { path = "../market-models" }
+serde.workspace = true
+
+[lib]
+name = "replay"
+path = "src/lib.rs"

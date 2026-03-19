@@ -1,0 +1,4104 @@
+use anyhow::Result;
+use chrono::{DateTime, Utc};
+use common::{
+    BankrollCard, DashboardSnapshot, LaneInspectionSnapshot, LaneReplaySummary, LaneState,
+    LaneTradeCard, LiveExceptionSnapshot, LiveExchangeSyncSummary, LiveFillCard, LiveIntentCard,
+    LiveOrderCard, LivePositionCard, LiveTradeExceptionCard, MarketFeatureSnapshotRecord,
+    ModelInference, OpenTradeSummary, OperatorControlState, OpportunityCard, OpportunityDecision,
+    PromotionState, ReadinessSummary, ReplayBenchmarkCard, StrategyFamily, TradeMode,
+};
+use serde::Serialize;
+use serde_json::json;
+use sqlx::{PgPool, Postgres, QueryBuilder, Row, postgres::PgPoolOptions};
+
+#[derive(Clone)]
+pub struct Storage {
+    pool: PgPool,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingExecutionIntent {
+    pub intent_id: i64,
+    pub decision_id: i64,
+    pub market_id: i64,
+    pub lane_key: String,
+    pub strategy_family: StrategyFamily,
+    pub side: String,
+    pub market_prob: f64,
+    pub recommended_size: f64,
+    pub mode: TradeMode,
+    pub timeout_seconds: i32,
+    pub force_exit_buffer_seconds: i32,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActiveLiveExecutionIntent {
+    pub intent_id: i64,
+    pub decision_id: i64,
+    pub market_id: i64,
+    pub lane_key: String,
+    pub strategy_family: StrategyFamily,
+    pub side: String,
+    pub market_prob: f64,
+    pub recommended_size: f64,
+    pub mode: TradeMode,
+    pub timeout_seconds: i32,
+    pub force_exit_buffer_seconds: i32,
+    pub created_at: DateTime<Utc>,
+    pub status: String,
+    pub market_ticker: Option<String>,
+    pub client_order_id: Option<String>,
+    pub exchange_order_id: Option<String>,
+    pub fill_status: Option<String>,
+    pub last_transition_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OpenTradeForExit {
+    pub trade_id: i64,
+    pub market_id: i64,
+    pub market_ticker: Option<String>,
+    pub lane_key: String,
+    pub side: String,
+    pub quantity: f64,
+    pub entry_price: f64,
+    pub entry_fee: f64,
+    pub strategy_family: StrategyFamily,
+    pub mode: TradeMode,
+    pub created_at: DateTime<Utc>,
+    pub timeout_seconds: i32,
+    pub force_exit_buffer_seconds: i32,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub exit_exchange_order_id: Option<String>,
+    pub exit_client_order_id: Option<String>,
+    pub exit_fill_status: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OpenLiveTradeForReconciliation {
+    pub trade_id: i64,
+    pub lane_key: String,
+    pub market_ticker: String,
+    pub side: String,
+    pub quantity: f64,
+    pub entry_price: f64,
+    pub entry_fee: f64,
+    pub created_at: DateTime<Utc>,
+    pub entry_exchange_order_id: Option<String>,
+    pub entry_client_order_id: Option<String>,
+    pub exit_exchange_order_id: Option<String>,
+    pub exit_client_order_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LiveTradeReconciliationSnapshot {
+    pub has_position: bool,
+    pub has_resting_order: bool,
+    pub matched_exit_fill_quantity: f64,
+    pub matched_exit_fill_price: Option<f64>,
+    pub matched_exit_fill_fee: f64,
+    pub matched_exit_fill_time: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TradeExitProgress {
+    pub closed_quantity: f64,
+    pub exit_fee: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClosedTradeNotification {
+    pub trade_id: i64,
+    pub lane_key: String,
+    pub strategy_family: StrategyFamily,
+    pub mode: TradeMode,
+    pub quantity: f64,
+    pub entry_price: f64,
+    pub exit_price: f64,
+    pub realized_pnl: f64,
+    pub closed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SymbolLanePolicy {
+    pub lane_key: String,
+    pub promotion_state: PromotionState,
+    pub promotion_reason: Option<String>,
+    pub recent_pnl: f64,
+    pub recent_brier: f64,
+    pub recent_execution_quality: f64,
+    pub recent_replay_expectancy: f64,
+    pub quarantine_reason: Option<String>,
+    pub current_champion_model: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecentTradeMetrics {
+    pub trade_count: i64,
+    pub win_count: i64,
+    pub realized_pnl: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkerStatusCard {
+    pub service: String,
+    pub status: String,
+    pub last_started_at: Option<DateTime<Utc>>,
+    pub last_succeeded_at: Option<DateTime<Utc>>,
+    pub last_failed_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+    pub details_json: serde_json::Value,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProbabilityCalibrationCard {
+    pub mean_error: f64,
+    pub sample_count: i32,
+}
+
+#[derive(Debug, Clone)]
+pub struct HistoricalReplayExampleCard {
+    pub lane_key: String,
+    pub time_to_expiry_bucket: String,
+    pub target_yes_probability: f64,
+    pub market_prob: f64,
+    pub features: market_models::FeatureVector,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelBenchmarkRunInsert {
+    pub lane_key: String,
+    pub symbol: String,
+    pub strategy_family: StrategyFamily,
+    pub source: String,
+    pub example_count: i32,
+    pub champion_model_name: Option<String>,
+    pub details_json: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelBenchmarkResultInsert {
+    pub model_name: String,
+    pub rank: i32,
+    pub brier: f64,
+    pub execution_pnl: f64,
+    pub sample_count: i32,
+    pub trade_count: i32,
+    pub win_rate: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ExecutionIntentStateUpdate {
+    pub market_ticker: Option<String>,
+    pub side: Option<String>,
+    pub client_order_id: Option<String>,
+    pub exchange_order_id: Option<String>,
+    pub fill_status: Option<String>,
+    pub details_json: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct LivePositionSyncRecord {
+    pub market_ticker: String,
+    pub position_count: f64,
+    pub resting_order_count: i32,
+    pub fees_paid: f64,
+    pub market_exposure: f64,
+    pub realized_pnl: f64,
+    pub details_json: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct LiveOrderSyncRecord {
+    pub order_id: String,
+    pub client_order_id: Option<String>,
+    pub market_ticker: Option<String>,
+    pub action: Option<String>,
+    pub side: Option<String>,
+    pub status: Option<String>,
+    pub count: f64,
+    pub fill_count: f64,
+    pub remaining_count: f64,
+    pub yes_price: f64,
+    pub no_price: f64,
+    pub expiration_time: Option<DateTime<Utc>>,
+    pub created_time: Option<DateTime<Utc>>,
+    pub details_json: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct LiveFillSyncRecord {
+    pub fill_id: String,
+    pub order_id: Option<String>,
+    pub client_order_id: Option<String>,
+    pub market_ticker: Option<String>,
+    pub action: Option<String>,
+    pub side: Option<String>,
+    pub count: f64,
+    pub yes_price: f64,
+    pub no_price: f64,
+    pub fee_paid: f64,
+    pub created_time: Option<DateTime<Utc>>,
+    pub details_json: serde_json::Value,
+}
+
+impl Storage {
+    pub async fn connect(database_url: &str) -> Result<Self> {
+        let pool = PgPoolOptions::new()
+            .max_connections(10)
+            .connect(database_url)
+            .await?;
+        Ok(Self { pool })
+    }
+
+    pub async fn healthcheck(&self) -> Result<()> {
+        sqlx::query("select 1").execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    pub async fn migrate(&self) -> Result<()> {
+        sqlx::migrate!("./migrations").run(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn ensure_bootstrap_state(
+        &self,
+        initial_paper_bankroll: f64,
+        initial_live_bankroll: f64,
+    ) -> Result<()> {
+        self.ensure_bootstrap_bankroll("paper", initial_paper_bankroll, SqlTradeMode::Paper)
+            .await?;
+        self.ensure_bootstrap_bankroll("live", initial_live_bankroll, SqlTradeMode::Live)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn dashboard_snapshot(&self) -> Result<DashboardSnapshot> {
+        let bankrolls = self.list_latest_bankrolls().await?;
+        let lanes = self.list_lane_states().await?;
+        let open_trades = self.list_open_trades().await?;
+        let opportunities = self.list_latest_opportunities(6).await?;
+        let live_sync = self.latest_live_exchange_sync_summary().await?;
+        let live_exceptions = self.live_exception_snapshot().await?;
+
+        let readiness = ReadinessSummary {
+            overall_status: overall_readiness_status(&lanes),
+            shadow_count: count_state(&lanes, PromotionState::Shadow),
+            paper_active_count: count_state(&lanes, PromotionState::PaperActive),
+            live_micro_count: count_state(&lanes, PromotionState::LiveMicro),
+            live_scaled_count: count_state(&lanes, PromotionState::LiveScaled),
+            quarantined_count: count_state(&lanes, PromotionState::Quarantined),
+            lanes,
+        };
+
+        Ok(DashboardSnapshot {
+            bankrolls,
+            readiness,
+            open_trades,
+            opportunities,
+            live_sync,
+            live_exceptions,
+        })
+    }
+
+    pub async fn insert_feature_snapshot(
+        &self,
+        snapshot: &MarketFeatureSnapshotRecord,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            insert into market_feature_snapshot (
+                market_id, exchange, symbol, window_minutes, seconds_to_expiry, time_to_expiry_bucket,
+                feature_version, venue_features_json, settlement_features_json, external_reference_json,
+                venue_quality_json, created_at
+            )
+            values ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10::jsonb, $11::jsonb, $12)
+            "#,
+        )
+        .bind(snapshot.market_id)
+        .bind(&snapshot.exchange)
+        .bind(&snapshot.symbol)
+        .bind(snapshot.window_minutes)
+        .bind(snapshot.seconds_to_expiry)
+        .bind(&snapshot.time_to_expiry_bucket)
+        .bind(&snapshot.feature_version)
+        .bind(json!({
+            "market_ticker": snapshot.market_ticker,
+            "market_title": snapshot.market_title,
+            "market_prob": snapshot.market_prob,
+            "best_bid": snapshot.best_bid,
+            "best_ask": snapshot.best_ask,
+            "last_price": snapshot.last_price,
+            "bid_size": snapshot.bid_size,
+            "ask_size": snapshot.ask_size,
+            "liquidity": snapshot.liquidity,
+            "order_book_imbalance": snapshot.order_book_imbalance,
+            "aggressive_buy_ratio": snapshot.aggressive_buy_ratio,
+        }))
+        .bind(json!({
+            "seconds_to_expiry": snapshot.seconds_to_expiry,
+            "time_to_expiry_bucket": snapshot.time_to_expiry_bucket,
+            "settlement_regime": snapshot.settlement_regime,
+            "averaging_window_progress": snapshot.averaging_window_progress,
+            "threshold_distance_bps_proxy": snapshot.threshold_distance_bps_proxy,
+            "last_minute_avg_proxy": snapshot.last_minute_avg_proxy,
+        }))
+        .bind(json!({
+            "reference_price": snapshot.reference_price,
+            "reference_previous_price": snapshot.reference_previous_price,
+            "reference_price_change_bps": snapshot.reference_price_change_bps,
+            "reference_yes_prob": snapshot.reference_yes_prob,
+            "reference_gap_bps": snapshot.reference_gap_bps,
+            "reference_age_seconds": snapshot.reference_age_seconds,
+        }))
+        .bind(json!({
+            "spread_bps": snapshot.spread_bps,
+            "venue_quality_score": snapshot.venue_quality_score,
+            "market_data_age_seconds": snapshot.market_data_age_seconds,
+        }))
+        .bind(snapshot.created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn insert_ingest_event(
+        &self,
+        source: &str,
+        topic: &str,
+        entity_key: &str,
+        payload_json: &serde_json::Value,
+        observed_at: DateTime<Utc>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            insert into ingest_event_log (
+                source, topic, entity_key, payload_json, observed_at
+            )
+            values ($1, $2, $3, $4::jsonb, $5)
+            "#,
+        )
+        .bind(source)
+        .bind(topic)
+        .bind(entity_key)
+        .bind(payload_json)
+        .bind(observed_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn historical_replay_example_count(&self) -> Result<i64> {
+        let count = sqlx::query_scalar::<_, i64>("select count(*) from historical_replay_example")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count)
+    }
+
+    pub async fn insert_historical_replay_examples(
+        &self,
+        rows: &[HistoricalReplayExampleInsert],
+    ) -> Result<usize> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        const MAX_BIND_PARAMS: usize = 60_000;
+        const PARAMS_PER_ROW: usize = 14;
+        let chunk_size = (MAX_BIND_PARAMS / PARAMS_PER_ROW).max(1);
+        let mut inserted = 0usize;
+
+        for chunk in rows.chunks(chunk_size) {
+            let mut builder = QueryBuilder::<Postgres>::new(
+                r#"
+                insert into historical_replay_example (
+                    source, source_key, exchange, symbol, strategy_family, market_id, market_slug,
+                    recorded_at, resolved_yes_probability, market_prob, time_to_expiry_bucket,
+                    feature_version, feature_vector_json, metadata_json
+                )
+                "#,
+            );
+            builder.push_values(chunk, |mut b, row| {
+                b.push_bind(&row.source)
+                    .push_bind(&row.source_key)
+                    .push_bind(&row.exchange)
+                    .push_bind(&row.symbol)
+                    .push_bind(SqlStrategyFamily::from(row.strategy_family))
+                    .push_bind(row.market_id)
+                    .push_bind(&row.market_slug)
+                    .push_bind(row.recorded_at)
+                    .push_bind(row.resolved_yes_probability)
+                    .push_bind(row.market_prob)
+                    .push_bind(&row.time_to_expiry_bucket)
+                    .push_bind(&row.feature_version)
+                    .push_bind(&row.feature_vector_json)
+                    .push_bind(&row.metadata_json);
+            });
+            builder.push(" on conflict (source_key) do nothing");
+            let result = builder.build().execute(&self.pool).await?;
+            inserted += result.rows_affected() as usize;
+        }
+
+        Ok(inserted)
+    }
+
+    pub async fn list_historical_replay_examples(
+        &self,
+        symbol: &str,
+        strategy_family: StrategyFamily,
+        limit: i64,
+    ) -> Result<Vec<HistoricalReplayExampleCard>> {
+        let rows = sqlx::query_as::<_, HistoricalReplayExampleRow>(
+            r#"
+            select lane_key, time_to_expiry_bucket, resolved_yes_probability, market_prob, feature_vector_json
+            from (
+                select
+                    format(
+                        'kalshi:%s:15:buy_yes:%s:%s',
+                        symbol,
+                        strategy_family,
+                        coalesce(metadata_json->>'champion_hint', 'baseline_logit_v1')
+                    ) as lane_key,
+                    time_to_expiry_bucket,
+                    resolved_yes_probability,
+                    market_prob,
+                    feature_vector_json,
+                    recorded_at
+                from historical_replay_example
+                where symbol = $1
+                  and strategy_family = $2
+                order by recorded_at asc
+                limit $3
+            ) ranked
+            "#,
+        )
+        .bind(symbol.to_lowercase())
+        .bind(SqlStrategyFamily::from(strategy_family))
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub async fn insert_model_benchmark_run(
+        &self,
+        run: &ModelBenchmarkRunInsert,
+        results: &[ModelBenchmarkResultInsert],
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let run_id = sqlx::query_scalar::<_, i64>(
+            r#"
+            insert into model_benchmark_run (
+                lane_key, symbol, strategy_family, source, example_count,
+                champion_model_name, details_json
+            )
+            values ($1, $2, $3, $4, $5, $6, $7::jsonb)
+            returning id
+            "#,
+        )
+        .bind(&run.lane_key)
+        .bind(&run.symbol)
+        .bind(SqlStrategyFamily::from(run.strategy_family))
+        .bind(&run.source)
+        .bind(run.example_count)
+        .bind(&run.champion_model_name)
+        .bind(&run.details_json)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        if !results.is_empty() {
+            let mut builder = QueryBuilder::<Postgres>::new(
+                r#"
+                insert into model_benchmark_result (
+                    run_id, model_name, rank, brier, execution_pnl,
+                    sample_count, trade_count, win_rate
+                )
+                "#,
+            );
+            builder.push_values(results, |mut b, result| {
+                b.push_bind(run_id)
+                    .push_bind(&result.model_name)
+                    .push_bind(result.rank)
+                    .push_bind(result.brier)
+                    .push_bind(result.execution_pnl)
+                    .push_bind(result.sample_count)
+                    .push_bind(result.trade_count)
+                    .push_bind(result.win_rate);
+            });
+            builder.build().execute(&mut *tx).await?;
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn latest_model_benchmark_summary_for_lane(
+        &self,
+        lane_key: &str,
+    ) -> Result<Option<LaneReplaySummary>> {
+        let run = sqlx::query_as::<_, ModelBenchmarkRunRow>(
+            r#"
+            select id, lane_key, source, example_count, created_at
+            from model_benchmark_run
+            where lane_key = $1
+            order by created_at desc, id desc
+            limit 1
+            "#,
+        )
+        .bind(lane_key)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some(run) = run else {
+            return Ok(None);
+        };
+        let source = run.source.clone();
+        let created_at = run.created_at;
+        let example_count = run.example_count;
+
+        let results = sqlx::query_as::<_, ModelBenchmarkResultRow>(
+            r#"
+            select model_name, rank, brier, execution_pnl, sample_count, trade_count, win_rate
+            from model_benchmark_result
+            where run_id = $1
+            order by rank asc, model_name asc
+            "#,
+        )
+        .bind(run.id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(Some(LaneReplaySummary {
+            example_count,
+            source: source.clone(),
+            created_at,
+            benchmarks: results
+                .into_iter()
+                .map(|row| ReplayBenchmarkCard {
+                    model_name: row.model_name,
+                    rank: row.rank,
+                    brier: row.brier,
+                    execution_pnl: row.execution_pnl,
+                    sample_count: row.sample_count,
+                    trade_count: row.trade_count,
+                    win_rate: row.win_rate,
+                    source: source.clone(),
+                    created_at,
+                })
+                .collect(),
+        }))
+    }
+
+    pub async fn list_latest_feature_snapshots(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<MarketFeatureSnapshotRecord>> {
+        let rows = sqlx::query_as::<_, FeatureSnapshotRow>(
+            r#"
+            with latest as (
+                select distinct on (market_id)
+                    id,
+                    market_id,
+                    exchange,
+                    symbol,
+                    window_minutes,
+                    seconds_to_expiry,
+                    time_to_expiry_bucket,
+                    feature_version,
+                    venue_features_json,
+                    settlement_features_json,
+                    external_reference_json,
+                    venue_quality_json,
+                    created_at
+                from market_feature_snapshot
+                order by market_id, created_at desc, id desc
+            )
+            select *
+            from latest
+            order by created_at desc
+            limit $1
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub async fn latest_feature_snapshot_for_market(
+        &self,
+        market_id: i64,
+    ) -> Result<Option<MarketFeatureSnapshotRecord>> {
+        let row = sqlx::query_as::<_, FeatureSnapshotRow>(
+            r#"
+            select
+                id,
+                market_id,
+                exchange,
+                symbol,
+                window_minutes,
+                seconds_to_expiry,
+                time_to_expiry_bucket,
+                feature_version,
+                venue_features_json,
+                settlement_features_json,
+                external_reference_json,
+                venue_quality_json,
+                created_at
+            from market_feature_snapshot
+            where market_id = $1
+            order by created_at desc, id desc
+            limit 1
+            "#,
+        )
+        .bind(market_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(TryInto::try_into).transpose()
+    }
+
+    pub async fn latest_feature_snapshot_for_ticker(
+        &self,
+        market_ticker: &str,
+    ) -> Result<Option<MarketFeatureSnapshotRecord>> {
+        let row = sqlx::query_as::<_, FeatureSnapshotRow>(
+            r#"
+            select
+                id,
+                market_id,
+                exchange,
+                symbol,
+                window_minutes,
+                seconds_to_expiry,
+                time_to_expiry_bucket,
+                feature_version,
+                venue_features_json,
+                settlement_features_json,
+                external_reference_json,
+                venue_quality_json,
+                created_at
+            from market_feature_snapshot
+            where venue_features_json->>'market_ticker' = $1
+            order by created_at desc, id desc
+            limit 1
+            "#,
+        )
+        .bind(market_ticker)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(TryInto::try_into).transpose()
+    }
+
+    pub async fn latest_decision_at_for_lane(
+        &self,
+        lane_key: &str,
+    ) -> Result<Option<DateTime<Utc>>> {
+        let created_at = sqlx::query_scalar::<_, DateTime<Utc>>(
+            r#"
+            select created_at
+            from opportunity_decision
+            where lane_key = $1
+            order by created_at desc
+            limit 1
+            "#,
+        )
+        .bind(lane_key)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(created_at)
+    }
+
+    pub async fn insert_model_inference(&self, inference: &ModelInference) -> Result<i64> {
+        let id = sqlx::query_scalar(
+            r#"
+            insert into model_inference (
+                market_id, lane_key, strategy_family, model_name, raw_score, raw_probability_yes,
+                calibrated_probability_yes, raw_confidence, calibrated_confidence, feature_version,
+                rationale_json
+            )
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
+            returning id
+            "#,
+        )
+        .bind(inference.market_id)
+        .bind(&inference.lane_key)
+        .bind(SqlStrategyFamily::from(inference.strategy_family))
+        .bind(&inference.model_name)
+        .bind(inference.raw_score)
+        .bind(inference.raw_probability_yes)
+        .bind(inference.calibrated_probability_yes)
+        .bind(inference.raw_confidence)
+        .bind(inference.calibrated_confidence)
+        .bind(&inference.feature_version)
+        .bind(&inference.rationale_json)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    pub async fn upsert_probability_calibration(
+        &self,
+        symbol: &str,
+        strategy_family: StrategyFamily,
+        model_name: &str,
+        expiry_bucket: &str,
+        mean_error: f64,
+        sample_count: i32,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            insert into probability_calibration (
+                symbol, strategy_family, model_name, expiry_bucket, mean_error, sample_count, updated_at
+            )
+            values ($1, $2, $3, $4, $5, $6, now())
+            on conflict (symbol, strategy_family, model_name, expiry_bucket) do update
+            set mean_error = excluded.mean_error,
+                sample_count = excluded.sample_count,
+                updated_at = now()
+            "#,
+        )
+        .bind(symbol.to_lowercase())
+        .bind(SqlStrategyFamily::from(strategy_family))
+        .bind(model_name)
+        .bind(expiry_bucket)
+        .bind(mean_error)
+        .bind(sample_count)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn latest_probability_calibration(
+        &self,
+        symbol: &str,
+        strategy_family: StrategyFamily,
+        model_name: &str,
+        expiry_bucket: &str,
+    ) -> Result<Option<ProbabilityCalibrationCard>> {
+        let row = sqlx::query_as::<_, ProbabilityCalibrationRow>(
+            r#"
+            select mean_error, sample_count
+            from probability_calibration
+            where symbol = $1
+              and strategy_family = $2
+              and model_name = $3
+              and expiry_bucket = $4
+            "#,
+        )
+        .bind(symbol.to_lowercase())
+        .bind(SqlStrategyFamily::from(strategy_family))
+        .bind(model_name)
+        .bind(expiry_bucket)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(Into::into))
+    }
+
+    pub async fn insert_opportunity_decision(&self, decision: &OpportunityDecision) -> Result<i64> {
+        let id = sqlx::query_scalar(
+            r#"
+            insert into opportunity_decision (
+                market_id, lane_key, strategy_family, model_name, side, market_prob, model_prob, edge,
+                confidence, approved, reasons_json, recommended_size
+            )
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12)
+            returning id
+            "#,
+        )
+        .bind(decision.market_id)
+        .bind(&decision.lane_key)
+        .bind(SqlStrategyFamily::from(decision.strategy_family))
+        .bind(&decision.model_name)
+        .bind(&decision.side)
+        .bind(decision.market_prob)
+        .bind(decision.model_prob)
+        .bind(decision.edge)
+        .bind(decision.confidence)
+        .bind(decision.approved)
+        .bind(json!(decision.reasons_json))
+        .bind(decision.recommended_size)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    pub async fn upsert_lane_state(&self, lane: &LaneState) -> Result<()> {
+        let previous = sqlx::query_as::<_, LaneStateRow>(
+            r#"
+            select lane_key, promotion_state, promotion_reason, recent_pnl, recent_brier,
+                   recent_execution_quality, recent_replay_expectancy, quarantine_reason, current_champion_model
+            from lane_state
+            where lane_key = $1
+            "#,
+        )
+        .bind(&lane.lane_key)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            insert into lane_state (
+                lane_key, promotion_state, recent_pnl, recent_brier, recent_execution_quality,
+                recent_replay_expectancy, quarantine_reason, promotion_reason, current_champion_model, updated_at
+            )
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
+            on conflict (lane_key) do update
+            set promotion_state = excluded.promotion_state,
+                recent_pnl = excluded.recent_pnl,
+                recent_brier = excluded.recent_brier,
+                recent_execution_quality = excluded.recent_execution_quality,
+                recent_replay_expectancy = excluded.recent_replay_expectancy,
+                quarantine_reason = excluded.quarantine_reason,
+                promotion_reason = excluded.promotion_reason,
+                current_champion_model = excluded.current_champion_model,
+                updated_at = now()
+            "#,
+        )
+        .bind(&lane.lane_key)
+        .bind(SqlPromotionState::from(lane.promotion_state))
+        .bind(lane.recent_pnl)
+        .bind(lane.recent_brier)
+        .bind(lane.recent_execution_quality)
+        .bind(lane.recent_replay_expectancy)
+        .bind(&lane.quarantine_reason)
+        .bind(&lane.promotion_reason)
+        .bind(&lane.current_champion_model)
+        .execute(&self.pool)
+        .await?;
+        let changed = previous
+            .as_ref()
+            .map(|row| {
+                row.promotion_state != SqlPromotionState::from(lane.promotion_state)
+                    || row.promotion_reason != lane.promotion_reason
+                    || row.current_champion_model != lane.current_champion_model
+            })
+            .unwrap_or(true);
+        if changed {
+            sqlx::query(
+                r#"
+                insert into lane_state_transition (
+                    lane_key, from_state, to_state, from_reason, to_reason, current_champion_model, details_json
+                )
+                values ($1, $2, $3, $4, $5, $6, $7::jsonb)
+                "#,
+            )
+            .bind(&lane.lane_key)
+            .bind(previous.as_ref().map(|row| row.promotion_state.as_key()))
+            .bind(SqlPromotionState::from(lane.promotion_state).as_key())
+            .bind(previous.as_ref().and_then(|row| row.promotion_reason.clone()))
+            .bind(&lane.promotion_reason)
+            .bind(&lane.current_champion_model)
+            .bind(json!({
+                "recent_pnl": lane.recent_pnl,
+                "recent_brier": lane.recent_brier,
+                "recent_execution_quality": lane.recent_execution_quality,
+                "recent_replay_expectancy": lane.recent_replay_expectancy,
+                "quarantine_reason": lane.quarantine_reason,
+            }))
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn latest_lane_policy_for_symbol(
+        &self,
+        symbol: &str,
+        strategy_family: StrategyFamily,
+    ) -> Result<Option<SymbolLanePolicy>> {
+        let pattern = format!("kalshi:{}:%", symbol.to_lowercase());
+        let family = match strategy_family {
+            StrategyFamily::DirectionalSettlement => "directional_settlement",
+            StrategyFamily::PreSettlementScalp => "pre_settlement_scalp",
+            StrategyFamily::Portfolio => "portfolio",
+        };
+        let row = sqlx::query_as::<_, LaneStateRow>(
+            r#"
+            select lane_key, promotion_state, promotion_reason, recent_pnl, recent_brier, recent_execution_quality,
+                   recent_replay_expectancy, quarantine_reason, current_champion_model
+            from lane_state
+            where lane_key like $1
+              and lane_key like $2
+              and current_champion_model is not null
+            order by updated_at desc
+            limit 1
+            "#,
+        )
+        .bind(pattern)
+        .bind(format!("%:{}:%", family))
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(Into::into))
+    }
+
+    pub async fn latest_portfolio_bankroll(&self, mode: TradeMode) -> Result<Option<BankrollCard>> {
+        let scope = match mode {
+            TradeMode::Paper => "paper",
+            TradeMode::Live => "live",
+        };
+        let row = sqlx::query_as::<_, BankrollRow>(
+            r#"
+            select scope, mode, strategy_family, bankroll, deployable_balance, open_exposure,
+                   realized_pnl, unrealized_pnl, created_at
+            from bankroll_snapshot
+            where scope = $1 and mode = $2 and strategy_family = $3
+            order by created_at desc, id desc
+            limit 1
+            "#,
+        )
+        .bind(scope)
+        .bind(SqlTradeMode::from(mode))
+        .bind(SqlStrategyFamily::Portfolio)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(Into::into))
+    }
+
+    pub async fn latest_feature_snapshot_timestamp(&self) -> Result<Option<DateTime<Utc>>> {
+        let created_at = sqlx::query_scalar::<_, DateTime<Utc>>(
+            r#"
+            select created_at
+            from market_feature_snapshot
+            order by created_at desc
+            limit 1
+            "#,
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(created_at)
+    }
+
+    pub async fn upsert_worker_started(
+        &self,
+        service: &str,
+        details_json: &serde_json::Value,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            insert into worker_status (
+                service, status, last_started_at, details_json, updated_at
+            )
+            values ($1, 'running', now(), $2::jsonb, now())
+            on conflict (service) do update
+            set status = 'running',
+                last_started_at = now(),
+                details_json = excluded.details_json,
+                updated_at = now()
+            "#,
+        )
+        .bind(service)
+        .bind(details_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn upsert_worker_success(
+        &self,
+        service: &str,
+        details_json: &serde_json::Value,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            insert into worker_status (
+                service, status, last_succeeded_at, last_error, details_json, updated_at
+            )
+            values ($1, 'ok', now(), null, $2::jsonb, now())
+            on conflict (service) do update
+            set status = 'ok',
+                last_succeeded_at = now(),
+                last_error = null,
+                details_json = excluded.details_json,
+                updated_at = now()
+            "#,
+        )
+        .bind(service)
+        .bind(details_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn upsert_worker_failure(
+        &self,
+        service: &str,
+        error: &str,
+        details_json: &serde_json::Value,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            insert into worker_status (
+                service, status, last_failed_at, last_error, details_json, updated_at
+            )
+            values ($1, 'failed', now(), $2, $3::jsonb, now())
+            on conflict (service) do update
+            set status = 'failed',
+                last_failed_at = now(),
+                last_error = excluded.last_error,
+                details_json = excluded.details_json,
+                updated_at = now()
+            "#,
+        )
+        .bind(service)
+        .bind(error)
+        .bind(details_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_worker_statuses(&self) -> Result<Vec<WorkerStatusCard>> {
+        let rows = sqlx::query_as::<_, WorkerStatusRow>(
+            r#"
+            select
+                service,
+                status,
+                last_started_at,
+                last_succeeded_at,
+                last_failed_at,
+                last_error,
+                details_json,
+                updated_at
+            from worker_status
+            order by service asc
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    pub async fn record_external_bankroll_snapshot(
+        &self,
+        mode: TradeMode,
+        bankroll: f64,
+        deployable_balance: f64,
+        open_exposure: f64,
+    ) -> Result<()> {
+        let scope = match mode {
+            TradeMode::Paper => "paper",
+            TradeMode::Live => "live",
+        };
+        sqlx::query(
+            r#"
+            insert into bankroll_snapshot (
+                scope, mode, strategy_family, bankroll, deployable_balance, open_exposure,
+                realized_pnl, unrealized_pnl
+            )
+            values ($1, $2, $3, $4, $5, $6, 0, 0)
+            "#,
+        )
+        .bind(scope)
+        .bind(SqlTradeMode::from(mode))
+        .bind(SqlStrategyFamily::Portfolio)
+        .bind(bankroll.max(0.0))
+        .bind(deployable_balance.max(0.0))
+        .bind(open_exposure.max(0.0))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn replace_live_positions(
+        &self,
+        synced_at: DateTime<Utc>,
+        positions: &[LivePositionSyncRecord],
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("delete from live_position_sync")
+            .execute(&mut *tx)
+            .await?;
+        for position in positions {
+            sqlx::query(
+                r#"
+                insert into live_position_sync (
+                    market_ticker, position_count, resting_order_count, fees_paid,
+                    market_exposure, realized_pnl, synced_at, details_json
+                )
+                values ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+                "#,
+            )
+            .bind(&position.market_ticker)
+            .bind(position.position_count)
+            .bind(position.resting_order_count)
+            .bind(position.fees_paid)
+            .bind(position.market_exposure)
+            .bind(position.realized_pnl)
+            .bind(synced_at)
+            .bind(&position.details_json)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn replace_live_orders(
+        &self,
+        synced_at: DateTime<Utc>,
+        orders: &[LiveOrderSyncRecord],
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("delete from live_order_sync")
+            .execute(&mut *tx)
+            .await?;
+        for order in orders {
+            sqlx::query(
+                r#"
+                insert into live_order_sync (
+                    order_id, client_order_id, market_ticker, action, side, status, count,
+                    fill_count, remaining_count, yes_price, no_price, expiration_time,
+                    created_time, synced_at, details_json
+                )
+                values (
+                    $1, $2, $3, $4, $5, $6, $7,
+                    $8, $9, $10, $11, $12,
+                    $13, $14, $15::jsonb
+                )
+                "#,
+            )
+            .bind(&order.order_id)
+            .bind(&order.client_order_id)
+            .bind(&order.market_ticker)
+            .bind(&order.action)
+            .bind(&order.side)
+            .bind(&order.status)
+            .bind(order.count)
+            .bind(order.fill_count)
+            .bind(order.remaining_count)
+            .bind(order.yes_price)
+            .bind(order.no_price)
+            .bind(order.expiration_time)
+            .bind(order.created_time)
+            .bind(synced_at)
+            .bind(&order.details_json)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn replace_live_fills(
+        &self,
+        synced_at: DateTime<Utc>,
+        fills: &[LiveFillSyncRecord],
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("delete from live_fill_sync")
+            .execute(&mut *tx)
+            .await?;
+        for fill in fills {
+            sqlx::query(
+                r#"
+                insert into live_fill_sync (
+                    fill_id, order_id, client_order_id, market_ticker, action, side, count,
+                    yes_price, no_price, fee_paid, created_time, synced_at, details_json
+                )
+                values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb)
+                "#,
+            )
+            .bind(&fill.fill_id)
+            .bind(&fill.order_id)
+            .bind(&fill.client_order_id)
+            .bind(&fill.market_ticker)
+            .bind(&fill.action)
+            .bind(&fill.side)
+            .bind(fill.count)
+            .bind(fill.yes_price)
+            .bind(fill.no_price)
+            .bind(fill.fee_paid)
+            .bind(fill.created_time)
+            .bind(synced_at)
+            .bind(&fill.details_json)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn record_live_exchange_sync_status(
+        &self,
+        summary: &LiveExchangeSyncSummary,
+        details_json: &serde_json::Value,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            insert into live_exchange_sync_status (
+                source, synced_at, positions_count, resting_orders_count, recent_fills_count,
+                local_open_live_trades_count, status, issues_json, details_json
+            )
+            values ('kalshi', $1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb)
+            on conflict (source) do update
+            set synced_at = excluded.synced_at,
+                positions_count = excluded.positions_count,
+                resting_orders_count = excluded.resting_orders_count,
+                recent_fills_count = excluded.recent_fills_count,
+                local_open_live_trades_count = excluded.local_open_live_trades_count,
+                status = excluded.status,
+                issues_json = excluded.issues_json,
+                details_json = excluded.details_json
+            "#,
+        )
+        .bind(summary.synced_at)
+        .bind(summary.positions_count as i32)
+        .bind(summary.resting_orders_count as i32)
+        .bind(summary.recent_fills_count as i32)
+        .bind(summary.local_open_live_trades_count as i32)
+        .bind(&summary.status)
+        .bind(json!(summary.issues))
+        .bind(details_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn count_open_live_trades(&self) -> Result<i64> {
+        let count = sqlx::query_scalar::<_, i64>(
+            r#"
+            select count(*)
+            from trade_lifecycle
+            where mode = 'live'
+              and closed_at is null
+              and status not in ('closed', 'cancelled')
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count)
+    }
+
+    pub async fn latest_live_exchange_sync_summary(
+        &self,
+    ) -> Result<Option<LiveExchangeSyncSummary>> {
+        let row = sqlx::query_as::<_, LiveExchangeSyncStatusRow>(
+            r#"
+            select
+                source,
+                synced_at,
+                positions_count,
+                resting_orders_count,
+                recent_fills_count,
+                local_open_live_trades_count,
+                status,
+                issues_json,
+                details_json
+            from live_exchange_sync_status
+            where source = 'kalshi'
+            "#,
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(Into::into))
+    }
+
+    pub async fn operator_control_state(&self) -> Result<Option<OperatorControlState>> {
+        let row = sqlx::query_as::<_, OperatorControlStateRow>(
+            r#"
+            select live_order_placement_enabled, updated_by, note, updated_at
+            from operator_control_state
+            where control_key = 'global'
+            "#,
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(Into::into))
+    }
+
+    pub async fn set_live_order_placement_enabled(
+        &self,
+        enabled: bool,
+        updated_by: &str,
+        note: Option<&str>,
+    ) -> Result<OperatorControlState> {
+        let row = sqlx::query_as::<_, OperatorControlStateRow>(
+            r#"
+            insert into operator_control_state (
+                control_key,
+                live_order_placement_enabled,
+                updated_by,
+                note,
+                updated_at
+            )
+            values ('global', $1, $2, $3, now())
+            on conflict (control_key) do update
+            set live_order_placement_enabled = excluded.live_order_placement_enabled,
+                updated_by = excluded.updated_by,
+                note = excluded.note,
+                updated_at = now()
+            returning live_order_placement_enabled, updated_by, note, updated_at
+            "#,
+        )
+        .bind(enabled)
+        .bind(updated_by)
+        .bind(note)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.into())
+    }
+
+    pub async fn effective_live_order_placement_enabled(
+        &self,
+        config_enabled: bool,
+    ) -> Result<bool> {
+        let operator_enabled = self
+            .operator_control_state()
+            .await?
+            .map(|state| state.live_order_placement_enabled)
+            .unwrap_or(true);
+        Ok(config_enabled && operator_enabled)
+    }
+
+    pub async fn live_exception_snapshot(&self) -> Result<LiveExceptionSnapshot> {
+        Ok(LiveExceptionSnapshot {
+            operator_control: self.operator_control_state().await?,
+            positions: self.list_live_positions(6).await?,
+            orders: self.list_live_orders(8).await?,
+            recent_fills: self.list_recent_live_fills(8).await?,
+            trade_exceptions: self.list_live_trade_exceptions(6).await?,
+            live_intents: self.list_live_intents(8).await?,
+        })
+    }
+
+    pub async fn list_live_positions(&self, limit: i64) -> Result<Vec<LivePositionCard>> {
+        let rows = sqlx::query_as::<_, LivePositionSyncRow>(
+            r#"
+            select market_ticker, position_count, resting_order_count, market_exposure,
+                   realized_pnl, synced_at
+            from live_position_sync
+            order by abs(market_exposure) desc, synced_at desc, market_ticker asc
+            limit $1
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    pub async fn list_live_orders(&self, limit: i64) -> Result<Vec<LiveOrderCard>> {
+        let rows = sqlx::query_as::<_, LiveOrderSyncListRow>(
+            r#"
+            select order_id, client_order_id, market_ticker, action, side, status, count,
+                   fill_count, remaining_count, created_time, synced_at
+            from live_order_sync
+            order by created_time desc nulls last, synced_at desc, order_id desc
+            limit $1
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    pub async fn list_resting_live_orders(&self, limit: i64) -> Result<Vec<LiveOrderCard>> {
+        let rows = sqlx::query_as::<_, LiveOrderSyncListRow>(
+            r#"
+            select order_id, client_order_id, market_ticker, action, side, status, count,
+                   fill_count, remaining_count, created_time, synced_at
+            from live_order_sync
+            where coalesce(status, 'resting') not in ('cancelled', 'filled', 'rejected')
+            order by created_time desc nulls last, synced_at desc, order_id desc
+            limit $1
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    pub async fn list_recent_live_fills(&self, limit: i64) -> Result<Vec<LiveFillCard>> {
+        let rows = sqlx::query_as::<_, LiveFillSyncListRow>(
+            r#"
+            select fill_id, order_id, client_order_id, market_ticker, action, side, count,
+                   fee_paid, created_time, synced_at
+            from live_fill_sync
+            order by created_time desc nulls last, synced_at desc, fill_id desc
+            limit $1
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    pub async fn list_live_intents(&self, limit: i64) -> Result<Vec<LiveIntentCard>> {
+        let rows = sqlx::query_as::<_, LiveIntentRow>(
+            r#"
+            select
+                ei.id as intent_id,
+                od.lane_key,
+                ei.mode,
+                ei.status,
+                ei.last_error,
+                ei.market_ticker,
+                ei.side,
+                ei.client_order_id,
+                ei.exchange_order_id,
+                ei.fill_status,
+                ei.created_at,
+                ei.last_transition_at
+            from execution_intent ei
+            join opportunity_decision od on od.id = ei.decision_id
+            where ei.mode = 'live'
+            order by ei.last_transition_at desc, ei.id desc
+            limit $1
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    pub async fn list_live_trade_exceptions(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<LiveTradeExceptionCard>> {
+        let open_trades = self.list_open_live_trades_for_reconciliation().await?;
+        let mut out = Vec::new();
+        for trade in open_trades {
+            let snapshot = self.live_reconciliation_snapshot_for_trade(&trade).await?;
+            if live_trade_needs_attention(&trade, &snapshot) {
+                out.push(LiveTradeExceptionCard {
+                    trade_id: trade.trade_id,
+                    lane_key: trade.lane_key.clone(),
+                    market_ticker: trade.market_ticker.clone(),
+                    issue: "exchange truth mismatch".to_string(),
+                    has_position: snapshot.has_position,
+                    has_resting_order: snapshot.has_resting_order,
+                    matched_exit_fill_quantity: snapshot.matched_exit_fill_quantity,
+                    created_at: trade.created_at,
+                });
+            }
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    pub async fn lane_inspection_snapshot(&self, lane_key: &str) -> Result<LaneInspectionSnapshot> {
+        let lane_state = sqlx::query_as::<_, LaneStateRow>(
+            r#"
+            select lane_key, promotion_state, promotion_reason, recent_pnl, recent_brier, recent_execution_quality,
+                   recent_replay_expectancy, quarantine_reason, current_champion_model
+            from lane_state
+            where lane_key = $1
+            "#,
+        )
+        .bind(lane_key)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(Into::into);
+
+        let opportunity_rows = sqlx::query(
+            r#"
+            select lane_key, strategy_family, side, market_prob, model_prob, edge, confidence,
+                   approved, reasons_json, created_at
+            from opportunity_decision
+            where lane_key = $1
+            order by created_at desc, id desc
+            limit 8
+            "#,
+        )
+        .bind(lane_key)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut recent_opportunities = Vec::with_capacity(opportunity_rows.len());
+        for row in opportunity_rows {
+            let strategy_family =
+                parse_strategy_family(row.try_get::<String, _>("strategy_family")?.as_str());
+            let reasons_json: serde_json::Value = row.try_get("reasons_json")?;
+            recent_opportunities.push(OpportunityCard {
+                lane_key: row.try_get("lane_key")?,
+                strategy_family,
+                side: row.try_get("side")?,
+                market_prob: row.try_get("market_prob")?,
+                model_prob: row.try_get("model_prob")?,
+                edge: row.try_get("edge")?,
+                confidence: row.try_get("confidence")?,
+                approved: row.try_get("approved")?,
+                reasons: reasons_json
+                    .as_array()
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| item.as_str().map(ToOwned::to_owned))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                as_of: row.try_get("created_at")?,
+            });
+        }
+
+        let trade_rows = sqlx::query_as::<_, LaneTradeRow>(
+            r#"
+            select id, status, mode, quantity, entry_price, exit_price, realized_pnl,
+                   created_at, closed_at
+            from trade_lifecycle
+            where lane_key = $1
+            order by created_at desc, id desc
+            limit 8
+            "#,
+        )
+        .bind(lane_key)
+        .fetch_all(&self.pool)
+        .await?;
+        let replay_summary = self.latest_model_benchmark_summary_for_lane(lane_key).await?;
+
+        Ok(LaneInspectionSnapshot {
+            lane_key: lane_key.to_string(),
+            lane_state,
+            recent_opportunities,
+            recent_trades: trade_rows.into_iter().map(Into::into).collect(),
+            replay_summary,
+        })
+    }
+
+    pub async fn recent_trade_metrics_for_symbol(
+        &self,
+        symbol: &str,
+        strategy_family: StrategyFamily,
+        mode: TradeMode,
+        limit: i64,
+    ) -> Result<RecentTradeMetrics> {
+        let family = match strategy_family {
+            StrategyFamily::DirectionalSettlement => "directional_settlement",
+            StrategyFamily::PreSettlementScalp => "pre_settlement_scalp",
+            StrategyFamily::Portfolio => "portfolio",
+        };
+        let symbol_pattern = format!("kalshi:{}:%", symbol.to_lowercase());
+        let family_pattern = format!("%:{}:%", family);
+        let row = sqlx::query_as::<_, RecentTradeMetricsRow>(
+            r#"
+            with recent as (
+                select realized_pnl
+                from trade_lifecycle
+                where lane_key like $1
+                  and lane_key like $2
+                  and mode = $3
+                  and closed_at is not null
+                order by closed_at desc, id desc
+                limit $4
+            )
+            select
+                count(*) as trade_count,
+                coalesce(sum(case when coalesce(realized_pnl, 0) > 0 then 1 else 0 end), 0) as win_count,
+                coalesce(sum(coalesce(realized_pnl, 0)), 0) as realized_pnl
+            from recent
+            "#,
+        )
+        .bind(symbol_pattern)
+        .bind(family_pattern)
+        .bind(SqlTradeMode::from(mode))
+        .bind(limit)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.into())
+    }
+
+    pub async fn has_open_trade_for_lane(&self, lane_key: &str) -> Result<bool> {
+        let exists = sqlx::query_scalar::<_, bool>(
+            r#"
+            select exists(
+                select 1
+                from trade_lifecycle
+                where lane_key = $1
+                  and closed_at is null
+                  and status not in ('closed', 'cancelled')
+            )
+            "#,
+        )
+        .bind(lane_key)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(exists)
+    }
+
+    pub async fn open_exposure_for_mode_and_lane(
+        &self,
+        mode: TradeMode,
+        lane_key: &str,
+    ) -> Result<f64> {
+        let exposure = sqlx::query_scalar::<_, f64>(
+            r#"
+            select coalesce(sum(quantity * entry_price), 0)
+            from trade_lifecycle
+            where mode = $1
+              and lane_key = $2
+              and closed_at is null
+              and status not in ('closed', 'cancelled')
+            "#,
+        )
+        .bind(SqlTradeMode::from(mode))
+        .bind(lane_key)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(exposure.max(0.0))
+    }
+
+    pub async fn open_exposure_for_mode_and_symbol(
+        &self,
+        mode: TradeMode,
+        symbol: &str,
+    ) -> Result<f64> {
+        let exposure = sqlx::query_scalar::<_, f64>(
+            r#"
+            select coalesce(sum(quantity * entry_price), 0)
+            from trade_lifecycle
+            where mode = $1
+              and split_part(lane_key, ':', 2) = $2
+              and closed_at is null
+              and status not in ('closed', 'cancelled')
+            "#,
+        )
+        .bind(SqlTradeMode::from(mode))
+        .bind(symbol.to_lowercase())
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(exposure.max(0.0))
+    }
+
+    pub async fn insert_execution_intent(
+        &self,
+        decision_id: i64,
+        mode: TradeMode,
+        entry_style: &str,
+        target_ladder_json: &[f64],
+        timeout_seconds: i32,
+        force_exit_buffer_seconds: i32,
+        stop_conditions_json: &[String],
+    ) -> Result<i64> {
+        let id = sqlx::query_scalar(
+            r#"
+            insert into execution_intent (
+                decision_id, mode, entry_style, target_ladder_json, timeout_seconds,
+                force_exit_buffer_seconds, stop_conditions_json, status
+            )
+            values ($1, $2, $3, $4::jsonb, $5, $6, $7::jsonb, 'pending')
+            returning id
+            "#,
+        )
+        .bind(decision_id)
+        .bind(SqlTradeMode::from(mode))
+        .bind(entry_style)
+        .bind(json!(target_ladder_json))
+        .bind(timeout_seconds)
+        .bind(force_exit_buffer_seconds)
+        .bind(json!(stop_conditions_json))
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    pub async fn list_pending_execution_intents(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<PendingExecutionIntent>> {
+        let rows = sqlx::query_as::<_, PendingExecutionIntentRow>(
+            r#"
+            select
+                ei.id as intent_id,
+                ei.decision_id,
+                od.market_id,
+                od.lane_key,
+                od.strategy_family,
+                od.side,
+                od.market_prob,
+                od.recommended_size,
+                ei.mode,
+                ei.timeout_seconds,
+                ei.force_exit_buffer_seconds,
+                ei.created_at
+            from execution_intent ei
+            join opportunity_decision od on od.id = ei.decision_id
+            left join trade_lifecycle tl on tl.decision_id = ei.decision_id
+            where tl.id is null
+              and ei.status = 'pending'
+            order by ei.created_at asc
+            limit $1
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    pub async fn execution_intent_by_id(
+        &self,
+        intent_id: i64,
+    ) -> Result<Option<PendingExecutionIntent>> {
+        let row = sqlx::query_as::<_, PendingExecutionIntentRow>(
+            r#"
+            select
+                ei.id as intent_id,
+                ei.decision_id,
+                od.market_id,
+                od.lane_key,
+                od.strategy_family,
+                od.side,
+                od.market_prob,
+                od.recommended_size,
+                ei.mode,
+                ei.timeout_seconds,
+                ei.force_exit_buffer_seconds,
+                ei.created_at
+            from execution_intent ei
+            join opportunity_decision od on od.id = ei.decision_id
+            where ei.id = $1
+            "#,
+        )
+        .bind(intent_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(Into::into))
+    }
+
+    pub async fn list_active_live_execution_intents(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<ActiveLiveExecutionIntent>> {
+        let rows = sqlx::query_as::<_, ActiveLiveExecutionIntentRow>(
+            r#"
+            select
+                ei.id as intent_id,
+                ei.decision_id,
+                od.market_id,
+                od.lane_key,
+                od.strategy_family,
+                od.side,
+                od.market_prob,
+                od.recommended_size,
+                ei.mode,
+                ei.timeout_seconds,
+                ei.force_exit_buffer_seconds,
+                ei.created_at,
+                ei.status,
+                ei.market_ticker,
+                ei.client_order_id,
+                ei.exchange_order_id,
+                ei.fill_status,
+                ei.last_transition_at
+            from execution_intent ei
+            join opportunity_decision od on od.id = ei.decision_id
+            where ei.mode = 'live'
+              and ei.status in ('pending', 'submitted', 'acknowledged', 'partially_filled', 'cancel_pending')
+            order by ei.last_transition_at asc, ei.id asc
+            limit $1
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    pub async fn repair_pending_execution_intents_from_trades(&self) -> Result<usize> {
+        let result = sqlx::query(
+            r#"
+            update execution_intent ei
+            set status = 'opened',
+                last_error = null,
+                processed_at = coalesce(ei.processed_at, now())
+            where ei.status = 'pending'
+              and exists (
+                  select 1
+                  from trade_lifecycle tl
+                  where tl.decision_id = ei.decision_id
+              )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() as usize)
+    }
+
+    pub async fn open_trade_from_intent(
+        &self,
+        intent: &PendingExecutionIntent,
+        quantity: f64,
+        entry_price: f64,
+    ) -> Result<i64> {
+        self.open_trade_from_intent_with_metadata_and_status(
+            intent,
+            quantity,
+            entry_price,
+            &json!({}),
+            "opened",
+        )
+        .await
+    }
+
+    pub async fn open_trade_from_intent_with_metadata(
+        &self,
+        intent: &PendingExecutionIntent,
+        quantity: f64,
+        entry_price: f64,
+        extra_metadata: &serde_json::Value,
+    ) -> Result<i64> {
+        self.open_trade_from_intent_with_metadata_and_status(
+            intent,
+            quantity,
+            entry_price,
+            extra_metadata,
+            "opened",
+        )
+        .await
+    }
+
+    pub async fn open_trade_from_intent_with_metadata_and_status(
+        &self,
+        intent: &PendingExecutionIntent,
+        quantity: f64,
+        entry_price: f64,
+        extra_metadata: &serde_json::Value,
+        status_on_open: &str,
+    ) -> Result<i64> {
+        let expires_at = self
+            .latest_feature_snapshot_for_market(intent.market_id)
+            .await?
+            .map(|snapshot| {
+                snapshot.created_at + chrono::Duration::seconds(snapshot.seconds_to_expiry as i64)
+            });
+        let metadata = json!({
+            "market_id": intent.market_id,
+            "side": intent.side,
+            "intent_id": intent.intent_id,
+            "timeout_seconds": intent.timeout_seconds,
+            "force_exit_buffer_seconds": intent.force_exit_buffer_seconds,
+            "expires_at": expires_at,
+        });
+        let market_ticker = extra_metadata
+            .get("market_ticker")
+            .and_then(serde_json::Value::as_str);
+        let entry_fee = json_f64(extra_metadata, "entry_fee");
+        let entry_exchange_order_id = extra_metadata
+            .get("entry_order_id")
+            .and_then(serde_json::Value::as_str);
+        let entry_client_order_id = extra_metadata
+            .get("entry_client_order_id")
+            .and_then(serde_json::Value::as_str);
+        let entry_fill_status = extra_metadata
+            .get("entry_status")
+            .and_then(serde_json::Value::as_str);
+        let id = sqlx::query_scalar(
+            r#"
+            insert into trade_lifecycle (
+                decision_id, lane_key, strategy_family, mode, status, quantity, entry_price,
+                market_id, market_ticker, side, timeout_seconds, force_exit_buffer_seconds,
+                expires_at, entry_fee, entry_exchange_order_id, entry_client_order_id,
+                entry_fill_status, metadata_json
+            )
+            values (
+                $1, $2, $3, $4, 'open', $5, $6,
+                $7, $8, $9, $10, $11,
+                $12, $13, $14, $15,
+                $16, $17::jsonb
+            )
+            returning id
+            "#,
+        )
+        .bind(intent.decision_id)
+        .bind(&intent.lane_key)
+        .bind(SqlStrategyFamily::from(intent.strategy_family))
+        .bind(SqlTradeMode::from(intent.mode))
+        .bind(quantity)
+        .bind(entry_price)
+        .bind(intent.market_id)
+        .bind(market_ticker)
+        .bind(&intent.side)
+        .bind(intent.timeout_seconds)
+        .bind(intent.force_exit_buffer_seconds)
+        .bind(expires_at)
+        .bind(entry_fee)
+        .bind(entry_exchange_order_id)
+        .bind(entry_client_order_id)
+        .bind(entry_fill_status)
+        .bind(merge_json(metadata, extra_metadata.clone()))
+        .fetch_one(&self.pool)
+        .await?;
+        self.transition_execution_intent(
+            intent.intent_id,
+            status_on_open,
+            None,
+            &ExecutionIntentStateUpdate {
+                market_ticker: market_ticker.map(ToOwned::to_owned),
+                side: Some(intent.side.clone()),
+                details_json: json!({
+                    "trade_id": id,
+                    "status_on_open": status_on_open,
+                }),
+                ..Default::default()
+            },
+        )
+        .await?;
+        if intent.mode == TradeMode::Paper {
+            self.reconcile_bankroll_for_mode(intent.mode).await?;
+        }
+        Ok(id)
+    }
+
+    pub async fn upsert_open_live_trade_fill_progress(
+        &self,
+        decision_id: i64,
+        quantity: f64,
+        entry_price: f64,
+        entry_fee: f64,
+        entry_fill_status: &str,
+        extra_metadata: &serde_json::Value,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            r#"
+            update trade_lifecycle
+            set quantity = $2,
+                entry_price = $3,
+                entry_fee = $4,
+                entry_fill_status = $5,
+                metadata_json = coalesce(metadata_json, '{}'::jsonb) || $6::jsonb
+            where decision_id = $1
+              and mode = 'live'
+              and closed_at is null
+              and status = 'open'
+            "#,
+        )
+        .bind(decision_id)
+        .bind(quantity)
+        .bind(entry_price)
+        .bind(entry_fee)
+        .bind(entry_fill_status)
+        .bind(extra_metadata)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn mark_execution_intent_status(
+        &self,
+        intent_id: i64,
+        status: &str,
+        last_error: Option<&str>,
+    ) -> Result<()> {
+        self.transition_execution_intent(
+            intent_id,
+            status,
+            last_error,
+            &ExecutionIntentStateUpdate::default(),
+        )
+        .await
+    }
+
+    pub async fn transition_execution_intent(
+        &self,
+        intent_id: i64,
+        status: &str,
+        last_error: Option<&str>,
+        update: &ExecutionIntentStateUpdate,
+    ) -> Result<()> {
+        let previous_status = sqlx::query_scalar::<_, String>(
+            r#"
+            select status
+            from execution_intent
+            where id = $1
+            "#,
+        )
+        .bind(intent_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            update execution_intent
+            set status = $2,
+                last_error = $3,
+                market_ticker = coalesce($4, market_ticker),
+                side = coalesce($5, side),
+                client_order_id = coalesce($6, client_order_id),
+                exchange_order_id = coalesce($7, exchange_order_id),
+                fill_status = coalesce($8, fill_status),
+                submitted_at = case when $2 = 'submitted' and submitted_at is null then now() else submitted_at end,
+                acknowledged_at = case when $2 = 'acknowledged' and acknowledged_at is null then now() else acknowledged_at end,
+                cancelled_at = case when $2 in ('cancelled', 'cancel_pending') and cancelled_at is null then now() else cancelled_at end,
+                processed_at = case when $2 in ('opened', 'filled', 'partially_filled', 'cancelled', 'rejected', 'expired', 'superseded', 'orphaned') then now() else processed_at end,
+                last_transition_at = now()
+            where id = $1
+            "#,
+        )
+        .bind(intent_id)
+        .bind(status)
+        .bind(last_error)
+        .bind(&update.market_ticker)
+        .bind(&update.side)
+        .bind(&update.client_order_id)
+        .bind(&update.exchange_order_id)
+        .bind(&update.fill_status)
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            insert into execution_intent_transition (
+                intent_id,
+                from_status,
+                to_status,
+                last_error,
+                details_json
+            )
+            values ($1, $2, $3, $4, $5::jsonb)
+            "#,
+        )
+        .bind(intent_id)
+        .bind(previous_status)
+        .bind(status)
+        .bind(last_error)
+        .bind(&update.details_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn pending_execution_intent_status_counts(&self) -> Result<Vec<(String, i64)>> {
+        let rows = sqlx::query(
+            r#"
+            select status, count(*) as count
+            from execution_intent
+            group by status
+            order by status asc
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row.try_get::<String, _>("status").unwrap_or_default(),
+                    row.try_get::<i64, _>("count").unwrap_or_default(),
+                )
+            })
+            .collect())
+    }
+
+    pub async fn list_open_trades_for_exit(&self) -> Result<Vec<OpenTradeForExit>> {
+        let rows = sqlx::query_as::<_, OpenTradeForExitRow>(
+            r#"
+            select
+                id,
+                decision_id,
+                lane_key,
+                strategy_family,
+                mode,
+                quantity,
+                entry_price,
+                coalesce(entry_fee, (metadata_json->>'entry_fee')::double precision, 0) as entry_fee,
+                coalesce(market_id, (metadata_json->>'market_id')::bigint) as market_id,
+                market_ticker,
+                coalesce(side, metadata_json->>'side') as side,
+                created_at,
+                coalesce(timeout_seconds, (metadata_json->>'timeout_seconds')::integer, 0) as timeout_seconds,
+                coalesce(force_exit_buffer_seconds, (metadata_json->>'force_exit_buffer_seconds')::integer, 45) as force_exit_buffer_seconds,
+                coalesce(expires_at, (metadata_json->>'expires_at')::timestamptz) as expires_at,
+                exit_exchange_order_id,
+                exit_client_order_id,
+                exit_fill_status
+            from trade_lifecycle
+            where closed_at is null and status = 'open'
+            order by created_at asc
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    pub async fn list_open_live_trades_for_reconciliation(
+        &self,
+    ) -> Result<Vec<OpenLiveTradeForReconciliation>> {
+        let rows = sqlx::query_as::<_, OpenLiveTradeForReconciliationRow>(
+            r#"
+            select
+                id,
+                lane_key,
+                market_ticker,
+                side,
+                quantity,
+                entry_price,
+                entry_fee,
+                created_at,
+                entry_exchange_order_id,
+                entry_client_order_id,
+                exit_exchange_order_id,
+                exit_client_order_id
+            from trade_lifecycle
+            where mode = 'live'
+              and closed_at is null
+              and status = 'open'
+              and market_ticker is not null
+              and side is not null
+            order by created_at asc
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    pub async fn live_reconciliation_snapshot_for_trade(
+        &self,
+        trade: &OpenLiveTradeForReconciliation,
+    ) -> Result<LiveTradeReconciliationSnapshot> {
+        let contract_side = if trade.side == "buy_no" { "no" } else { "yes" };
+
+        let has_position = sqlx::query_scalar::<_, bool>(
+            r#"
+            select exists(
+                select 1
+                from live_position_sync
+                where market_ticker = $1
+                  and abs(position_count) >= 0.999
+            )
+            "#,
+        )
+        .bind(&trade.market_ticker)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let has_resting_order = sqlx::query_scalar::<_, bool>(
+            r#"
+            select exists(
+                select 1
+                from live_order_sync
+                where market_ticker = $1
+                  and (
+                    ($2 is not null and order_id = $2)
+                    or ($3 is not null and client_order_id = $3)
+                    or ($4 is not null and order_id = $4)
+                    or ($5 is not null and client_order_id = $5)
+                  )
+            )
+            "#,
+        )
+        .bind(&trade.market_ticker)
+        .bind(&trade.entry_exchange_order_id)
+        .bind(&trade.entry_client_order_id)
+        .bind(&trade.exit_exchange_order_id)
+        .bind(&trade.exit_client_order_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let exit_fill = sqlx::query_as::<_, LiveExitFillAggregateRow>(
+            r#"
+            select
+                coalesce(sum(count), 0) as fill_quantity,
+                case when coalesce(sum(count), 0) > 0
+                    then sum(count * case
+                        when side = 'yes' then yes_price
+                        else no_price
+                    end) / sum(count)
+                    else null end as avg_fill_price,
+                coalesce(sum(fee_paid), 0) as total_fee,
+                max(created_time) as latest_fill_time
+            from live_fill_sync
+            where market_ticker = $1
+              and action = 'sell'
+              and side = $2
+              and created_time >= $3
+              and (
+                ($4 is not null and order_id = $4)
+                or ($5 is not null and client_order_id = $5)
+                or (
+                    $4 is null and $5 is null
+                    and $6 is null and $7 is null
+                )
+              )
+            "#,
+        )
+        .bind(&trade.market_ticker)
+        .bind(contract_side)
+        .bind(trade.created_at)
+        .bind(&trade.exit_exchange_order_id)
+        .bind(&trade.exit_client_order_id)
+        .bind(&trade.entry_exchange_order_id)
+        .bind(&trade.entry_client_order_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(LiveTradeReconciliationSnapshot {
+            has_position,
+            has_resting_order,
+            matched_exit_fill_quantity: exit_fill.fill_quantity,
+            matched_exit_fill_price: exit_fill.avg_fill_price,
+            matched_exit_fill_fee: exit_fill.total_fee,
+            matched_exit_fill_time: exit_fill.latest_fill_time,
+        })
+    }
+
+    pub async fn reconcile_live_trades_from_sync(&self) -> Result<(usize, usize)> {
+        let open_live_trades = self.list_open_live_trades_for_reconciliation().await?;
+        let mut reconciled = 0usize;
+        let mut attention = 0usize;
+
+        for trade in open_live_trades {
+            let snapshot = self.live_reconciliation_snapshot_for_trade(&trade).await?;
+            let exit_progress = self.trade_exit_progress(trade.trade_id).await?;
+            let new_exit_quantity =
+                (snapshot.matched_exit_fill_quantity - exit_progress.closed_quantity).max(0.0);
+            let new_exit_fee = (snapshot.matched_exit_fill_fee - exit_progress.exit_fee).max(0.0);
+            if new_exit_quantity >= 0.99 && snapshot.matched_exit_fill_price.is_some() {
+                let delta_quantity = new_exit_quantity.min(trade.quantity);
+                let exit_price = snapshot
+                    .matched_exit_fill_price
+                    .unwrap_or(trade.entry_price);
+                let realized_pnl = ((exit_price - trade.entry_price) * delta_quantity)
+                    - proportional_entry_fee(trade.entry_fee, delta_quantity, trade.quantity)
+                    - new_exit_fee;
+                let metadata = json!({
+                    "exit_fee": new_exit_fee,
+                    "exit_status": "exchange_reconciled_fill",
+                    "exchange_reconciled_at": chrono::Utc::now(),
+                    "exchange_exit_fill_time": snapshot.matched_exit_fill_time,
+                    "exchange_exit_fill_quantity": snapshot.matched_exit_fill_quantity,
+                    "exchange_exit_delta_quantity": delta_quantity,
+                });
+                if delta_quantity + 0.01 >= trade.quantity && !snapshot.has_position {
+                    self.close_trade_with_metadata(
+                        trade.trade_id,
+                        exit_price,
+                        realized_pnl,
+                        "exchange_reconciled_exit",
+                        &metadata,
+                    )
+                    .await?;
+                } else {
+                    self.partially_close_trade_with_metadata(
+                        trade.trade_id,
+                        delta_quantity,
+                        exit_price,
+                        realized_pnl,
+                        "partial_exit",
+                        &metadata,
+                    )
+                    .await?;
+                }
+                reconciled += 1;
+                continue;
+            }
+
+            if live_trade_needs_attention(&trade, &snapshot) {
+                attention += 1;
+            }
+        }
+
+        Ok((reconciled, attention))
+    }
+
+    pub async fn trade_exit_progress(&self, trade_id: i64) -> Result<TradeExitProgress> {
+        let row = sqlx::query_as::<_, TradeExitProgressRow>(
+            r#"
+            select
+                coalesce(sum(quantity), 0) as closed_quantity,
+                coalesce(sum(coalesce(exit_fee, 0)), 0) as exit_fee
+            from trade_lifecycle
+            where parent_trade_id = $1
+              and closed_at is not null
+            "#,
+        )
+        .bind(trade_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.into())
+    }
+
+    pub async fn cancel_live_execution_intents(&self, reason: &str) -> Result<usize> {
+        let intent_ids = sqlx::query_scalar::<_, i64>(
+            r#"
+            select id
+            from execution_intent
+            where mode = 'live'
+              and status in ('pending', 'submitted', 'acknowledged', 'cancel_pending', 'partially_filled')
+            order by created_at asc
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        for intent_id in &intent_ids {
+            self.transition_execution_intent(
+                *intent_id,
+                "cancelled",
+                Some(reason),
+                &ExecutionIntentStateUpdate {
+                    details_json: json!({"operator_action": "cancel_pending_live_orders"}),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        }
+
+        Ok(intent_ids.len())
+    }
+
+    pub async fn close_trade(
+        &self,
+        trade_id: i64,
+        exit_price: f64,
+        realized_pnl: f64,
+        status: &str,
+    ) -> Result<()> {
+        self.close_trade_with_metadata(trade_id, exit_price, realized_pnl, status, &json!({}))
+            .await
+    }
+
+    pub async fn close_trade_with_metadata(
+        &self,
+        trade_id: i64,
+        exit_price: f64,
+        realized_pnl: f64,
+        status: &str,
+        extra_metadata: &serde_json::Value,
+    ) -> Result<()> {
+        let trade = sqlx::query_as::<_, CloseTradeRow>(
+            r#"
+            select lane_key, mode
+            from trade_lifecycle
+            where id = $1
+            "#,
+        )
+        .bind(trade_id)
+        .fetch_one(&self.pool)
+        .await?;
+        let exit_fee = json_f64(extra_metadata, "exit_fee");
+        let exit_exchange_order_id = extra_metadata
+            .get("exit_order_id")
+            .and_then(serde_json::Value::as_str);
+        let exit_client_order_id = extra_metadata
+            .get("exit_client_order_id")
+            .and_then(serde_json::Value::as_str);
+        let exit_fill_status = extra_metadata
+            .get("exit_status")
+            .and_then(serde_json::Value::as_str);
+        sqlx::query(
+            r#"
+            update trade_lifecycle
+            set exit_price = $2,
+                realized_pnl = $3,
+                status = $4,
+                exit_fee = coalesce($5, exit_fee, 0),
+                exit_exchange_order_id = coalesce($6, exit_exchange_order_id),
+                exit_client_order_id = coalesce($7, exit_client_order_id),
+                exit_fill_status = coalesce($8, exit_fill_status),
+                metadata_json = coalesce(metadata_json, '{}'::jsonb) || $9::jsonb,
+                closed_at = now()
+            where id = $1
+            "#,
+        )
+        .bind(trade_id)
+        .bind(exit_price)
+        .bind(realized_pnl)
+        .bind(status)
+        .bind(exit_fee)
+        .bind(exit_exchange_order_id)
+        .bind(exit_client_order_id)
+        .bind(exit_fill_status)
+        .bind(extra_metadata)
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            r#"
+            update lane_state
+            set recent_pnl = recent_pnl + $2,
+                updated_at = now()
+            where lane_key = $1
+            "#,
+        )
+        .bind(&trade.lane_key)
+        .bind(realized_pnl)
+        .execute(&self.pool)
+        .await?;
+        if TradeMode::from(trade.mode) == TradeMode::Paper {
+            self.reconcile_bankroll_for_mode(trade.mode.into()).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn partially_close_trade_with_metadata(
+        &self,
+        trade_id: i64,
+        exit_quantity: f64,
+        exit_price: f64,
+        realized_pnl: f64,
+        status: &str,
+        extra_metadata: &serde_json::Value,
+    ) -> Result<i64> {
+        let trade = sqlx::query_as::<_, TradeLifecycleRow>(
+            r#"
+            select
+                id,
+                parent_trade_id,
+                decision_id,
+                lane_key,
+                strategy_family,
+                mode,
+                status,
+                quantity,
+                entry_price,
+                coalesce(entry_fee, 0) as entry_fee,
+                market_id,
+                market_ticker,
+                side,
+                timeout_seconds,
+                force_exit_buffer_seconds,
+                expires_at,
+                entry_exchange_order_id,
+                entry_client_order_id,
+                entry_fill_status,
+                metadata_json,
+                created_at
+            from trade_lifecycle
+            where id = $1
+              and closed_at is null
+              and status = 'open'
+            "#,
+        )
+        .bind(trade_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        if exit_quantity + 0.01 >= trade.quantity {
+            self.close_trade_with_metadata(
+                trade_id,
+                exit_price,
+                realized_pnl,
+                status,
+                extra_metadata,
+            )
+            .await?;
+            return Ok(trade_id);
+        }
+
+        let exit_fee = json_f64(extra_metadata, "exit_fee");
+        let exit_exchange_order_id = extra_metadata
+            .get("exit_order_id")
+            .and_then(serde_json::Value::as_str);
+        let exit_client_order_id = extra_metadata
+            .get("exit_client_order_id")
+            .and_then(serde_json::Value::as_str);
+        let exit_fill_status = extra_metadata
+            .get("exit_status")
+            .and_then(serde_json::Value::as_str);
+
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            r#"
+            update trade_lifecycle
+            set quantity = quantity - $2,
+                exit_fee = coalesce($3, exit_fee, 0),
+                exit_exchange_order_id = coalesce($4, exit_exchange_order_id),
+                exit_client_order_id = coalesce($5, exit_client_order_id),
+                exit_fill_status = coalesce($6, exit_fill_status),
+                metadata_json = coalesce(metadata_json, '{}'::jsonb) || $7::jsonb
+            where id = $1
+            "#,
+        )
+        .bind(trade_id)
+        .bind(exit_quantity)
+        .bind(exit_fee)
+        .bind(exit_exchange_order_id)
+        .bind(exit_client_order_id)
+        .bind(exit_fill_status)
+        .bind(json!({
+            "last_partial_exit_at": chrono::Utc::now(),
+            "last_partial_exit_quantity": exit_quantity,
+        }))
+        .execute(&mut *tx)
+        .await?;
+
+        let partial_trade_id = sqlx::query_scalar(
+            r#"
+            insert into trade_lifecycle (
+                parent_trade_id,
+                decision_id,
+                lane_key,
+                strategy_family,
+                mode,
+                status,
+                quantity,
+                entry_price,
+                exit_price,
+                realized_pnl,
+                market_id,
+                market_ticker,
+                side,
+                timeout_seconds,
+                force_exit_buffer_seconds,
+                expires_at,
+                entry_fee,
+                entry_exchange_order_id,
+                entry_client_order_id,
+                entry_fill_status,
+                exit_fee,
+                exit_exchange_order_id,
+                exit_client_order_id,
+                exit_fill_status,
+                metadata_json,
+                created_at,
+                closed_at
+            )
+            values (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
+                $21, $22, $23, $24, $25::jsonb, $26, now()
+            )
+            returning id
+            "#,
+        )
+        .bind(trade.id)
+        .bind(trade.decision_id)
+        .bind(&trade.lane_key)
+        .bind(trade.strategy_family)
+        .bind(trade.mode)
+        .bind(status)
+        .bind(exit_quantity)
+        .bind(trade.entry_price)
+        .bind(exit_price)
+        .bind(realized_pnl)
+        .bind(trade.market_id)
+        .bind(&trade.market_ticker)
+        .bind(&trade.side)
+        .bind(trade.timeout_seconds)
+        .bind(trade.force_exit_buffer_seconds)
+        .bind(trade.expires_at)
+        .bind(proportional_entry_fee(
+            trade.entry_fee,
+            exit_quantity,
+            trade.quantity,
+        ))
+        .bind(&trade.entry_exchange_order_id)
+        .bind(&trade.entry_client_order_id)
+        .bind(&trade.entry_fill_status)
+        .bind(exit_fee)
+        .bind(exit_exchange_order_id)
+        .bind(exit_client_order_id)
+        .bind(exit_fill_status)
+        .bind(merge_json(trade.metadata_json, extra_metadata.clone()))
+        .bind(trade.created_at)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            r#"
+            update lane_state
+            set recent_pnl = recent_pnl + $2,
+                updated_at = now()
+            where lane_key = $1
+            "#,
+        )
+        .bind(&trade.lane_key)
+        .bind(realized_pnl)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        if TradeMode::from(trade.mode) == TradeMode::Paper {
+            self.reconcile_bankroll_for_mode(trade.mode.into()).await?;
+        }
+        Ok(partial_trade_id)
+    }
+
+    pub async fn update_live_trade_exit_order(
+        &self,
+        trade_id: i64,
+        exit_exchange_order_id: Option<&str>,
+        exit_client_order_id: Option<&str>,
+        exit_fill_status: Option<&str>,
+        extra_metadata: &serde_json::Value,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            update trade_lifecycle
+            set exit_exchange_order_id = coalesce($2, exit_exchange_order_id),
+                exit_client_order_id = coalesce($3, exit_client_order_id),
+                exit_fill_status = coalesce($4, exit_fill_status),
+                metadata_json = coalesce(metadata_json, '{}'::jsonb) || $5::jsonb
+            where id = $1
+              and mode = 'live'
+              and closed_at is null
+            "#,
+        )
+        .bind(trade_id)
+        .bind(exit_exchange_order_id)
+        .bind(exit_client_order_id)
+        .bind(exit_fill_status)
+        .bind(extra_metadata)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_unnotified_closed_trades(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<ClosedTradeNotification>> {
+        let rows = sqlx::query_as::<_, ClosedTradeNotificationRow>(
+            r#"
+            select
+                id,
+                lane_key,
+                strategy_family,
+                mode,
+                quantity,
+                entry_price,
+                exit_price,
+                realized_pnl,
+                closed_at
+            from trade_lifecycle
+            where closed_at is not null
+              and coalesce(metadata_json->>'notified', 'false') <> 'true'
+            order by closed_at asc
+            limit $1
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    pub async fn mark_trade_notified(&self, trade_id: i64) -> Result<()> {
+        sqlx::query(
+            r#"
+            update trade_lifecycle
+            set metadata_json = coalesce(metadata_json, '{}'::jsonb) || '{"notified": true}'::jsonb
+            where id = $1
+            "#,
+        )
+        .bind(trade_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_recent_feature_snapshots(
+        &self,
+        symbol: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<MarketFeatureSnapshotRecord>> {
+        let rows = if let Some(symbol) = symbol {
+            sqlx::query_as::<_, FeatureSnapshotRow>(
+                r#"
+                select
+                    id,
+                    market_id,
+                    exchange,
+                    symbol,
+                    window_minutes,
+                    seconds_to_expiry,
+                    time_to_expiry_bucket,
+                    feature_version,
+                    venue_features_json,
+                    settlement_features_json,
+                    external_reference_json,
+                    venue_quality_json,
+                    created_at
+                from market_feature_snapshot
+                where symbol = $1
+                order by created_at asc, id asc
+                limit $2
+                "#,
+            )
+            .bind(symbol)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, FeatureSnapshotRow>(
+                r#"
+                select
+                    id,
+                    market_id,
+                    exchange,
+                    symbol,
+                    window_minutes,
+                    seconds_to_expiry,
+                    time_to_expiry_bucket,
+                    feature_version,
+                    venue_features_json,
+                    settlement_features_json,
+                    external_reference_json,
+                    venue_quality_json,
+                    created_at
+                from market_feature_snapshot
+                order by created_at asc, id asc
+                limit $1
+                "#,
+            )
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub async fn champion_model_for_symbol(
+        &self,
+        symbol: &str,
+        strategy_family: StrategyFamily,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .latest_lane_policy_for_symbol(symbol, strategy_family)
+            .await?
+            .and_then(|policy| policy.current_champion_model))
+    }
+
+    pub async fn reconcile_bankroll_for_mode(&self, mode: TradeMode) -> Result<()> {
+        let scope = match mode {
+            TradeMode::Paper => "paper",
+            TradeMode::Live => "live",
+        };
+        let base_bankroll = self
+            .bootstrap_bankroll(scope, mode)
+            .await?
+            .unwrap_or_default();
+        let aggregates = sqlx::query_as::<_, TradeAggregateRow>(
+            r#"
+            select
+                coalesce(sum(
+                    case
+                        when closed_at is null and status not in ('closed', 'cancelled')
+                        then quantity * entry_price
+                        else 0
+                    end
+                ), 0) as open_exposure,
+                coalesce(sum(
+                    case
+                        when closed_at is not null then coalesce(realized_pnl, 0)
+                        else 0
+                    end
+                ), 0) as realized_pnl
+            from trade_lifecycle
+            where mode = $1
+            "#,
+        )
+        .bind(SqlTradeMode::from(mode))
+        .fetch_one(&self.pool)
+        .await?;
+        let bankroll = (base_bankroll + aggregates.realized_pnl).max(0.0);
+        let deployable_balance = (bankroll - aggregates.open_exposure).max(0.0);
+        sqlx::query(
+            r#"
+            insert into bankroll_snapshot (
+                scope, mode, strategy_family, bankroll, deployable_balance, open_exposure,
+                realized_pnl, unrealized_pnl
+            )
+            values ($1, $2, $3, $4, $5, $6, $7, 0)
+            "#,
+        )
+        .bind(scope)
+        .bind(SqlTradeMode::from(mode))
+        .bind(SqlStrategyFamily::Portfolio)
+        .bind(bankroll)
+        .bind(deployable_balance)
+        .bind(aggregates.open_exposure)
+        .bind(aggregates.realized_pnl)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn list_latest_bankrolls(&self) -> Result<Vec<BankrollCard>> {
+        let rows = sqlx::query_as::<_, BankrollRow>(
+            r#"
+            select scope, mode, strategy_family, bankroll, deployable_balance, open_exposure,
+                   realized_pnl, unrealized_pnl, created_at
+            from bankroll_snapshot
+            order by created_at desc
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
+
+        let mut seen = std::collections::BTreeSet::new();
+        let mut out = Vec::new();
+        for row in rows {
+            let key = format!(
+                "{}:{}:{}",
+                row.scope,
+                row.mode.as_key(),
+                row.strategy_family.as_key()
+            );
+            if seen.insert(key) {
+                out.push(row.into());
+            }
+        }
+        Ok(out)
+    }
+
+    async fn list_lane_states(&self) -> Result<Vec<LaneState>> {
+        let rows = sqlx::query_as::<_, LaneStateRow>(
+            r#"
+            with ranked as (
+                select
+                    lane_key,
+                    promotion_state,
+                    promotion_reason,
+                    recent_pnl,
+                    recent_brier,
+                    recent_execution_quality,
+                    recent_replay_expectancy,
+                    quarantine_reason,
+                    current_champion_model,
+                    row_number() over (
+                        partition by split_part(lane_key, ':', 2), split_part(lane_key, ':', 5)
+                        order by updated_at desc
+                    ) as rn
+                from lane_state
+            )
+            select lane_key, promotion_state, promotion_reason, recent_pnl, recent_brier, recent_execution_quality,
+                   recent_replay_expectancy, quarantine_reason, current_champion_model
+            from ranked
+            where rn = 1
+            order by
+                case promotion_state
+                    when 'live_scaled' then 0
+                    when 'live_micro' then 1
+                    when 'paper_active' then 2
+                    when 'shadow' then 3
+                    when 'quarantined' then 4
+                    else 5
+                end,
+                recent_replay_expectancy desc,
+                recent_pnl desc
+            limit 8
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn list_open_trades(&self) -> Result<Vec<OpenTradeSummary>> {
+        let rows = sqlx::query_as::<_, OpenTradeRow>(
+            r#"
+            select id, lane_key, strategy_family, mode, quantity, entry_price, created_at, status
+            from trade_lifecycle
+            where closed_at is null and status not in ('closed', 'cancelled')
+            order by created_at desc
+            limit 12
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn list_latest_opportunities(&self, limit: i64) -> Result<Vec<OpportunityCard>> {
+        let rows = sqlx::query(
+            r#"
+            with ranked as (
+                select
+                    id,
+                    lane_key,
+                    strategy_family,
+                    side,
+                    market_prob,
+                    model_prob,
+                    edge,
+                    confidence,
+                    approved,
+                    reasons_json,
+                    created_at,
+                    row_number() over (partition by lane_key order by created_at desc, id desc) as rn
+                from opportunity_decision
+            )
+            select id, lane_key, strategy_family, side, market_prob, model_prob, edge, confidence, approved, reasons_json, created_at, rn
+            from ranked
+            where rn = 1
+            order by created_at desc
+            limit $1
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut opportunities = Vec::with_capacity(rows.len());
+        for row in rows {
+            let strategy_family =
+                parse_strategy_family(row.try_get::<String, _>("strategy_family")?.as_str());
+            let reasons_json: serde_json::Value = row.try_get("reasons_json")?;
+            opportunities.push(OpportunityCard {
+                lane_key: row.try_get("lane_key")?,
+                strategy_family,
+                side: row.try_get("side")?,
+                market_prob: row.try_get("market_prob")?,
+                model_prob: row.try_get("model_prob")?,
+                edge: row.try_get("edge")?,
+                confidence: row.try_get("confidence")?,
+                approved: row.try_get("approved")?,
+                reasons: reasons_json
+                    .as_array()
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| item.as_str().map(ToOwned::to_owned))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                as_of: row.try_get("created_at")?,
+            });
+        }
+        Ok(opportunities)
+    }
+
+    async fn insert_bankroll_seed(
+        &self,
+        scope: &str,
+        bankroll: f64,
+        mode: SqlTradeMode,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            insert into bankroll_snapshot (
+                scope, mode, strategy_family, bankroll, deployable_balance, open_exposure,
+                realized_pnl, unrealized_pnl
+            )
+            values ($1, $2, $3, $4, $4, 0, 0, 0)
+            "#,
+        )
+        .bind(scope)
+        .bind(mode)
+        .bind(SqlStrategyFamily::Portfolio)
+        .bind(bankroll)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn ensure_bootstrap_bankroll(
+        &self,
+        scope: &str,
+        bankroll: f64,
+        mode: SqlTradeMode,
+    ) -> Result<()> {
+        let snapshot_count: i64 = sqlx::query_scalar(
+            r#"
+            select count(*)
+            from bankroll_snapshot
+            where scope = $1 and mode = $2 and strategy_family = $3
+            "#,
+        )
+        .bind(scope)
+        .bind(mode)
+        .bind(SqlStrategyFamily::Portfolio)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(0);
+
+        if snapshot_count == 0 {
+            self.insert_bankroll_seed(scope, bankroll, mode).await?;
+            return Ok(());
+        }
+
+        if snapshot_count == 1 {
+            let row = sqlx::query_as::<_, BootstrapBankrollRow>(
+                r#"
+                select id, open_exposure, realized_pnl, unrealized_pnl
+                from bankroll_snapshot
+                where scope = $1 and mode = $2 and strategy_family = $3
+                order by created_at desc
+                limit 1
+                "#,
+            )
+            .bind(scope)
+            .bind(mode)
+            .bind(SqlStrategyFamily::Portfolio)
+            .fetch_optional(&self.pool)
+            .await?;
+
+            if let Some(row) = row {
+                let is_bootstrap_only = row.open_exposure.abs() < f64::EPSILON
+                    && row.realized_pnl.abs() < f64::EPSILON
+                    && row.unrealized_pnl.abs() < f64::EPSILON;
+
+                if is_bootstrap_only {
+                    sqlx::query(
+                        r#"
+                        update bankroll_snapshot
+                        set bankroll = $2, deployable_balance = $2
+                        where id = $1
+                        "#,
+                    )
+                    .bind(row.id)
+                    .bind(bankroll)
+                    .execute(&self.pool)
+                    .await?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn bootstrap_bankroll(&self, scope: &str, mode: TradeMode) -> Result<Option<f64>> {
+        let bankroll = sqlx::query_scalar::<_, f64>(
+            r#"
+            select bankroll
+            from bankroll_snapshot
+            where scope = $1 and mode = $2 and strategy_family = $3
+            order by created_at asc, id asc
+            limit 1
+            "#,
+        )
+        .bind(scope)
+        .bind(SqlTradeMode::from(mode))
+        .bind(SqlStrategyFamily::Portfolio)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(bankroll)
+    }
+}
+
+fn count_state(lanes: &[LaneState], state: PromotionState) -> i64 {
+    lanes
+        .iter()
+        .filter(|lane| lane.promotion_state == state)
+        .count() as i64
+}
+
+fn overall_readiness_status(lanes: &[LaneState]) -> String {
+    if lanes
+        .iter()
+        .any(|lane| lane.promotion_state == PromotionState::LiveScaled)
+    {
+        return "live_active".to_string();
+    }
+    if lanes
+        .iter()
+        .any(|lane| lane.promotion_state == PromotionState::LiveMicro)
+    {
+        return "live_micro_active".to_string();
+    }
+    let paper_active = lanes
+        .iter()
+        .filter(|lane| lane.promotion_state == PromotionState::PaperActive)
+        .count();
+    let quarantined = lanes
+        .iter()
+        .filter(|lane| lane.promotion_state == PromotionState::Quarantined)
+        .count();
+    if paper_active > 0 && quarantined == 0 {
+        return "promotion_candidate".to_string();
+    }
+    if quarantined > 0 {
+        return "attention_needed".to_string();
+    }
+    "shadow_only".to_string()
+}
+
+#[derive(sqlx::FromRow)]
+struct BankrollRow {
+    scope: String,
+    mode: SqlTradeMode,
+    strategy_family: SqlStrategyFamily,
+    bankroll: f64,
+    deployable_balance: f64,
+    open_exposure: f64,
+    realized_pnl: f64,
+    unrealized_pnl: f64,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+struct LaneStateRow {
+    lane_key: String,
+    promotion_state: SqlPromotionState,
+    promotion_reason: Option<String>,
+    recent_pnl: f64,
+    recent_brier: f64,
+    recent_execution_quality: f64,
+    recent_replay_expectancy: f64,
+    quarantine_reason: Option<String>,
+    current_champion_model: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
+struct OpenTradeRow {
+    id: i64,
+    lane_key: String,
+    strategy_family: SqlStrategyFamily,
+    mode: SqlTradeMode,
+    quantity: f64,
+    entry_price: f64,
+    created_at: DateTime<Utc>,
+    status: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct LaneTradeRow {
+    id: i64,
+    status: String,
+    mode: SqlTradeMode,
+    quantity: f64,
+    entry_price: f64,
+    exit_price: Option<f64>,
+    realized_pnl: Option<f64>,
+    created_at: DateTime<Utc>,
+    closed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(sqlx::FromRow)]
+struct OpportunityRow {
+    id: i64,
+    lane_key: String,
+    strategy_family: SqlStrategyFamily,
+    side: String,
+    market_prob: f64,
+    model_prob: f64,
+    edge: f64,
+    confidence: f64,
+    approved: bool,
+    reasons_json: serde_json::Value,
+    created_at: DateTime<Utc>,
+    rn: i32,
+}
+
+#[derive(sqlx::FromRow)]
+struct BootstrapBankrollRow {
+    id: i64,
+    open_exposure: f64,
+    realized_pnl: f64,
+    unrealized_pnl: f64,
+}
+
+#[derive(sqlx::FromRow)]
+struct TradeAggregateRow {
+    open_exposure: f64,
+    realized_pnl: f64,
+}
+
+#[derive(sqlx::FromRow)]
+struct RecentTradeMetricsRow {
+    trade_count: i64,
+    win_count: i64,
+    realized_pnl: f64,
+}
+
+#[derive(sqlx::FromRow)]
+struct WorkerStatusRow {
+    service: String,
+    status: String,
+    last_started_at: Option<DateTime<Utc>>,
+    last_succeeded_at: Option<DateTime<Utc>>,
+    last_failed_at: Option<DateTime<Utc>>,
+    last_error: Option<String>,
+    details_json: serde_json::Value,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+struct ProbabilityCalibrationRow {
+    mean_error: f64,
+    sample_count: i32,
+}
+
+#[derive(Debug, Clone)]
+pub struct HistoricalReplayExampleInsert {
+    pub source: String,
+    pub source_key: String,
+    pub exchange: String,
+    pub symbol: String,
+    pub strategy_family: StrategyFamily,
+    pub market_id: Option<i64>,
+    pub market_slug: String,
+    pub recorded_at: DateTime<Utc>,
+    pub resolved_yes_probability: f64,
+    pub market_prob: f64,
+    pub time_to_expiry_bucket: String,
+    pub feature_version: String,
+    pub feature_vector_json: serde_json::Value,
+    pub metadata_json: serde_json::Value,
+}
+
+#[derive(sqlx::FromRow)]
+struct HistoricalReplayExampleRow {
+    lane_key: String,
+    time_to_expiry_bucket: String,
+    resolved_yes_probability: f64,
+    market_prob: f64,
+    feature_vector_json: serde_json::Value,
+}
+
+#[derive(sqlx::FromRow)]
+struct ModelBenchmarkRunRow {
+    id: i64,
+    source: String,
+    example_count: i32,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+struct ModelBenchmarkResultRow {
+    model_name: String,
+    rank: i32,
+    brier: f64,
+    execution_pnl: f64,
+    sample_count: i32,
+    trade_count: i32,
+    win_rate: f64,
+}
+
+#[derive(sqlx::FromRow)]
+struct LiveExchangeSyncStatusRow {
+    source: String,
+    synced_at: DateTime<Utc>,
+    positions_count: i32,
+    resting_orders_count: i32,
+    recent_fills_count: i32,
+    local_open_live_trades_count: i32,
+    status: String,
+    issues_json: serde_json::Value,
+    details_json: serde_json::Value,
+}
+
+#[derive(sqlx::FromRow)]
+struct OperatorControlStateRow {
+    live_order_placement_enabled: bool,
+    updated_by: Option<String>,
+    note: Option<String>,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+struct FeatureSnapshotRow {
+    id: i64,
+    market_id: i64,
+    exchange: String,
+    symbol: String,
+    window_minutes: i32,
+    seconds_to_expiry: i32,
+    time_to_expiry_bucket: String,
+    feature_version: String,
+    venue_features_json: serde_json::Value,
+    settlement_features_json: serde_json::Value,
+    external_reference_json: serde_json::Value,
+    venue_quality_json: serde_json::Value,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+struct PendingExecutionIntentRow {
+    intent_id: i64,
+    decision_id: i64,
+    market_id: i64,
+    lane_key: String,
+    strategy_family: SqlStrategyFamily,
+    side: String,
+    market_prob: f64,
+    recommended_size: f64,
+    mode: SqlTradeMode,
+    timeout_seconds: i32,
+    force_exit_buffer_seconds: i32,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+struct ActiveLiveExecutionIntentRow {
+    intent_id: i64,
+    decision_id: i64,
+    market_id: i64,
+    lane_key: String,
+    strategy_family: SqlStrategyFamily,
+    side: String,
+    market_prob: f64,
+    recommended_size: f64,
+    mode: SqlTradeMode,
+    timeout_seconds: i32,
+    force_exit_buffer_seconds: i32,
+    created_at: DateTime<Utc>,
+    status: String,
+    market_ticker: Option<String>,
+    client_order_id: Option<String>,
+    exchange_order_id: Option<String>,
+    fill_status: Option<String>,
+    last_transition_at: DateTime<Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+struct OpenTradeForExitRow {
+    id: i64,
+    decision_id: Option<i64>,
+    lane_key: String,
+    strategy_family: SqlStrategyFamily,
+    mode: SqlTradeMode,
+    quantity: f64,
+    entry_price: f64,
+    entry_fee: f64,
+    market_id: i64,
+    market_ticker: Option<String>,
+    side: String,
+    created_at: DateTime<Utc>,
+    timeout_seconds: i32,
+    force_exit_buffer_seconds: i32,
+    expires_at: Option<DateTime<Utc>>,
+    exit_exchange_order_id: Option<String>,
+    exit_client_order_id: Option<String>,
+    exit_fill_status: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
+struct OpenLiveTradeForReconciliationRow {
+    id: i64,
+    lane_key: String,
+    market_ticker: String,
+    side: String,
+    quantity: f64,
+    entry_price: f64,
+    entry_fee: f64,
+    created_at: DateTime<Utc>,
+    entry_exchange_order_id: Option<String>,
+    entry_client_order_id: Option<String>,
+    exit_exchange_order_id: Option<String>,
+    exit_client_order_id: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
+struct LiveExitFillAggregateRow {
+    fill_quantity: f64,
+    avg_fill_price: Option<f64>,
+    total_fee: f64,
+    latest_fill_time: Option<DateTime<Utc>>,
+}
+
+#[derive(sqlx::FromRow)]
+struct TradeExitProgressRow {
+    closed_quantity: f64,
+    exit_fee: f64,
+}
+
+#[derive(sqlx::FromRow)]
+struct ClosedTradeNotificationRow {
+    id: i64,
+    lane_key: String,
+    strategy_family: SqlStrategyFamily,
+    mode: SqlTradeMode,
+    quantity: f64,
+    entry_price: f64,
+    exit_price: Option<f64>,
+    realized_pnl: Option<f64>,
+    closed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(sqlx::FromRow)]
+struct CloseTradeRow {
+    lane_key: String,
+    mode: SqlTradeMode,
+}
+
+#[allow(dead_code)]
+#[derive(sqlx::FromRow)]
+struct TradeLifecycleRow {
+    id: i64,
+    parent_trade_id: Option<i64>,
+    decision_id: Option<i64>,
+    lane_key: String,
+    strategy_family: SqlStrategyFamily,
+    mode: SqlTradeMode,
+    status: String,
+    quantity: f64,
+    entry_price: f64,
+    entry_fee: f64,
+    market_id: Option<i64>,
+    market_ticker: Option<String>,
+    side: Option<String>,
+    timeout_seconds: Option<i32>,
+    force_exit_buffer_seconds: Option<i32>,
+    expires_at: Option<DateTime<Utc>>,
+    entry_exchange_order_id: Option<String>,
+    entry_client_order_id: Option<String>,
+    entry_fill_status: Option<String>,
+    metadata_json: serde_json::Value,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+struct LivePositionSyncRow {
+    market_ticker: String,
+    position_count: f64,
+    resting_order_count: i32,
+    market_exposure: f64,
+    realized_pnl: f64,
+    synced_at: DateTime<Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+struct LiveOrderSyncListRow {
+    order_id: String,
+    client_order_id: Option<String>,
+    market_ticker: Option<String>,
+    action: Option<String>,
+    side: Option<String>,
+    status: Option<String>,
+    count: f64,
+    fill_count: f64,
+    remaining_count: f64,
+    created_time: Option<DateTime<Utc>>,
+    synced_at: DateTime<Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+struct LiveFillSyncListRow {
+    fill_id: String,
+    order_id: Option<String>,
+    client_order_id: Option<String>,
+    market_ticker: Option<String>,
+    action: Option<String>,
+    side: Option<String>,
+    count: f64,
+    fee_paid: f64,
+    created_time: Option<DateTime<Utc>>,
+    synced_at: DateTime<Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+struct LiveIntentRow {
+    intent_id: i64,
+    lane_key: String,
+    mode: SqlTradeMode,
+    status: String,
+    last_error: Option<String>,
+    market_ticker: Option<String>,
+    side: Option<String>,
+    client_order_id: Option<String>,
+    exchange_order_id: Option<String>,
+    fill_status: Option<String>,
+    created_at: DateTime<Utc>,
+    last_transition_at: DateTime<Utc>,
+}
+
+#[derive(sqlx::Type, Clone, Copy)]
+#[sqlx(type_name = "text", rename_all = "snake_case")]
+enum SqlStrategyFamily {
+    Portfolio,
+    DirectionalSettlement,
+    PreSettlementScalp,
+}
+
+impl SqlStrategyFamily {
+    fn as_key(self) -> &'static str {
+        match self {
+            Self::Portfolio => "portfolio",
+            Self::DirectionalSettlement => "directional_settlement",
+            Self::PreSettlementScalp => "pre_settlement_scalp",
+        }
+    }
+}
+
+impl From<SqlStrategyFamily> for StrategyFamily {
+    fn from(value: SqlStrategyFamily) -> Self {
+        match value {
+            SqlStrategyFamily::Portfolio => StrategyFamily::Portfolio,
+            SqlStrategyFamily::DirectionalSettlement => StrategyFamily::DirectionalSettlement,
+            SqlStrategyFamily::PreSettlementScalp => StrategyFamily::PreSettlementScalp,
+        }
+    }
+}
+
+impl From<StrategyFamily> for SqlStrategyFamily {
+    fn from(value: StrategyFamily) -> Self {
+        match value {
+            StrategyFamily::Portfolio => SqlStrategyFamily::Portfolio,
+            StrategyFamily::DirectionalSettlement => SqlStrategyFamily::DirectionalSettlement,
+            StrategyFamily::PreSettlementScalp => SqlStrategyFamily::PreSettlementScalp,
+        }
+    }
+}
+
+#[derive(sqlx::Type, Clone, Copy)]
+#[sqlx(type_name = "text", rename_all = "snake_case")]
+enum SqlTradeMode {
+    Paper,
+    Live,
+}
+
+impl SqlTradeMode {
+    fn as_key(self) -> &'static str {
+        match self {
+            Self::Paper => "paper",
+            Self::Live => "live",
+        }
+    }
+}
+
+impl From<SqlTradeMode> for TradeMode {
+    fn from(value: SqlTradeMode) -> Self {
+        match value {
+            SqlTradeMode::Paper => TradeMode::Paper,
+            SqlTradeMode::Live => TradeMode::Live,
+        }
+    }
+}
+
+impl From<TradeMode> for SqlTradeMode {
+    fn from(value: TradeMode) -> Self {
+        match value {
+            TradeMode::Paper => SqlTradeMode::Paper,
+            TradeMode::Live => SqlTradeMode::Live,
+        }
+    }
+}
+
+#[derive(sqlx::Type, Clone, Copy, PartialEq, Eq)]
+#[sqlx(type_name = "text", rename_all = "snake_case")]
+enum SqlPromotionState {
+    Shadow,
+    PaperActive,
+    LiveMicro,
+    LiveScaled,
+    Quarantined,
+}
+
+impl SqlPromotionState {
+    fn as_key(self) -> &'static str {
+        match self {
+            Self::Shadow => "shadow",
+            Self::PaperActive => "paper_active",
+            Self::LiveMicro => "live_micro",
+            Self::LiveScaled => "live_scaled",
+            Self::Quarantined => "quarantined",
+        }
+    }
+}
+
+impl From<SqlPromotionState> for PromotionState {
+    fn from(value: SqlPromotionState) -> Self {
+        match value {
+            SqlPromotionState::Shadow => PromotionState::Shadow,
+            SqlPromotionState::PaperActive => PromotionState::PaperActive,
+            SqlPromotionState::LiveMicro => PromotionState::LiveMicro,
+            SqlPromotionState::LiveScaled => PromotionState::LiveScaled,
+            SqlPromotionState::Quarantined => PromotionState::Quarantined,
+        }
+    }
+}
+
+impl From<PromotionState> for SqlPromotionState {
+    fn from(value: PromotionState) -> Self {
+        match value {
+            PromotionState::Shadow => SqlPromotionState::Shadow,
+            PromotionState::PaperActive => SqlPromotionState::PaperActive,
+            PromotionState::LiveMicro => SqlPromotionState::LiveMicro,
+            PromotionState::LiveScaled => SqlPromotionState::LiveScaled,
+            PromotionState::Quarantined => SqlPromotionState::Quarantined,
+        }
+    }
+}
+
+impl From<BankrollRow> for BankrollCard {
+    fn from(value: BankrollRow) -> Self {
+        Self {
+            scope: value.scope,
+            mode: value.mode.into(),
+            strategy_family: value.strategy_family.into(),
+            bankroll: value.bankroll,
+            deployable_balance: value.deployable_balance,
+            open_exposure: value.open_exposure,
+            realized_pnl: value.realized_pnl,
+            unrealized_pnl: value.unrealized_pnl,
+            as_of: value.created_at,
+        }
+    }
+}
+
+impl From<LaneStateRow> for LaneState {
+    fn from(value: LaneStateRow) -> Self {
+        Self {
+            lane_key: value.lane_key,
+            promotion_state: value.promotion_state.into(),
+            promotion_reason: value.promotion_reason,
+            recent_pnl: value.recent_pnl,
+            recent_brier: value.recent_brier,
+            recent_execution_quality: value.recent_execution_quality,
+            recent_replay_expectancy: value.recent_replay_expectancy,
+            quarantine_reason: value.quarantine_reason,
+            current_champion_model: value.current_champion_model,
+        }
+    }
+}
+
+impl From<LaneStateRow> for SymbolLanePolicy {
+    fn from(value: LaneStateRow) -> Self {
+        Self {
+            lane_key: value.lane_key,
+            promotion_state: value.promotion_state.into(),
+            promotion_reason: value.promotion_reason,
+            recent_pnl: value.recent_pnl,
+            recent_brier: value.recent_brier,
+            recent_execution_quality: value.recent_execution_quality,
+            recent_replay_expectancy: value.recent_replay_expectancy,
+            quarantine_reason: value.quarantine_reason,
+            current_champion_model: value.current_champion_model,
+        }
+    }
+}
+
+impl From<OpenTradeRow> for OpenTradeSummary {
+    fn from(value: OpenTradeRow) -> Self {
+        Self {
+            trade_id: value.id,
+            lane_key: value.lane_key,
+            strategy_family: value.strategy_family.into(),
+            mode: value.mode.into(),
+            quantity: value.quantity,
+            entry_price: value.entry_price,
+            created_at: value.created_at,
+            status: value.status,
+        }
+    }
+}
+
+impl From<LaneTradeRow> for LaneTradeCard {
+    fn from(value: LaneTradeRow) -> Self {
+        Self {
+            trade_id: value.id,
+            status: value.status,
+            mode: value.mode.into(),
+            quantity: value.quantity,
+            entry_price: value.entry_price,
+            exit_price: value.exit_price,
+            realized_pnl: value.realized_pnl,
+            created_at: value.created_at,
+            closed_at: value.closed_at,
+        }
+    }
+}
+
+impl From<OpportunityRow> for OpportunityCard {
+    fn from(value: OpportunityRow) -> Self {
+        let _ = value.id;
+        let _ = value.rn;
+        Self {
+            lane_key: value.lane_key,
+            strategy_family: value.strategy_family.into(),
+            side: value.side,
+            market_prob: value.market_prob,
+            model_prob: value.model_prob,
+            edge: value.edge,
+            confidence: value.confidence,
+            approved: value.approved,
+            reasons: value
+                .reasons_json
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(ToOwned::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            as_of: value.created_at,
+        }
+    }
+}
+
+impl TryFrom<FeatureSnapshotRow> for MarketFeatureSnapshotRecord {
+    type Error = anyhow::Error;
+
+    fn try_from(value: FeatureSnapshotRow) -> Result<Self, Self::Error> {
+        let _ = value.id;
+        let venue = value.venue_features_json;
+        let settlement = value.settlement_features_json;
+        let external = value.external_reference_json;
+        let quality = value.venue_quality_json;
+        Ok(Self {
+            market_id: value.market_id,
+            market_ticker: json_text(&venue, "market_ticker"),
+            market_title: json_text(&venue, "market_title"),
+            feature_version: value.feature_version,
+            exchange: value.exchange,
+            symbol: value.symbol,
+            window_minutes: value.window_minutes,
+            seconds_to_expiry: value.seconds_to_expiry,
+            time_to_expiry_bucket: value.time_to_expiry_bucket,
+            market_prob: json_f64(&venue, "market_prob"),
+            best_bid: json_f64(&venue, "best_bid"),
+            best_ask: json_f64(&venue, "best_ask"),
+            last_price: json_f64(&venue, "last_price"),
+            bid_size: json_f64(&venue, "bid_size"),
+            ask_size: json_f64(&venue, "ask_size"),
+            liquidity: json_f64(&venue, "liquidity"),
+            order_book_imbalance: json_f64(&venue, "order_book_imbalance"),
+            aggressive_buy_ratio: json_f64(&venue, "aggressive_buy_ratio"),
+            spread_bps: json_f64(&quality, "spread_bps"),
+            venue_quality_score: json_f64(&quality, "venue_quality_score"),
+            reference_price: json_f64(&external, "reference_price"),
+            reference_previous_price: json_f64(&external, "reference_previous_price"),
+            reference_price_change_bps: json_f64(&external, "reference_price_change_bps"),
+            reference_yes_prob: json_f64(&external, "reference_yes_prob"),
+            reference_gap_bps: json_f64(&external, "reference_gap_bps"),
+            threshold_distance_bps_proxy: json_f64(&settlement, "threshold_distance_bps_proxy"),
+            averaging_window_progress: json_f64(&settlement, "averaging_window_progress"),
+            settlement_regime: json_text(&settlement, "settlement_regime"),
+            last_minute_avg_proxy: json_f64(&settlement, "last_minute_avg_proxy"),
+            market_data_age_seconds: json_i32(&quality, "market_data_age_seconds"),
+            reference_age_seconds: json_i32(&external, "reference_age_seconds"),
+            created_at: value.created_at,
+        })
+    }
+}
+
+impl TryFrom<HistoricalReplayExampleRow> for HistoricalReplayExampleCard {
+    type Error = anyhow::Error;
+
+    fn try_from(value: HistoricalReplayExampleRow) -> Result<Self, Self::Error> {
+        let features = &value.feature_vector_json;
+        Ok(Self {
+            lane_key: value.lane_key,
+            time_to_expiry_bucket: value.time_to_expiry_bucket,
+            target_yes_probability: value.resolved_yes_probability,
+            market_prob: value.market_prob,
+            features: market_models::FeatureVector {
+                market_prob: json_f64(features, "market_prob"),
+                reference_yes_prob: json_f64(features, "reference_yes_prob"),
+                reference_gap_bps_scaled: json_f64(features, "reference_gap_bps_scaled"),
+                threshold_distance_bps_scaled: json_f64(features, "threshold_distance_bps_scaled"),
+                order_book_imbalance: json_f64(features, "order_book_imbalance"),
+                aggressive_buy_ratio: json_f64(features, "aggressive_buy_ratio"),
+                venue_quality_score: json_f64(features, "venue_quality_score"),
+                market_data_age_scaled: json_f64(features, "market_data_age_scaled"),
+                reference_age_scaled: json_f64(features, "reference_age_scaled"),
+                averaging_window_progress: json_f64(features, "averaging_window_progress"),
+                seconds_to_expiry_scaled: json_f64(features, "seconds_to_expiry_scaled"),
+            },
+        })
+    }
+}
+
+impl From<PendingExecutionIntentRow> for PendingExecutionIntent {
+    fn from(value: PendingExecutionIntentRow) -> Self {
+        Self {
+            intent_id: value.intent_id,
+            decision_id: value.decision_id,
+            market_id: value.market_id,
+            lane_key: value.lane_key,
+            strategy_family: value.strategy_family.into(),
+            side: value.side,
+            market_prob: value.market_prob,
+            recommended_size: value.recommended_size,
+            mode: value.mode.into(),
+            timeout_seconds: value.timeout_seconds,
+            force_exit_buffer_seconds: value.force_exit_buffer_seconds,
+            created_at: value.created_at,
+        }
+    }
+}
+
+impl From<ActiveLiveExecutionIntentRow> for ActiveLiveExecutionIntent {
+    fn from(value: ActiveLiveExecutionIntentRow) -> Self {
+        Self {
+            intent_id: value.intent_id,
+            decision_id: value.decision_id,
+            market_id: value.market_id,
+            lane_key: value.lane_key,
+            strategy_family: value.strategy_family.into(),
+            side: value.side,
+            market_prob: value.market_prob,
+            recommended_size: value.recommended_size,
+            mode: value.mode.into(),
+            timeout_seconds: value.timeout_seconds,
+            force_exit_buffer_seconds: value.force_exit_buffer_seconds,
+            created_at: value.created_at,
+            status: value.status,
+            market_ticker: value.market_ticker,
+            client_order_id: value.client_order_id,
+            exchange_order_id: value.exchange_order_id,
+            fill_status: value.fill_status,
+            last_transition_at: value.last_transition_at,
+        }
+    }
+}
+
+impl From<OpenTradeForExitRow> for OpenTradeForExit {
+    fn from(value: OpenTradeForExitRow) -> Self {
+        let _ = value.decision_id;
+        Self {
+            trade_id: value.id,
+            market_id: value.market_id,
+            market_ticker: value.market_ticker,
+            lane_key: value.lane_key,
+            side: value.side,
+            quantity: value.quantity,
+            entry_price: value.entry_price,
+            entry_fee: value.entry_fee,
+            strategy_family: value.strategy_family.into(),
+            mode: value.mode.into(),
+            created_at: value.created_at,
+            timeout_seconds: value.timeout_seconds,
+            force_exit_buffer_seconds: value.force_exit_buffer_seconds,
+            expires_at: value.expires_at,
+            exit_exchange_order_id: value.exit_exchange_order_id,
+            exit_client_order_id: value.exit_client_order_id,
+            exit_fill_status: value.exit_fill_status,
+        }
+    }
+}
+
+impl From<OpenLiveTradeForReconciliationRow> for OpenLiveTradeForReconciliation {
+    fn from(value: OpenLiveTradeForReconciliationRow) -> Self {
+        Self {
+            trade_id: value.id,
+            lane_key: value.lane_key,
+            market_ticker: value.market_ticker,
+            side: value.side,
+            quantity: value.quantity,
+            entry_price: value.entry_price,
+            entry_fee: value.entry_fee,
+            created_at: value.created_at,
+            entry_exchange_order_id: value.entry_exchange_order_id,
+            entry_client_order_id: value.entry_client_order_id,
+            exit_exchange_order_id: value.exit_exchange_order_id,
+            exit_client_order_id: value.exit_client_order_id,
+        }
+    }
+}
+
+impl From<ClosedTradeNotificationRow> for ClosedTradeNotification {
+    fn from(value: ClosedTradeNotificationRow) -> Self {
+        Self {
+            trade_id: value.id,
+            lane_key: value.lane_key,
+            strategy_family: value.strategy_family.into(),
+            mode: value.mode.into(),
+            quantity: value.quantity,
+            entry_price: value.entry_price,
+            exit_price: value.exit_price.unwrap_or_default(),
+            realized_pnl: value.realized_pnl.unwrap_or_default(),
+            closed_at: value.closed_at.unwrap_or_else(Utc::now),
+        }
+    }
+}
+
+impl From<TradeExitProgressRow> for TradeExitProgress {
+    fn from(value: TradeExitProgressRow) -> Self {
+        Self {
+            closed_quantity: value.closed_quantity,
+            exit_fee: value.exit_fee,
+        }
+    }
+}
+
+impl From<RecentTradeMetricsRow> for RecentTradeMetrics {
+    fn from(value: RecentTradeMetricsRow) -> Self {
+        Self {
+            trade_count: value.trade_count,
+            win_count: value.win_count,
+            realized_pnl: value.realized_pnl,
+        }
+    }
+}
+
+impl From<WorkerStatusRow> for WorkerStatusCard {
+    fn from(value: WorkerStatusRow) -> Self {
+        Self {
+            service: value.service,
+            status: value.status,
+            last_started_at: value.last_started_at,
+            last_succeeded_at: value.last_succeeded_at,
+            last_failed_at: value.last_failed_at,
+            last_error: value.last_error,
+            details_json: value.details_json,
+            updated_at: value.updated_at,
+        }
+    }
+}
+
+impl From<ProbabilityCalibrationRow> for ProbabilityCalibrationCard {
+    fn from(value: ProbabilityCalibrationRow) -> Self {
+        Self {
+            mean_error: value.mean_error,
+            sample_count: value.sample_count,
+        }
+    }
+}
+
+impl From<LiveExchangeSyncStatusRow> for LiveExchangeSyncSummary {
+    fn from(value: LiveExchangeSyncStatusRow) -> Self {
+        let _ = value.source;
+        let _ = value.details_json;
+        Self {
+            synced_at: value.synced_at,
+            positions_count: i64::from(value.positions_count),
+            resting_orders_count: i64::from(value.resting_orders_count),
+            recent_fills_count: i64::from(value.recent_fills_count),
+            local_open_live_trades_count: i64::from(value.local_open_live_trades_count),
+            status: value.status,
+            issues: value
+                .issues_json
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(ToOwned::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
+}
+
+impl From<OperatorControlStateRow> for OperatorControlState {
+    fn from(value: OperatorControlStateRow) -> Self {
+        Self {
+            live_order_placement_enabled: value.live_order_placement_enabled,
+            updated_by: value.updated_by,
+            note: value.note,
+            updated_at: value.updated_at,
+        }
+    }
+}
+
+impl From<LivePositionSyncRow> for LivePositionCard {
+    fn from(value: LivePositionSyncRow) -> Self {
+        Self {
+            market_ticker: value.market_ticker,
+            position_count: value.position_count,
+            resting_order_count: value.resting_order_count,
+            market_exposure: value.market_exposure,
+            realized_pnl: value.realized_pnl,
+            synced_at: value.synced_at,
+        }
+    }
+}
+
+impl From<LiveOrderSyncListRow> for LiveOrderCard {
+    fn from(value: LiveOrderSyncListRow) -> Self {
+        Self {
+            order_id: value.order_id,
+            client_order_id: value.client_order_id,
+            market_ticker: value.market_ticker,
+            action: value.action,
+            side: value.side,
+            status: value.status,
+            count: value.count,
+            fill_count: value.fill_count,
+            remaining_count: value.remaining_count,
+            created_time: value.created_time,
+            synced_at: value.synced_at,
+        }
+    }
+}
+
+impl From<LiveFillSyncListRow> for LiveFillCard {
+    fn from(value: LiveFillSyncListRow) -> Self {
+        Self {
+            fill_id: value.fill_id,
+            order_id: value.order_id,
+            client_order_id: value.client_order_id,
+            market_ticker: value.market_ticker,
+            action: value.action,
+            side: value.side,
+            count: value.count,
+            fee_paid: value.fee_paid,
+            created_time: value.created_time,
+            synced_at: value.synced_at,
+        }
+    }
+}
+
+impl From<LiveIntentRow> for LiveIntentCard {
+    fn from(value: LiveIntentRow) -> Self {
+        Self {
+            intent_id: value.intent_id,
+            lane_key: value.lane_key,
+            mode: value.mode.into(),
+            status: value.status,
+            last_error: value.last_error,
+            market_ticker: value.market_ticker,
+            side: value.side,
+            client_order_id: value.client_order_id,
+            exchange_order_id: value.exchange_order_id,
+            fill_status: value.fill_status,
+            created_at: value.created_at,
+            last_transition_at: value.last_transition_at,
+        }
+    }
+}
+
+fn json_f64(value: &serde_json::Value, key: &str) -> f64 {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or_default()
+}
+
+fn json_text(value: &serde_json::Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn json_i32(value: &serde_json::Value, key: &str) -> i32 {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or_default() as i32
+}
+
+fn merge_json(base: serde_json::Value, extra: serde_json::Value) -> serde_json::Value {
+    match (base, extra) {
+        (serde_json::Value::Object(mut base), serde_json::Value::Object(extra)) => {
+            for (key, value) in extra {
+                base.insert(key, value);
+            }
+            serde_json::Value::Object(base)
+        }
+        (base, serde_json::Value::Null) => base,
+        (_, extra) => extra,
+    }
+}
+
+fn parse_strategy_family(value: &str) -> StrategyFamily {
+    match value {
+        "directional_settlement" => StrategyFamily::DirectionalSettlement,
+        "pre_settlement_scalp" => StrategyFamily::PreSettlementScalp,
+        _ => StrategyFamily::Portfolio,
+    }
+}
+
+fn live_trade_needs_attention(
+    trade: &OpenLiveTradeForReconciliation,
+    snapshot: &LiveTradeReconciliationSnapshot,
+) -> bool {
+    let trade_age_seconds = (chrono::Utc::now() - trade.created_at).num_seconds();
+    trade_age_seconds >= 90
+        && !snapshot.has_position
+        && !snapshot.has_resting_order
+        && snapshot.matched_exit_fill_quantity + 0.01 < trade.quantity
+}
+
+fn proportional_entry_fee(total_entry_fee: f64, exit_quantity: f64, total_quantity: f64) -> f64 {
+    if total_entry_fee <= 0.0 || total_quantity <= 0.0 {
+        0.0
+    } else {
+        (total_entry_fee * (exit_quantity / total_quantity)).max(0.0)
+    }
+}

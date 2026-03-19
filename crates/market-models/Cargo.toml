@@ -1,0 +1,13 @@
+[package]
+name = "market-models"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+common = { path = "../common" }
+serde.workspace = true
+
+[lib]
+name = "market_models"
+path = "src/lib.rs"

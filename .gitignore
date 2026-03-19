@@ -1,0 +1,10 @@
+/target/
+/.env
+/docker-data/
+/.sqlx/
+/logs/
+/*.log
+/tmp/
+/.runtime/
+/.DS_Store
+Thumbs.db

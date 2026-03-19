@@ -1,0 +1,11 @@
+.git
+.github
+target
+docker-data
+logs
+*.log
+.env
+temp-*.log
+logs-*.log
+ingest-foreground.*.log
+
