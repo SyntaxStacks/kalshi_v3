@@ -66,7 +66,12 @@ async fn notify_once(config: &AppConfig, storage: &Storage, client: &Client) -> 
 
     for trade in storage.list_unnotified_closed_trades(20).await? {
         let body = build_trade_webhook(&trade, &config.app_env);
-        client.post(webhook).json(&body).send().await?.error_for_status()?;
+        client
+            .post(webhook)
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?;
         storage.mark_trade_notified(trade.trade_id).await?;
         sent_count += 1;
     }
@@ -79,7 +84,12 @@ async fn notify_once(config: &AppConfig, storage: &Storage, client: &Client) -> 
             continue;
         }
         let body = build_alert_webhook(&alert, &config.app_env);
-        client.post(webhook).json(&body).send().await?.error_for_status()?;
+        client
+            .post(webhook)
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?;
         storage
             .record_notification_delivery(
                 ALERT_NOTIFICATION_KIND,
@@ -116,7 +126,10 @@ async fn build_critical_alert_candidates(
 
     let mut alerts = Vec::new();
 
-    if let Some(control) = operator_control.as_ref().filter(|control| !control.live_order_placement_enabled) {
+    if let Some(control) = operator_control
+        .as_ref()
+        .filter(|control| !control.live_order_placement_enabled)
+    {
         alerts.push(CriticalAlertNotification {
             alert_key: format!("live_disabled:{}", control.updated_at.timestamp()),
             headline: "ALERT | LIVE DISABLED".to_string(),
@@ -158,9 +171,14 @@ async fn build_critical_alert_candidates(
             subsystem: "market_data".to_string(),
             affected_lane: None,
             current_state: feature_timestamp.map(|timestamp| {
-                format!("latest feature snapshot {}", timestamp.format("%Y-%m-%d %H:%M:%S UTC"))
+                format!(
+                    "latest feature snapshot {}",
+                    timestamp.format("%Y-%m-%d %H:%M:%S UTC")
+                )
             }),
-            next_action: Some("Check ingest and feature workers before trusting new entries.".to_string()),
+            next_action: Some(
+                "Check ingest and feature workers before trusting new entries.".to_string(),
+            ),
             occurred_at: feature_timestamp.unwrap_or(now),
         });
     }
@@ -169,7 +187,9 @@ async fn build_critical_alert_candidates(
         .map(|age| age > config.reference_stale_after_seconds)
         .unwrap_or(false)
     {
-        let occurred_at = reference_worker.map(|worker| worker.updated_at).unwrap_or(now);
+        let occurred_at = reference_worker
+            .map(|worker| worker.updated_at)
+            .unwrap_or(now);
         alerts.push(CriticalAlertNotification {
             alert_key: format!("reference_feed_stale:{}", occurred_at.timestamp()),
             headline: "ALERT | REFERENCE FEED STALE".to_string(),
@@ -186,7 +206,10 @@ async fn build_critical_alert_candidates(
                     worker.updated_at.format("%Y-%m-%d %H:%M:%S UTC")
                 )
             }),
-            next_action: Some("Validate Coinbase/reference connectivity before resuming live confidence.".to_string()),
+            next_action: Some(
+                "Validate Coinbase/reference connectivity before resuming live confidence."
+                    .to_string(),
+            ),
             occurred_at,
         });
     }
@@ -215,7 +238,9 @@ async fn build_critical_alert_candidates(
                     sync.positions_count, sync.resting_orders_count, sync.recent_fills_count
                 )
             }),
-            next_action: Some("Run live sync and confirm exchange truth before trading live.".to_string()),
+            next_action: Some(
+                "Run live sync and confirm exchange truth before trading live.".to_string(),
+            ),
             occurred_at,
         });
     }
@@ -223,7 +248,11 @@ async fn build_critical_alert_candidates(
     if let Some(sync) = live_exchange_sync.as_ref() {
         for issue in &sync.issues {
             alerts.push(CriticalAlertNotification {
-                alert_key: format!("live_exchange_issue:{}:{}", sync.synced_at.timestamp(), issue),
+                alert_key: format!(
+                    "live_exchange_issue:{}:{}",
+                    sync.synced_at.timestamp(),
+                    issue
+                ),
                 headline: "ALERT | RECONCILIATION ISSUE".to_string(),
                 severity: "warning".to_string(),
                 reason: issue.clone(),
@@ -233,7 +262,10 @@ async fn build_critical_alert_candidates(
                     "positions={} orders={} fills={}",
                     sync.positions_count, sync.resting_orders_count, sync.recent_fills_count
                 )),
-                next_action: Some("Inspect live exceptions and run reconcile_now if the issue persists.".to_string()),
+                next_action: Some(
+                    "Inspect live exceptions and run reconcile_now if the issue persists."
+                        .to_string(),
+                ),
                 occurred_at: sync.synced_at,
             });
         }
@@ -293,7 +325,9 @@ async fn build_critical_alert_candidates(
                     .map(format_timestamp)
                     .unwrap_or_else(|| "never".to_string())
             )),
-            next_action: Some("Inspect worker logs and restore health before trusting automation.".to_string()),
+            next_action: Some(
+                "Inspect worker logs and restore health before trusting automation.".to_string(),
+            ),
             occurred_at: worker.last_failed_at.unwrap_or(worker.updated_at),
         });
     }
@@ -323,7 +357,10 @@ fn operator_action_to_alert(
             subsystem: "operator".to_string(),
             affected_lane: None,
             current_state: Some(format_operator_action_state(action)),
-            next_action: Some("Confirm live orders are gone from exchange sync before resuming live placement.".to_string()),
+            next_action: Some(
+                "Confirm live orders are gone from exchange sync before resuming live placement."
+                    .to_string(),
+            ),
             occurred_at: action.created_at,
         }),
         "flatten_live_positions" => Some(CriticalAlertNotification {
@@ -337,7 +374,10 @@ fn operator_action_to_alert(
             subsystem: "operator".to_string(),
             affected_lane: None,
             current_state: Some(format_operator_action_state(action)),
-            next_action: Some("Verify exchange positions are flat and keep live disabled until reconciled.".to_string()),
+            next_action: Some(
+                "Verify exchange positions are flat and keep live disabled until reconciled."
+                    .to_string(),
+            ),
             occurred_at: action.created_at,
         }),
         _ => None,
@@ -412,25 +452,23 @@ fn build_trade_webhook(trade: &ClosedTradeNotification, app_env: &str) -> Value 
 
 fn build_alert_webhook(alert: &CriticalAlertNotification, app_env: &str) -> Value {
     let mut fields = Vec::new();
-    push_field(&mut fields, "Subsystem", Some(alert.subsystem.clone()), true);
     push_field(
         &mut fields,
-        "State",
-        alert.current_state.clone(),
-        false,
+        "Subsystem",
+        Some(alert.subsystem.clone()),
+        true,
     );
+    push_field(&mut fields, "State", alert.current_state.clone(), false);
     push_field(
         &mut fields,
         "Lane",
-        alert.affected_lane.clone().map(|lane| compact_lane_summary(&lane)),
+        alert
+            .affected_lane
+            .clone()
+            .map(|lane| compact_lane_summary(&lane)),
         false,
     );
-    push_field(
-        &mut fields,
-        "Next Action",
-        alert.next_action.clone(),
-        false,
-    );
+    push_field(&mut fields, "Next Action", alert.next_action.clone(), false);
 
     json!({
         "embeds": [{
@@ -526,12 +564,7 @@ fn strategy_family_label(strategy_family: common::StrategyFamily) -> String {
 fn compact_lane_summary(lane_key: &str) -> String {
     let parts: Vec<&str> = lane_key.split(':').collect();
     if parts.len() >= 6 {
-        return format!(
-            "{} {}m · {}",
-            parts[1].to_uppercase(),
-            parts[2],
-            parts[5]
-        );
+        return format!("{} {}m · {}", parts[1].to_uppercase(), parts[2], parts[5]);
     }
     lane_key.to_string()
 }
@@ -661,10 +694,12 @@ mod tests {
         let embed = first_embed(&body);
         assert_eq!(embed["title"], "LOSS | LIVE | -$5.60");
         assert_eq!(embed["color"], 0xDC2626);
-        assert!(embed["description"]
-            .as_str()
-            .expect("description")
-            .contains("live"));
+        assert!(
+            embed["description"]
+                .as_str()
+                .expect("description")
+                .contains("live")
+        );
     }
 
     #[test]
@@ -713,9 +748,7 @@ mod tests {
     #[test]
     fn compact_lane_summary_is_mobile_friendly() {
         assert_eq!(
-            compact_lane_summary(
-                "kalshi:xrp:15:buy_yes:directional_settlement:trained_linear_v1"
-            ),
+            compact_lane_summary("kalshi:xrp:15:buy_yes:directional_settlement:trained_linear_v1"),
             "XRP 15m · trained_linear_v1"
         );
         assert_eq!(format_contract_price(0.345), "34.5c");

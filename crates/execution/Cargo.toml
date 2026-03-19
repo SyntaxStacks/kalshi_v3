@@ -9,6 +9,8 @@ anyhow.workspace = true
 common = { path = "../common" }
 chrono.workspace = true
 dotenvy.workspace = true
+market-data = { path = "../market-data" }
+redis.workspace = true
 reqwest.workspace = true
 rsa.workspace = true
 serde.workspace = true

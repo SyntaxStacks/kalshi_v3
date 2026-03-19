@@ -450,7 +450,10 @@ async fn dashboard(
     let family = query.family.as_deref().and_then(parse_market_family_query);
     let _ = state
         .storage
-        .upsert_worker_success("api", &json!({"route": "dashboard", "family": query.family}))
+        .upsert_worker_success(
+            "api",
+            &json!({"route": "dashboard", "family": query.family}),
+        )
         .await;
     match state.storage.dashboard_snapshot(family).await {
         Ok(snapshot) => Json(json!(snapshot)),
@@ -819,18 +822,18 @@ fn worker_health_issues(workers: &[WorkerStatusCard], config: &AppConfig) -> Vec
     required
         .iter()
         .filter_map(|(service, ttl_seconds)| {
-        let Some(worker) = workers.iter().find(|worker| worker.service == *service) else {
-            return Some(format!("{service}:missing"));
-        };
-        if worker.status == "failed" {
-            return Some(format!("{service}:failed"));
-        }
-        let age_seconds = (Utc::now() - worker.updated_at).num_seconds();
-        if age_seconds > *ttl_seconds {
-            return Some(format!("{service}:stale:{age_seconds}s"));
-        }
-        None
-    })
+            let Some(worker) = workers.iter().find(|worker| worker.service == *service) else {
+                return Some(format!("{service}:missing"));
+            };
+            if worker.status == "failed" {
+                return Some(format!("{service}:failed"));
+            }
+            let age_seconds = (Utc::now() - worker.updated_at).num_seconds();
+            if age_seconds > *ttl_seconds {
+                return Some(format!("{service}:stale:{age_seconds}s"));
+            }
+            None
+        })
         .collect()
 }
 
@@ -1489,7 +1492,9 @@ struct LiveBalance {
 
 #[cfg(test)]
 mod tests {
-    use super::{AcceptanceGateStatus, build_acceptance_gates, worker_health_issues, workers_healthy};
+    use super::{
+        AcceptanceGateStatus, build_acceptance_gates, worker_health_issues, workers_healthy,
+    };
     use chrono::{Duration, Utc};
     use common::{
         AppConfig, DashboardSnapshot, LaneState, LiveExceptionSnapshot, LiveExchangeSyncSummary,
@@ -1603,13 +1608,29 @@ mod tests {
             readiness: ReadinessSummary {
                 overall_status: "paper_active".to_string(),
                 shadow_count: 0,
-                paper_active_count: if state == PromotionState::PaperActive { 1 } else { 0 },
-                live_micro_count: if state == PromotionState::LiveMicro { 1 } else { 0 },
-                live_scaled_count: if state == PromotionState::LiveScaled { 1 } else { 0 },
-                quarantined_count: if state == PromotionState::Quarantined { 1 } else { 0 },
+                paper_active_count: if state == PromotionState::PaperActive {
+                    1
+                } else {
+                    0
+                },
+                live_micro_count: if state == PromotionState::LiveMicro {
+                    1
+                } else {
+                    0
+                },
+                live_scaled_count: if state == PromotionState::LiveScaled {
+                    1
+                } else {
+                    0
+                },
+                quarantined_count: if state == PromotionState::Quarantined {
+                    1
+                } else {
+                    0
+                },
                 lanes: vec![LaneState {
-                    lane_key:
-                        "kalshi:btc:15:buy_yes:directional_settlement:trained_linear_v1".to_string(),
+                    lane_key: "kalshi:btc:15:buy_yes:directional_settlement:trained_linear_v1"
+                        .to_string(),
                     market_family: MarketFamily::Crypto,
                     promotion_state: state,
                     promotion_reason: Some("paper_ready".to_string()),

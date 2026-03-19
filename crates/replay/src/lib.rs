@@ -20,9 +20,13 @@ pub struct ModelBenchmark {
     pub model_name: String,
     pub brier: f64,
     pub execution_pnl: f64,
+    pub pnl_per_trade: f64,
     pub sample_count: usize,
     pub trade_count: usize,
     pub win_rate: f64,
+    pub fill_rate: f64,
+    pub slippage_bps: f64,
+    pub edge_realization_ratio: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,13 +87,17 @@ pub fn benchmark_model_set(
     for model_name in model_names {
         let effective_policy =
             if *model_name == TRAINED_LINEAR_V1 || *model_name == TRAINED_LINEAR_CONTRARIAN_V1 {
-            trained_policy.unwrap_or(policy)
-        } else {
-            policy
-        };
-        if let Some(result) =
-            benchmark_single_model(lane_key, model_name, examples, effective_policy, trained_weights)
-        {
+                trained_policy.unwrap_or(policy)
+            } else {
+                policy
+            };
+        if let Some(result) = benchmark_single_model(
+            lane_key,
+            model_name,
+            examples,
+            effective_policy,
+            trained_weights,
+        ) {
             results.push(result);
         }
     }
@@ -124,6 +132,9 @@ pub fn benchmark_single_model(
     let mut execution_pnl = 0.0;
     let mut trade_count = 0usize;
     let mut winning_trades = 0usize;
+    let mut fill_count = 0usize;
+    let mut slippage_bps_total = 0.0;
+    let mut predicted_edge_total = 0.0;
     for example in examples {
         let output = run_model_with_weights(model_name, &example.features, trained_weights);
         brier += (output.probability_yes - example.target_yes_probability).powi(2);
@@ -132,14 +143,18 @@ pub fn benchmark_single_model(
             output.confidence,
             example.market_prob,
             example.target_yes_probability,
-            example.features.venue_quality_score,
-            example.features.seconds_to_expiry_scaled,
+            &example.features,
             policy,
         );
-        execution_pnl += trade_result;
-        if trade_result.abs() > f64::EPSILON {
+        execution_pnl += trade_result.realized_pnl;
+        slippage_bps_total += trade_result.slippage_bps;
+        predicted_edge_total += trade_result.predicted_edge;
+        if trade_result.traded {
             trade_count += 1;
-            if trade_result > 0.0 {
+            if trade_result.filled {
+                fill_count += 1;
+            }
+            if trade_result.realized_pnl > 0.0 {
                 winning_trades += 1;
             }
         }
@@ -150,6 +165,11 @@ pub fn benchmark_single_model(
         model_name: model_name.to_string(),
         brier: brier / sample_count as f64,
         execution_pnl,
+        pnl_per_trade: if trade_count > 0 {
+            execution_pnl / trade_count as f64
+        } else {
+            0.0
+        },
         sample_count,
         trade_count,
         win_rate: if trade_count > 0 {
@@ -157,7 +177,30 @@ pub fn benchmark_single_model(
         } else {
             0.0
         },
+        fill_rate: if trade_count > 0 {
+            fill_count as f64 / trade_count as f64
+        } else {
+            0.0
+        },
+        slippage_bps: if fill_count > 0 {
+            slippage_bps_total / fill_count as f64
+        } else {
+            0.0
+        },
+        edge_realization_ratio: if predicted_edge_total.abs() > f64::EPSILON {
+            execution_pnl / predicted_edge_total
+        } else {
+            0.0
+        },
     })
+}
+
+struct ReplayTradeResult {
+    traded: bool,
+    filled: bool,
+    realized_pnl: f64,
+    predicted_edge: f64,
+    slippage_bps: f64,
 }
 
 fn execution_delta(
@@ -165,31 +208,98 @@ fn execution_delta(
     confidence: f64,
     market_prob: f64,
     target_yes_probability: f64,
-    venue_quality_score: f64,
-    seconds_to_expiry_scaled: f64,
+    features: &FeatureVector,
     policy: ReplayPolicy,
-) -> f64 {
+) -> ReplayTradeResult {
     let edge = model_prob - market_prob;
 
     if edge.abs() < policy.min_edge
         || confidence < policy.min_confidence
-        || venue_quality_score < policy.min_venue_quality
-        || seconds_to_expiry_scaled < policy.min_seconds_to_expiry_scaled
+        || features.venue_quality_score < policy.min_venue_quality
+        || features.seconds_to_expiry_scaled < policy.min_seconds_to_expiry_scaled
     {
-        return 0.0;
+        return ReplayTradeResult {
+            traded: false,
+            filled: false,
+            realized_pnl: 0.0,
+            predicted_edge: 0.0,
+            slippage_bps: 0.0,
+        };
     }
 
-    let size_multiplier = (confidence * venue_quality_score).clamp(0.10, 1.0)
+    let fill_probability = estimate_fill_probability(features);
+    let slippage_bps = estimate_slippage_bps(features);
+    let adverse_selection_bps = estimate_adverse_selection_bps(features);
+    let execution_cost =
+        policy.execution_cost + ((slippage_bps + adverse_selection_bps) / 10_000.0);
+    let size_multiplier = (confidence * features.venue_quality_score).clamp(0.10, 1.0)
         * ((edge.abs() - policy.min_edge) / 0.20).clamp(0.15, 1.0);
+    let predicted_edge = edge.abs() * size_multiplier;
+    if fill_probability <= 0.0 {
+        return ReplayTradeResult {
+            traded: true,
+            filled: false,
+            realized_pnl: 0.0,
+            predicted_edge,
+            slippage_bps: 0.0,
+        };
+    }
 
-    if edge >= policy.min_edge {
-        ((target_yes_probability - market_prob) - policy.execution_cost) * size_multiplier
+    let realized_pnl = if edge >= policy.min_edge {
+        (((target_yes_probability - market_prob) - execution_cost) * size_multiplier)
+            * fill_probability
     } else if edge <= -policy.min_edge {
-        (((1.0 - target_yes_probability) - (1.0 - market_prob)) - policy.execution_cost)
-            * size_multiplier
+        ((((1.0 - target_yes_probability) - (1.0 - market_prob)) - execution_cost)
+            * size_multiplier)
+            * fill_probability
     } else {
         0.0
+    };
+
+    ReplayTradeResult {
+        traded: true,
+        filled: fill_probability > 0.2,
+        realized_pnl,
+        predicted_edge,
+        slippage_bps,
     }
+}
+
+fn estimate_fill_probability(features: &FeatureVector) -> f64 {
+    let size_ahead = (features
+        .size_ahead_real_scaled
+        .max(features.size_ahead_scaled)
+        .max(0.05)
+        * 100.0)
+        .max(1.0);
+    let trade_consumption_rate = if features.trade_consumption_rate_scaled > 0.0 {
+        features.trade_consumption_rate_scaled * 25.0
+    } else {
+        features.trade_rate_scaled.max(0.0) * 50.0
+    };
+    let cancel_rate = features.cancel_rate_scaled.max(0.0) * 25.0;
+    let effective_rate = (trade_consumption_rate + cancel_rate).max(0.0);
+    if effective_rate <= f64::EPSILON {
+        return 0.0;
+    }
+    let seconds_to_expiry = (features.seconds_to_expiry_scaled.max(0.0) * 900.0).max(1.0);
+    let expected_fill_time = size_ahead / effective_rate;
+    let queue_fill_probability = (seconds_to_expiry / expected_fill_time).clamp(0.0, 1.0);
+    (queue_fill_probability
+        * (1.0 - features.spread_bps_scaled * 0.35)
+        * (1.0 - features.queue_decay_rate_scaled * 0.05)
+        * (1.0 - features.quote_churn_scaled * 0.10))
+        .clamp(0.0, 1.0)
+}
+
+fn estimate_slippage_bps(features: &FeatureVector) -> f64 {
+    (features.spread_bps_scaled * 1_000.0 * 0.5).clamp(0.0, 500.0)
+}
+
+fn estimate_adverse_selection_bps(features: &FeatureVector) -> f64 {
+    ((features.aggressive_buy_ratio.clamp(0.0, 1.0) * features.spread_bps_scaled * 1_000.0)
+        + (features.quote_churn_scaled * 20.0))
+        .clamp(0.0, 500.0)
 }
 
 #[cfg(test)]
@@ -197,7 +307,11 @@ mod tests {
     use super::*;
     use market_models::FeatureVector;
 
-    fn sample_example(market_prob: f64, target_yes_probability: f64, venue_quality_score: f64) -> ReplayExample {
+    fn sample_example(
+        market_prob: f64,
+        target_yes_probability: f64,
+        venue_quality_score: f64,
+    ) -> ReplayExample {
         ReplayExample {
             lane_key: "kalshi:btc:15:buy_yes:directional_settlement:baseline_logit_v1".to_string(),
             time_to_expiry_bucket: "5_to_10m".to_string(),
@@ -208,8 +322,20 @@ mod tests {
                 reference_yes_prob: 0.62,
                 reference_gap_bps_scaled: 0.7,
                 threshold_distance_bps_scaled: 0.4,
+                distance_to_strike_bps_scaled: 0.5,
+                reference_velocity_scaled: 0.3,
+                realized_vol_short_scaled: 0.2,
+                time_decay_factor: 0.5,
                 order_book_imbalance: 0.3,
                 aggressive_buy_ratio: 0.66,
+                size_ahead_scaled: 0.25,
+                trade_rate_scaled: 0.4,
+                quote_churn_scaled: 0.12,
+                size_ahead_real_scaled: 0.28,
+                trade_consumption_rate_scaled: 0.46,
+                cancel_rate_scaled: 0.12,
+                queue_decay_rate_scaled: 0.18,
+                spread_bps_scaled: 0.14,
                 venue_quality_score,
                 market_data_age_scaled: 0.05,
                 reference_age_scaled: 0.05,
@@ -223,36 +349,36 @@ mod tests {
     fn benchmark_gates_weak_quality_examples() {
         let weak = sample_example(0.50, 0.52, 0.10);
         let lane_key = weak.lane_key.clone();
-        let board =
-            benchmark_model_set(
-                &lane_key,
-                &[market_models::BASELINE_LOGIT_V1],
-                &[weak],
-                ReplayPolicy::directional_default(),
-                None,
-                None,
-            )
-            .expect("leaderboard");
+        let board = benchmark_model_set(
+            &lane_key,
+            &[market_models::BASELINE_LOGIT_V1],
+            &[weak],
+            ReplayPolicy::directional_default(),
+            None,
+            None,
+        )
+        .expect("leaderboard");
         assert_eq!(board.results[0].trade_count, 0);
         assert_eq!(board.results[0].execution_pnl, 0.0);
+        assert_eq!(board.results[0].fill_rate, 0.0);
     }
 
     #[test]
     fn benchmark_trades_high_quality_examples() {
         let strong = sample_example(0.40, 0.75, 0.85);
         let lane_key = strong.lane_key.clone();
-        let board =
-            benchmark_model_set(
-                &lane_key,
-                &[market_models::BASELINE_LOGIT_V1],
-                &[strong],
-                ReplayPolicy::directional_default(),
-                None,
-                None,
-            )
-            .expect("leaderboard");
+        let board = benchmark_model_set(
+            &lane_key,
+            &[market_models::BASELINE_LOGIT_V1],
+            &[strong],
+            ReplayPolicy::directional_default(),
+            None,
+            None,
+        )
+        .expect("leaderboard");
         assert_eq!(board.results[0].trade_count, 1);
         assert!(board.results[0].execution_pnl > 0.0);
+        assert!(board.results[0].fill_rate > 0.0);
     }
 
     #[test]

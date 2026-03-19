@@ -1,9 +1,9 @@
 mod pg;
 
 pub use pg::{
-    ActiveLiveExecutionIntent, ExecutionIntentStateUpdate, HistoricalReplayExampleInsert,
-    LiveFillSyncRecord, LiveOrderSyncRecord, LivePositionSyncRecord,
+    ActiveLiveExecutionIntent, ClosedTradeNotification, ExecutionIntentStateUpdate,
+    HistoricalReplayExampleInsert, LiveFillSyncRecord, LiveOrderSyncRecord, LivePositionSyncRecord,
     LiveTradeReconciliationSnapshot, ModelBenchmarkResultInsert, ModelBenchmarkRunInsert,
     OpenLiveTradeForReconciliation, OpenTradeForExit, PendingExecutionIntent, Storage,
-    TradeExitProgress, TrainedModelArtifactCard, WorkerStatusCard, ClosedTradeNotification,
+    TradeExitProgress, TrainedModelArtifactCard, WorkerStatusCard,
 };

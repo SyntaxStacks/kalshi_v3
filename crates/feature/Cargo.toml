@@ -16,3 +16,4 @@ storage = { path = "../storage" }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+market-data = { path = "../market-data" }

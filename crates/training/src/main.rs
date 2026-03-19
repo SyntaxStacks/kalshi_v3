@@ -1,6 +1,9 @@
 use anyhow::Result;
 use chrono::{DateTime, NaiveDateTime, Utc};
-use common::{AppConfig, LaneState, MarketFamily, PromotionState, StrategyFamily, lane_key};
+use common::{
+    AppConfig, LaneState, MarketFamily, MarketFeatureSnapshotRecord, PromotionState,
+    StrategyFamily, lane_key,
+};
 use market_models::{
     BASELINE_LOGIT_V1, FeatureVector, TRAINED_LINEAR_CONTRARIAN_V1, TRAINED_LINEAR_V1,
     TrainedLinearWeights, supported_models,
@@ -12,9 +15,7 @@ use rusqlite::Connection;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use storage::{
-    HistoricalReplayExampleInsert, ModelBenchmarkResultInsert, ModelBenchmarkRunInsert,
-};
+use storage::{HistoricalReplayExampleInsert, ModelBenchmarkResultInsert, ModelBenchmarkRunInsert};
 use tracing::{info, warn};
 
 #[tokio::main]
@@ -133,27 +134,7 @@ async fn training_pass(config: &AppConfig, storage: &storage::Storage) -> Result
                         time_to_expiry_bucket: current.time_to_expiry_bucket.clone(),
                         target_yes_probability: next.market_prob,
                         market_prob: current.market_prob,
-                        features: FeatureVector {
-                            market_prob: current.market_prob,
-                            reference_yes_prob: current.reference_yes_prob,
-                            reference_gap_bps_scaled: (current.reference_gap_bps / 1_000.0)
-                                .clamp(-1.5, 1.5),
-                            threshold_distance_bps_scaled: (current.threshold_distance_bps_proxy
-                                / 500.0)
-                                .clamp(-1.5, 1.5),
-                            order_book_imbalance: current.order_book_imbalance,
-                            aggressive_buy_ratio: current.aggressive_buy_ratio,
-                            venue_quality_score: current.venue_quality_score,
-                            market_data_age_scaled: (current.market_data_age_seconds as f64 / 20.0)
-                                .clamp(0.0, 1.5),
-                            reference_age_scaled: (current.reference_age_seconds as f64 / 20.0)
-                                .clamp(0.0, 1.5),
-                            averaging_window_progress: current
-                                .averaging_window_progress
-                                .clamp(0.0, 1.0),
-                            seconds_to_expiry_scaled: (current.seconds_to_expiry as f64 / 900.0)
-                                .clamp(0.0, 1.0),
-                        },
+                        features: feature_vector_from_snapshot(current),
                     });
                 }
             }
@@ -453,8 +434,16 @@ fn train_symbol_linear_weights(examples: &[ReplayExample]) -> TrainedLinearWeigh
         reference_yes_prob: 0.6,
         reference_gap_bps_scaled: 0.15,
         threshold_distance_bps_scaled: 0.12,
+        distance_to_strike_bps_scaled: 0.22,
+        reference_velocity_scaled: 0.10,
+        realized_vol_short_scaled: 0.06,
+        time_decay_factor: 0.04,
         order_book_imbalance: 0.10,
         aggressive_buy_ratio: 0.08,
+        size_ahead_scaled: -0.06,
+        trade_rate_scaled: 0.10,
+        quote_churn_scaled: -0.05,
+        spread_bps_scaled: -0.10,
         venue_quality_score: 0.05,
         market_data_age_scaled: -0.05,
         reference_age_scaled: -0.04,
@@ -484,12 +473,36 @@ fn train_symbol_linear_weights(examples: &[ReplayExample]) -> TrainedLinearWeigh
             weights.threshold_distance_bps_scaled += learning_rate
                 * ((error * example.features.threshold_distance_bps_scaled)
                     - (regularization * weights.threshold_distance_bps_scaled));
+            weights.distance_to_strike_bps_scaled += learning_rate
+                * ((error * example.features.distance_to_strike_bps_scaled)
+                    - (regularization * weights.distance_to_strike_bps_scaled));
+            weights.reference_velocity_scaled += learning_rate
+                * ((error * example.features.reference_velocity_scaled)
+                    - (regularization * weights.reference_velocity_scaled));
+            weights.realized_vol_short_scaled += learning_rate
+                * ((error * example.features.realized_vol_short_scaled)
+                    - (regularization * weights.realized_vol_short_scaled));
+            weights.time_decay_factor += learning_rate
+                * ((error * example.features.time_decay_factor)
+                    - (regularization * weights.time_decay_factor));
             weights.order_book_imbalance += learning_rate
                 * ((error * example.features.order_book_imbalance)
                     - (regularization * weights.order_book_imbalance));
             weights.aggressive_buy_ratio += learning_rate
                 * ((error * example.features.aggressive_buy_ratio)
                     - (regularization * weights.aggressive_buy_ratio));
+            weights.size_ahead_scaled += learning_rate
+                * ((error * example.features.size_ahead_scaled)
+                    - (regularization * weights.size_ahead_scaled));
+            weights.trade_rate_scaled += learning_rate
+                * ((error * example.features.trade_rate_scaled)
+                    - (regularization * weights.trade_rate_scaled));
+            weights.quote_churn_scaled += learning_rate
+                * ((error * example.features.quote_churn_scaled)
+                    - (regularization * weights.quote_churn_scaled));
+            weights.spread_bps_scaled += learning_rate
+                * ((error * example.features.spread_bps_scaled)
+                    - (regularization * weights.spread_bps_scaled));
             weights.venue_quality_score += learning_rate
                 * ((error * example.features.venue_quality_score)
                     - (regularization * weights.venue_quality_score));
@@ -537,14 +550,14 @@ fn optimize_trained_policy(
                         min_seconds_to_expiry_scaled,
                         execution_cost: default_policy.execution_cost,
                     };
-                let Some(result) = benchmark_single_model(
-                    lane_key,
-                    TRAINED_LINEAR_V1,
-                    examples,
-                    policy,
-                    Some(trained_weights),
-                ) else {
-                    continue;
+                    let Some(result) = benchmark_single_model(
+                        lane_key,
+                        TRAINED_LINEAR_V1,
+                        examples,
+                        policy,
+                        Some(trained_weights),
+                    ) else {
+                        continue;
                     };
                     let replay_score = if result.execution_pnl >= 0.0 {
                         result.execution_pnl - (result.trade_count as f64 * 0.0015)
@@ -603,10 +616,7 @@ fn optimize_trained_policy(
 }
 
 fn uses_trained_linear_weights(model_name: &str) -> bool {
-    matches!(
-        model_name,
-        TRAINED_LINEAR_V1 | TRAINED_LINEAR_CONTRARIAN_V1
-    )
+    matches!(model_name, TRAINED_LINEAR_V1 | TRAINED_LINEAR_CONTRARIAN_V1)
 }
 
 fn linear_score(weights: &TrainedLinearWeights, features: &FeatureVector) -> f64 {
@@ -615,13 +625,50 @@ fn linear_score(weights: &TrainedLinearWeights, features: &FeatureVector) -> f64
         + (weights.reference_yes_prob * features.reference_yes_prob)
         + (weights.reference_gap_bps_scaled * features.reference_gap_bps_scaled)
         + (weights.threshold_distance_bps_scaled * features.threshold_distance_bps_scaled)
+        + (weights.distance_to_strike_bps_scaled * features.distance_to_strike_bps_scaled)
+        + (weights.reference_velocity_scaled * features.reference_velocity_scaled)
+        + (weights.realized_vol_short_scaled * features.realized_vol_short_scaled)
+        + (weights.time_decay_factor * features.time_decay_factor)
         + (weights.order_book_imbalance * features.order_book_imbalance)
         + (weights.aggressive_buy_ratio * features.aggressive_buy_ratio)
+        + (weights.size_ahead_scaled * features.size_ahead_scaled)
+        + (weights.trade_rate_scaled * features.trade_rate_scaled)
+        + (weights.quote_churn_scaled * features.quote_churn_scaled)
+        + (weights.spread_bps_scaled * features.spread_bps_scaled)
         + (weights.venue_quality_score * features.venue_quality_score)
         + (weights.market_data_age_scaled * features.market_data_age_scaled)
         + (weights.reference_age_scaled * features.reference_age_scaled)
         + (weights.averaging_window_progress * features.averaging_window_progress)
         + (weights.seconds_to_expiry_scaled * features.seconds_to_expiry_scaled)
+}
+
+fn feature_vector_from_snapshot(snapshot: &MarketFeatureSnapshotRecord) -> FeatureVector {
+    FeatureVector {
+        market_prob: snapshot.market_prob,
+        reference_yes_prob: snapshot.reference_yes_prob,
+        reference_gap_bps_scaled: (snapshot.reference_gap_bps / 1_000.0).clamp(-1.5, 1.5),
+        threshold_distance_bps_scaled: (snapshot.threshold_distance_bps_proxy / 500.0)
+            .clamp(-1.5, 1.5),
+        distance_to_strike_bps_scaled: (snapshot.distance_to_strike_bps / 500.0).clamp(-2.5, 2.5),
+        reference_velocity_scaled: (snapshot.reference_velocity / 25.0).clamp(-2.0, 2.0),
+        realized_vol_short_scaled: (snapshot.realized_vol_short / 50.0).clamp(0.0, 2.0),
+        time_decay_factor: snapshot.time_decay_factor.clamp(0.0, 1.0),
+        order_book_imbalance: snapshot.order_book_imbalance,
+        aggressive_buy_ratio: snapshot.aggressive_buy_ratio,
+        size_ahead_scaled: (snapshot.size_ahead / 100.0).clamp(0.0, 3.0),
+        trade_rate_scaled: (snapshot.trade_rate / 50.0).clamp(0.0, 3.0),
+        quote_churn_scaled: snapshot.quote_churn.clamp(0.0, 3.0),
+        size_ahead_real_scaled: (snapshot.size_ahead_real / 100.0).clamp(0.0, 5.0),
+        trade_consumption_rate_scaled: (snapshot.trade_consumption_rate / 25.0).clamp(0.0, 5.0),
+        cancel_rate_scaled: (snapshot.cancel_rate / 25.0).clamp(0.0, 5.0),
+        queue_decay_rate_scaled: (snapshot.queue_decay_rate / 25.0).clamp(0.0, 5.0),
+        spread_bps_scaled: (snapshot.spread_bps / 1_000.0).clamp(0.0, 2.0),
+        venue_quality_score: snapshot.venue_quality_score,
+        market_data_age_scaled: (snapshot.market_data_age_seconds as f64 / 20.0).clamp(0.0, 1.5),
+        reference_age_scaled: (snapshot.reference_age_seconds as f64 / 20.0).clamp(0.0, 1.5),
+        averaging_window_progress: snapshot.averaging_window_progress.clamp(0.0, 1.0),
+        seconds_to_expiry_scaled: (snapshot.seconds_to_expiry as f64 / 900.0).clamp(0.0, 1.0),
+    }
 }
 
 async fn backfill_historical_examples_from_v2(
@@ -737,13 +784,53 @@ fn load_v2_historical_batch(
         } else {
             0.0
         };
+        let reference_velocity = micro
+            .get("reference_price")
+            .and_then(serde_json::Value::as_f64)
+            .zip(
+                micro.get("previous_reference_price")
+                    .and_then(serde_json::Value::as_f64),
+            )
+            .map(|(current, previous)| (current - previous) / 5.0)
+            .unwrap_or_default();
+        let realized_vol_short = reference_velocity.abs() * 5.0;
+        let spread_bps = micro
+            .get("spread_bps")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(120.0);
+        let distance_to_strike_bps = (((market_prob - 0.5) * 10_000.0) * 0.8).clamp(-3_000.0, 3_000.0);
+        let time_decay_factor = (-0.0025 * seconds_to_expiry as f64).exp().clamp(0.0, 1.0);
+        let size_ahead = micro
+            .get("ask_size")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(25.0);
+        let trade_rate = micro
+            .get("trade_rate")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(12.0);
+        let quote_churn = micro
+            .get("quote_churn")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.2);
         let feature_vector_json = json!({
             "market_prob": market_prob,
             "reference_yes_prob": reference_yes_prob,
             "reference_gap_bps_scaled": (reference_gap_bps / 1_000.0).clamp(-1.5, 1.5),
             "threshold_distance_bps_scaled": (((market_prob - 0.5) * 10_000.0) / 500.0).clamp(-1.5, 1.5),
+            "distance_to_strike_bps_scaled": (distance_to_strike_bps / 500.0).clamp(-2.5, 2.5),
+            "reference_velocity_scaled": (reference_velocity / 25.0).clamp(-2.0, 2.0),
+            "realized_vol_short_scaled": (realized_vol_short / 50.0).clamp(0.0, 2.0),
+            "time_decay_factor": time_decay_factor,
             "order_book_imbalance": 0.0,
             "aggressive_buy_ratio": 0.5,
+            "size_ahead_scaled": (size_ahead / 100.0).clamp(0.0, 3.0),
+            "trade_rate_scaled": (trade_rate / 50.0).clamp(0.0, 3.0),
+            "quote_churn_scaled": quote_churn.clamp(0.0, 3.0),
+            "size_ahead_real_scaled": (size_ahead / 100.0).clamp(0.0, 5.0),
+            "trade_consumption_rate_scaled": (trade_rate / 25.0).clamp(0.0, 5.0),
+            "cancel_rate_scaled": (quote_churn / 2.0).clamp(0.0, 5.0),
+            "queue_decay_rate_scaled": quote_churn.clamp(0.0, 5.0),
+            "spread_bps_scaled": (spread_bps / 1_000.0).clamp(0.0, 2.0),
             "venue_quality_score": (1.0 - (feature_age_seconds / 60.0)).clamp(0.2, 0.9),
             "market_data_age_scaled": (feature_age_seconds / 20.0).clamp(0.0, 1.5),
             "reference_age_scaled": (reference_age_seconds / 20.0).clamp(0.0, 1.5),

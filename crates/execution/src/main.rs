@@ -3,12 +3,17 @@ use common::{
     AppConfig, MarketFamily, StrategyFamily, TradeMode, kalshi_api_key_id, kalshi_private_key,
     kalshi_sign_rest_request, kalshi_timestamp_ms,
 };
+use market_data::{ContractSide, QueueSideSummary, QueueSnapshot};
+use redis::AsyncCommands;
 use reqwest::{Client, StatusCode};
 use rsa::RsaPrivateKey;
 use serde::Deserialize;
 use serde_json::json;
 use storage::{ActiveLiveExecutionIntent, ExecutionIntentStateUpdate, OpenTradeForExit};
 use tracing::{info, warn};
+
+const EXECUTION_SCORE_THRESHOLD_BPS: f64 = 10.0;
+const REDIS_QUEUE_PREFIX: &str = "v3:queue:";
 
 #[derive(Clone)]
 struct LiveKalshiClient {
@@ -100,6 +105,7 @@ async fn main() -> Result<()> {
     let config = AppConfig::load()?;
     let storage = storage::Storage::connect(&config.database_url).await?;
     storage.migrate().await?;
+    let redis_client = redis::Client::open(config.redis_url.clone())?;
     let public_client = build_public_client(&config)?;
     let live_client = build_live_client(&config)?;
     storage
@@ -124,6 +130,7 @@ async fn main() -> Result<()> {
         interval.tick().await;
         match execute_once(
             &storage,
+            &redis_client,
             &public_client,
             live_client.as_ref(),
             config.live_order_placement_enabled,
@@ -179,6 +186,7 @@ async fn main() -> Result<()> {
 
 async fn execute_once(
     storage: &storage::Storage,
+    redis_client: &redis::Client,
     public_client: &PublicKalshiClient,
     live_client: Option<&LiveKalshiClient>,
     live_order_placement_enabled_config: bool,
@@ -200,6 +208,7 @@ async fn execute_once(
     usize,
     usize,
 )> {
+    let mut redis = redis_client.get_multiplexed_async_connection().await?;
     storage
         .reconcile_bankroll_for_mode(common::TradeMode::Paper)
         .await?;
@@ -246,7 +255,12 @@ async fn execute_once(
         .map(|card| card.deployable_balance.max(0.0))
         .unwrap_or(0.0);
 
-    let intents = storage.list_pending_execution_intents(12).await?;
+    let mut intents = storage.list_pending_execution_intents(12).await?;
+    intents.sort_by(|left, right| {
+        pending_intent_priority(right)
+            .total_cmp(&pending_intent_priority(left))
+            .then_with(|| left.created_at.cmp(&right.created_at))
+    });
     let mut opened = 0usize;
     let mut rejected = 0usize;
     for intent in intents {
@@ -285,20 +299,53 @@ async fn execute_once(
 
         match intent.mode {
             TradeMode::Paper => {
+                if intent.market_family == MarketFamily::Crypto {
+                    let Some(snapshot) = storage
+                        .latest_feature_snapshot_for_market(intent.market_id)
+                        .await?
+                    else {
+                        storage
+                            .mark_execution_intent_status(
+                                intent.intent_id,
+                                "rejected",
+                                Some("missing_feature_snapshot"),
+                            )
+                            .await?;
+                        rejected += 1;
+                        continue;
+                    };
+                    let queue_snapshot =
+                        load_queue_snapshot(&mut redis, &snapshot.market_ticker).await?;
+                    let threshold = execution_score_threshold(&intent);
+                    let current_score =
+                        current_crypto_execution_score(&intent, &snapshot, queue_snapshot.as_ref())
+                            .unwrap_or(f64::NEG_INFINITY);
+                    if current_score <= threshold {
+                        storage
+                            .mark_execution_intent_status(
+                                intent.intent_id,
+                                "rejected",
+                                Some("execution_score_below_threshold"),
+                            )
+                            .await?;
+                        rejected += 1;
+                        continue;
+                    }
+                }
                 let quantity = (position_notional / theoretical_entry_price.max(0.05)).max(1.0);
                 storage
                     .open_trade_from_intent(&intent, quantity, theoretical_entry_price)
                     .await?;
                 match intent.market_family {
                     MarketFamily::Weather => {
-                        paper_weather_remaining =
-                            (paper_weather_remaining - (quantity * theoretical_entry_price))
-                                .max(0.0);
+                        paper_weather_remaining = (paper_weather_remaining
+                            - (quantity * theoretical_entry_price))
+                            .max(0.0);
                     }
                     _ => {
-                        paper_crypto_remaining =
-                            (paper_crypto_remaining - (quantity * theoretical_entry_price))
-                                .max(0.0);
+                        paper_crypto_remaining = (paper_crypto_remaining
+                            - (quantity * theoretical_entry_price))
+                            .max(0.0);
                     }
                 }
                 opened += 1;
@@ -343,6 +390,23 @@ async fn execute_once(
                     rejected += 1;
                     continue;
                 };
+                let queue_snapshot =
+                    load_queue_snapshot(&mut redis, &snapshot.market_ticker).await?;
+                let threshold = execution_score_threshold(&intent);
+                let current_score =
+                    current_crypto_execution_score(&intent, &snapshot, queue_snapshot.as_ref())
+                        .unwrap_or(f64::NEG_INFINITY);
+                if intent.market_family == MarketFamily::Crypto && current_score <= threshold {
+                    storage
+                        .mark_execution_intent_status(
+                            intent.intent_id,
+                            "rejected",
+                            Some("execution_score_below_threshold"),
+                        )
+                        .await?;
+                    rejected += 1;
+                    continue;
+                }
                 let quantity = (position_notional / theoretical_entry_price.max(0.05)).floor();
                 if quantity < 1.0 {
                     storage
@@ -757,14 +821,8 @@ async fn reconcile_active_live_intents(
             && order_is_resting(&order.status)
             && !time_in_force_is_fill_or_kill(entry_time_in_force)
         {
-            if replace_live_entry_order(
-                storage,
-                live_client,
-                &intent,
-                &order,
-                entry_time_in_force,
-            )
-            .await?
+            if replace_live_entry_order(storage, live_client, &intent, &order, entry_time_in_force)
+                .await?
             {
                 synced += 1;
                 cleaned += 1;
@@ -1097,7 +1155,8 @@ async fn handle_live_entry_placement_result(
                         &live_metadata,
                     )
                     .await?;
-            } else if let Some(intent_record) = storage.execution_intent_by_id(intent.intent_id).await?
+            } else if let Some(intent_record) =
+                storage.execution_intent_by_id(intent.intent_id).await?
             {
                 storage
                     .open_trade_from_intent_with_metadata_and_status(
@@ -1243,9 +1302,8 @@ async fn reconcile_active_live_exit_orders(
             .await?;
         synced += 1;
 
-        let age_seconds = order_age_seconds(&order).unwrap_or_else(|| {
-            (chrono::Utc::now() - trade.created_at).num_seconds().max(0)
-        });
+        let age_seconds = order_age_seconds(&order)
+            .unwrap_or_else(|| (chrono::Utc::now() - trade.created_at).num_seconds().max(0));
 
         if replace_enabled
             && age_seconds >= replace_after_seconds
@@ -1349,7 +1407,10 @@ async fn replace_live_exit_order(
     );
     let placement = place_live_exit_with_client_order_id(
         live_client,
-        trade.market_ticker.as_deref().unwrap_or(&snapshot.market_ticker),
+        trade
+            .market_ticker
+            .as_deref()
+            .unwrap_or(&snapshot.market_ticker),
         &trade.side,
         quantity,
         exit_price,
@@ -1513,7 +1574,9 @@ async fn close_trade_for_mode(
             )
             .await?
             {
-                placement => handle_live_exit_placement_result(storage, trade, placement, status).await?,
+                placement => {
+                    handle_live_exit_placement_result(storage, trade, placement, status).await?
+                }
             }
         }
     }
@@ -1944,6 +2007,126 @@ fn contract_price_for_side(side: &str, market_prob: f64) -> f64 {
     }
 }
 
+fn pending_intent_priority(intent: &storage::PendingExecutionIntent) -> f64 {
+    stop_condition_value(&intent.stop_conditions_json, "execution_score_bps").unwrap_or_default()
+        + stop_condition_value(&intent.stop_conditions_json, "fill_probability").unwrap_or_default()
+            * 25.0
+}
+
+fn execution_score_threshold(intent: &storage::PendingExecutionIntent) -> f64 {
+    stop_condition_value(
+        &intent.stop_conditions_json,
+        "execution_score_threshold_bps",
+    )
+    .unwrap_or(EXECUTION_SCORE_THRESHOLD_BPS)
+}
+
+fn stop_condition_value(stop_conditions: &[String], key: &str) -> Option<f64> {
+    stop_conditions.iter().find_map(|condition| {
+        let (prefix, raw_value) = condition.split_once(':')?;
+        if prefix == key {
+            raw_value.parse::<f64>().ok()
+        } else {
+            None
+        }
+    })
+}
+
+async fn load_queue_snapshot(
+    redis: &mut redis::aio::MultiplexedConnection,
+    market_ticker: &str,
+) -> Result<Option<QueueSnapshot>> {
+    let raw: Option<String> = redis
+        .get(format!("{REDIS_QUEUE_PREFIX}{market_ticker}"))
+        .await
+        .ok();
+    Ok(raw
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<QueueSnapshot>(value).ok()))
+}
+
+fn queue_contract_side(side: &str) -> Option<ContractSide> {
+    match side {
+        "buy_yes" => Some(ContractSide::Yes),
+        "buy_no" => Some(ContractSide::No),
+        _ => None,
+    }
+}
+
+fn queue_side_summary<'a>(
+    queue_snapshot: Option<&'a QueueSnapshot>,
+    side: &str,
+) -> Option<&'a QueueSideSummary> {
+    match (queue_snapshot, queue_contract_side(side)) {
+        (Some(queue), Some(ContractSide::Yes)) => Some(&queue.yes),
+        (Some(queue), Some(ContractSide::No)) => Some(&queue.no),
+        _ => None,
+    }
+}
+
+fn estimate_fill_probability(
+    size_ahead: f64,
+    trade_consumption_rate: f64,
+    cancel_rate: f64,
+    seconds_to_expiry: f64,
+) -> f64 {
+    let effective_rate = (trade_consumption_rate + cancel_rate).max(0.0);
+    if effective_rate <= f64::EPSILON {
+        return 0.0;
+    }
+    let expected_fill_time = size_ahead.max(1.0) / effective_rate;
+    if !expected_fill_time.is_finite() || expected_fill_time <= f64::EPSILON {
+        return 0.0;
+    }
+    (seconds_to_expiry / expected_fill_time).clamp(0.0, 1.0)
+}
+
+fn current_crypto_execution_score(
+    intent: &storage::PendingExecutionIntent,
+    snapshot: &common::MarketFeatureSnapshotRecord,
+    queue_snapshot: Option<&QueueSnapshot>,
+) -> Option<f64> {
+    if intent.market_family != MarketFamily::Crypto {
+        return None;
+    }
+    let raw_edge_bps = if intent.side == "buy_no" {
+        ((snapshot.market_prob - intent.model_prob) * 10_000.0).max(0.0)
+    } else {
+        ((intent.model_prob - snapshot.market_prob) * 10_000.0).max(0.0)
+    };
+    let queue_summary = queue_side_summary(queue_snapshot, &intent.side);
+    let size_ahead = queue_summary
+        .map(|queue| queue.size_ahead_real)
+        .unwrap_or(snapshot.size_ahead_real.max(snapshot.size_ahead.max(1.0)))
+        .max(1.0);
+    let trade_consumption_rate = queue_summary
+        .map(|queue| queue.trade_consumption_rate)
+        .unwrap_or(snapshot.trade_consumption_rate.max(snapshot.trade_rate))
+        .max(0.0);
+    let cancel_rate = queue_summary
+        .map(|queue| queue.cancel_rate)
+        .unwrap_or(snapshot.cancel_rate.max(0.0))
+        .max(0.0);
+    let queue_decay_rate = queue_summary
+        .map(|queue| queue.queue_decay_rate)
+        .unwrap_or(snapshot.queue_decay_rate.max(0.0))
+        .max(0.0);
+    let fill_probability = estimate_fill_probability(
+        size_ahead,
+        trade_consumption_rate,
+        cancel_rate,
+        f64::from(snapshot.seconds_to_expiry.max(1)),
+    );
+    let expected_slippage_bps = snapshot.spread_bps * 0.5;
+    let adverse_selection_bps = (snapshot.aggressive_buy_ratio * snapshot.spread_bps)
+        + ((cancel_rate + queue_decay_rate) * 10.0)
+        + (snapshot.quote_churn * 5.0);
+    Some(
+        (raw_edge_bps * fill_probability) - expected_slippage_bps - adverse_selection_bps
+            + (intent.confidence * 5.0),
+    )
+}
+
 fn settlement_contract_price(side: &str, resolved_yes: bool) -> f64 {
     match (side == "buy_no", resolved_yes) {
         (true, true) => 0.0,
@@ -2145,9 +2328,15 @@ mod tests {
 
     #[test]
     fn detects_active_live_exit_order_states() {
-        assert!(live_trade_has_active_exit_order(&sample_open_trade(Some("acknowledged"))));
-        assert!(live_trade_has_active_exit_order(&sample_open_trade(Some("partially_filled"))));
-        assert!(!live_trade_has_active_exit_order(&sample_open_trade(Some("cancelled"))));
+        assert!(live_trade_has_active_exit_order(&sample_open_trade(Some(
+            "acknowledged"
+        ))));
+        assert!(live_trade_has_active_exit_order(&sample_open_trade(Some(
+            "partially_filled"
+        ))));
+        assert!(!live_trade_has_active_exit_order(&sample_open_trade(Some(
+            "cancelled"
+        ))));
         assert!(!live_trade_has_active_exit_order(&sample_open_trade(None)));
     }
 
@@ -2177,9 +2366,13 @@ mod tests {
     fn stale_crypto_paper_trade_detection_ignores_live_trades() {
         let mut trade = sample_open_trade(None);
         trade.mode = TradeMode::Paper;
-        assert!(should_force_reconcile_stale_paper_crypto_trade(&trade, 1900));
+        assert!(should_force_reconcile_stale_paper_crypto_trade(
+            &trade, 1900
+        ));
         trade.mode = TradeMode::Live;
-        assert!(!should_force_reconcile_stale_paper_crypto_trade(&trade, 1900));
+        assert!(!should_force_reconcile_stale_paper_crypto_trade(
+            &trade, 1900
+        ));
     }
 
     #[test]
@@ -2188,5 +2381,22 @@ mod tests {
         assert_eq!(settlement_contract_price("buy_yes", false), 0.0);
         assert_eq!(settlement_contract_price("buy_no", true), 0.0);
         assert_eq!(settlement_contract_price("buy_no", false), 1.0);
+    }
+
+    #[test]
+    fn stop_condition_value_extracts_numeric_thresholds() {
+        let stop_conditions = vec![
+            "expiry_exit".to_string(),
+            "execution_score_bps:42.5".to_string(),
+            "fill_probability:0.75".to_string(),
+        ];
+        assert_eq!(
+            stop_condition_value(&stop_conditions, "execution_score_bps"),
+            Some(42.5)
+        );
+        assert_eq!(
+            stop_condition_value(&stop_conditions, "fill_probability"),
+            Some(0.75)
+        );
     }
 }

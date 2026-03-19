@@ -10,6 +10,8 @@ chrono.workspace = true
 common = { path = "../common" }
 dotenvy.workspace = true
 market-models = { path = "../market-models" }
+market-data = { path = "../market-data" }
+redis.workspace = true
 serde_json.workspace = true
 storage = { path = "../storage" }
 tokio.workspace = true

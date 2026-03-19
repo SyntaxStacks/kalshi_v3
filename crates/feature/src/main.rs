@@ -4,12 +4,14 @@ use common::{
     AppConfig, KalshiMarketState, MarketFamily, MarketFeatureSnapshotRecord, ReferencePriceState,
     WeatherReferenceState,
 };
+use market_data::QueueSnapshot;
 use redis::AsyncCommands;
 use tracing::{info, warn};
 
 const REDIS_MARKETS_KEY: &str = "v3:kalshi:markets";
+const REDIS_QUEUE_PREFIX: &str = "v3:queue:";
 const REDIS_WEATHER_REFERENCE_PREFIX: &str = "v3:weather:reference:";
-const CRYPTO_FEATURE_VERSION: &str = "v3_ws_feature_v2";
+const CRYPTO_FEATURE_VERSION: &str = "v3_ws_feature_v3";
 const WEATHER_FEATURE_VERSION: &str = "v3_weather_feature_v1";
 
 #[tokio::main]
@@ -113,6 +115,13 @@ async fn materialize_once(
                 let reference = raw_reference
                     .as_deref()
                     .and_then(|raw| serde_json::from_str::<ReferencePriceState>(raw).ok());
+                let raw_queue: Option<String> = redis
+                    .get(format!("{REDIS_QUEUE_PREFIX}{}", market.market_ticker))
+                    .await
+                    .ok();
+                let queue_snapshot = raw_queue
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str::<QueueSnapshot>(raw).ok());
                 build_crypto_snapshot(
                     &market,
                     seconds_to_expiry,
@@ -123,6 +132,7 @@ async fn materialize_once(
                     market_data_age_seconds,
                     now,
                     reference,
+                    queue_snapshot,
                 )
             }
         };
@@ -148,7 +158,9 @@ fn build_crypto_snapshot(
     market_data_age_seconds: i32,
     now: chrono::DateTime<Utc>,
     reference: Option<ReferencePriceState>,
+    queue_snapshot: Option<QueueSnapshot>,
 ) -> MarketFeatureSnapshotRecord {
+    let strike_price = crypto_strike_price(market).unwrap_or(0.0);
     let (
         reference_price,
         reference_previous_price,
@@ -187,6 +199,27 @@ fn build_crypto_snapshot(
     } else {
         (0.0, 0.0, 0.0, market.market_prob, 9_999, 0.0, 0.0)
     };
+    let distance_to_strike_bps = if strike_price > 0.0 && reference_price > 0.0 {
+        ((reference_price - strike_price) / strike_price) * 10_000.0
+    } else {
+        threshold_distance_bps_proxy
+    };
+    let reference_velocity = (reference_price - reference_previous_price) / 5.0;
+    let realized_vol_short = stddev(&[
+        reference_previous_price,
+        last_minute_avg_proxy,
+        reference_price,
+    ]);
+    let time_decay_factor = (-0.0025 * seconds_to_expiry as f64).exp().clamp(0.0, 1.0);
+    let queue_features = queue_features(
+        queue_snapshot.as_ref(),
+        depth_total,
+        spread,
+        market_data_age_seconds,
+    );
+    let size_ahead = queue_features.size_ahead_real.max(market.ask_size.max(1.0));
+    let trade_rate = queue_features.trade_consumption_rate;
+    let quote_churn = queue_features.quote_churn;
     let reference_gap_bps = (reference_yes_prob - market.market_prob) * 10_000.0;
     let freshness_score = (1.0 - (market_data_age_seconds as f64 / 20.0)).clamp(0.0, 1.0) * 0.6
         + (1.0 - (reference_age_seconds as f64 / 20.0)).clamp(0.0, 1.0) * 0.4;
@@ -233,6 +266,17 @@ fn build_crypto_snapshot(
         reference_yes_prob,
         reference_gap_bps,
         threshold_distance_bps_proxy,
+        distance_to_strike_bps,
+        reference_velocity,
+        realized_vol_short,
+        time_decay_factor,
+        size_ahead,
+        trade_rate,
+        quote_churn,
+        size_ahead_real: queue_features.size_ahead_real,
+        trade_consumption_rate: queue_features.trade_consumption_rate,
+        cancel_rate: queue_features.cancel_rate,
+        queue_decay_rate: queue_features.queue_decay_rate,
         averaging_window_progress,
         settlement_regime,
         last_minute_avg_proxy,
@@ -326,6 +370,17 @@ fn build_weather_snapshot(
         reference_yes_prob: probability_yes,
         reference_gap_bps,
         threshold_distance_bps_proxy: threshold_distance * 100.0,
+        distance_to_strike_bps: threshold_distance * 100.0,
+        reference_velocity: 0.0,
+        realized_vol_short: 0.0,
+        time_decay_factor: (-0.0001 * seconds_to_expiry as f64).exp().clamp(0.0, 1.0),
+        size_ahead: market.ask_size.max(1.0),
+        trade_rate: 0.0,
+        quote_churn: 0.0,
+        size_ahead_real: market.ask_size.max(1.0),
+        trade_consumption_rate: 0.0,
+        cancel_rate: 0.0,
+        queue_decay_rate: 0.0,
         averaging_window_progress,
         settlement_regime,
         last_minute_avg_proxy: observation_temp.unwrap_or(forecast_temp),
@@ -365,8 +420,16 @@ fn weather_metadata(market: &KalshiMarketState) -> Option<WeatherMarketMetadata>
     }
     Some(WeatherMarketMetadata {
         city: market.metadata_json.get("city")?.as_str()?.to_string(),
-        contract_kind: market.metadata_json.get("contract_kind")?.as_str()?.to_string(),
-        market_date: market.metadata_json.get("market_date")?.as_str()?.to_string(),
+        contract_kind: market
+            .metadata_json
+            .get("contract_kind")?
+            .as_str()?
+            .to_string(),
+        market_date: market
+            .metadata_json
+            .get("market_date")?
+            .as_str()?
+            .to_string(),
         strike_type: market
             .metadata_json
             .get("strike_type")
@@ -422,9 +485,14 @@ fn weather_probability_yes(
     }
 }
 
-fn weather_threshold_distance(metadata: &WeatherMarketMetadata, forecast_temperature_f: f64) -> f64 {
+fn weather_threshold_distance(
+    metadata: &WeatherMarketMetadata,
+    forecast_temperature_f: f64,
+) -> f64 {
     match metadata.strike_type.as_str() {
-        "greater" => forecast_temperature_f - metadata.floor_strike.unwrap_or(forecast_temperature_f),
+        "greater" => {
+            forecast_temperature_f - metadata.floor_strike.unwrap_or(forecast_temperature_f)
+        }
         "less" => metadata.cap_strike.unwrap_or(forecast_temperature_f) - forecast_temperature_f,
         _ => {
             let midpoint = match (metadata.floor_strike, metadata.cap_strike) {
@@ -456,6 +524,90 @@ fn weather_settlement_regime(seconds_to_expiry: i32) -> &'static str {
         0..=10_800 => "same_day_settlement",
         10_801..=43_200 => "overnight_settlement",
         _ => "forecast_window",
+    }
+}
+
+fn crypto_strike_price(market: &KalshiMarketState) -> Option<f64> {
+    market
+        .metadata_json
+        .get("target_price")
+        .and_then(serde_json::Value::as_f64)
+        .or_else(|| parse_title_target_price(&market.market_title))
+        .or_else(|| parse_title_target_price(&market.market_ticker))
+}
+
+fn parse_title_target_price(raw: &str) -> Option<f64> {
+    let marker = raw.find('$')?;
+    let numeric = raw[marker + 1..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit() || *ch == '.' || *ch == ',')
+        .collect::<String>()
+        .replace(',', "");
+    numeric.parse::<f64>().ok()
+}
+
+fn stddev(values: &[f64]) -> f64 {
+    let filtered = values
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .collect::<Vec<_>>();
+    if filtered.len() < 2 {
+        return 0.0;
+    }
+    let mean = filtered.iter().sum::<f64>() / filtered.len() as f64;
+    let variance = filtered
+        .iter()
+        .map(|value| (value - mean).powi(2))
+        .sum::<f64>()
+        / filtered.len() as f64;
+    variance.sqrt()
+}
+
+struct QueueFeatures {
+    size_ahead_real: f64,
+    trade_consumption_rate: f64,
+    cancel_rate: f64,
+    queue_decay_rate: f64,
+    quote_churn: f64,
+}
+
+fn queue_features(
+    queue_snapshot: Option<&QueueSnapshot>,
+    depth_total: f64,
+    spread: f64,
+    market_data_age_seconds: i32,
+) -> QueueFeatures {
+    if let Some(queue) = queue_snapshot {
+        let size_ahead_real =
+            ((queue.yes.size_ahead_real + queue.no.size_ahead_real) / 2.0).max(1.0);
+        let trade_consumption_rate =
+            ((queue.yes.trade_consumption_rate + queue.no.trade_consumption_rate) / 2.0).max(0.0);
+        let cancel_rate = ((queue.yes.cancel_rate + queue.no.cancel_rate) / 2.0).max(0.0);
+        let queue_decay_rate =
+            ((queue.yes.queue_decay_rate + queue.no.queue_decay_rate) / 2.0).max(0.0);
+        let quote_churn = (cancel_rate + queue_decay_rate).clamp(0.0, 5.0);
+        return QueueFeatures {
+            size_ahead_real,
+            trade_consumption_rate,
+            cancel_rate,
+            queue_decay_rate,
+            quote_churn,
+        };
+    }
+
+    let size_ahead_real = depth_total.max(1.0);
+    let trade_consumption_rate =
+        (depth_total / f64::from(market_data_age_seconds.max(1))).clamp(0.0, 500.0);
+    let queue_decay_rate = (spread / 250.0).clamp(0.0, 5.0);
+    let cancel_rate = (queue_decay_rate * 0.5).clamp(0.0, 5.0);
+    let quote_churn = (cancel_rate + queue_decay_rate).clamp(0.0, 5.0);
+    QueueFeatures {
+        size_ahead_real,
+        trade_consumption_rate,
+        cancel_rate,
+        queue_decay_rate,
+        quote_churn,
     }
 }
 

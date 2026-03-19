@@ -102,8 +102,7 @@ impl AppConfig {
             "REFERENCE_AVERAGING_WINDOW_SECONDS",
             self.reference_averaging_window_seconds,
         )?;
-        self.nws_api_base =
-            env_string("NWS_API_BASE").unwrap_or_else(|| self.nws_api_base.clone());
+        self.nws_api_base = env_string("NWS_API_BASE").unwrap_or_else(|| self.nws_api_base.clone());
         self.open_meteo_geocode_api_base = env_string("OPEN_METEO_GEOCODE_API_BASE")
             .unwrap_or_else(|| self.open_meteo_geocode_api_base.clone());
         self.weather_series_category = env_string("WEATHER_SERIES_CATEGORY")
@@ -111,10 +110,8 @@ impl AppConfig {
         self.weather_series_title_patterns = env_csv("WEATHER_SERIES_TITLE_PATTERNS")
             .filter(|values| !values.is_empty())
             .unwrap_or_else(|| self.weather_series_title_patterns.clone());
-        self.weather_series_poll_limit = env_parse(
-            "WEATHER_SERIES_POLL_LIMIT",
-            self.weather_series_poll_limit,
-        )?;
+        self.weather_series_poll_limit =
+            env_parse("WEATHER_SERIES_POLL_LIMIT", self.weather_series_poll_limit)?;
         self.weather_reference_refresh_seconds = env_parse(
             "WEATHER_REFERENCE_REFRESH_SECONDS",
             self.weather_reference_refresh_seconds,
@@ -160,10 +157,14 @@ impl AppConfig {
             "INITIAL_PAPER_WEATHER_BUDGET",
             self.initial_paper_weather_budget,
         )?;
-        self.initial_live_crypto_budget =
-            env_parse("INITIAL_LIVE_CRYPTO_BUDGET", self.initial_live_crypto_budget)?;
-        self.initial_live_weather_budget =
-            env_parse("INITIAL_LIVE_WEATHER_BUDGET", self.initial_live_weather_budget)?;
+        self.initial_live_crypto_budget = env_parse(
+            "INITIAL_LIVE_CRYPTO_BUDGET",
+            self.initial_live_crypto_budget,
+        )?;
+        self.initial_live_weather_budget = env_parse(
+            "INITIAL_LIVE_WEATHER_BUDGET",
+            self.initial_live_weather_budget,
+        )?;
         self.kalshi_series_tickers = env_csv("KALSHI_SERIES_TICKERS")
             .filter(|values| !values.is_empty())
             .unwrap_or_else(|| self.kalshi_series_tickers.clone());

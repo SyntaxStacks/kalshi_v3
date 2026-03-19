@@ -1,13 +1,15 @@
 use anyhow::Result;
 use chrono::{Duration, Utc};
 use common::{
-    AppConfig, MarketFamily, ModelInference, OpportunityDecision, PromotionState,
-    StrategyFamily, TradeMode, lane_key,
+    AppConfig, MarketFamily, ModelInference, OpportunityDecision, PromotionState, StrategyFamily,
+    TradeMode, lane_key,
 };
+use market_data::{ContractSide, QueueSideSummary, QueueSnapshot};
 use market_models::{
     BASELINE_LOGIT_V1, FeatureVector, TRAINED_LINEAR_CONTRARIAN_V1, TRAINED_LINEAR_V1,
     run_model_with_weights,
 };
+use redis::AsyncCommands;
 use serde_json::json;
 use std::collections::HashMap;
 use std::time::Instant;
@@ -15,6 +17,8 @@ use storage::TrainedModelArtifactCard;
 use tracing::{info, warn};
 
 const WEATHER_MODEL_NAME: &str = "weather_threshold_v1";
+const EXECUTION_SCORE_THRESHOLD_BPS: f64 = 10.0;
+const REDIS_QUEUE_PREFIX: &str = "v3:queue:";
 
 #[derive(Debug, Clone, Copy)]
 struct TrainedDecisionPolicy {
@@ -22,6 +26,21 @@ struct TrainedDecisionPolicy {
     min_confidence: f64,
     min_venue_quality: f64,
     min_seconds_to_expiry_scaled: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Regime {
+    Early,
+    Mid,
+    Late,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExecutionScore {
+    raw_edge_bps: f64,
+    fill_probability: f64,
+    expected_slippage_bps: f64,
+    adverse_selection_bps: f64,
 }
 
 #[tokio::main]
@@ -74,6 +93,8 @@ async fn main() -> Result<()> {
 
 async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(usize, usize)> {
     let started_at = Instant::now();
+    let redis_client = redis::Client::open(config.redis_url.clone())?;
+    let mut redis = redis_client.get_multiplexed_async_connection().await?;
     info!("decision_pass_started");
     let features = select_decision_snapshots(storage.list_latest_feature_snapshots(128).await?);
     info!(
@@ -162,14 +183,12 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
                     continue;
                 }
             }
-            let confidence = (
-                snapshot.weather_reference_confidence.unwrap_or(0.05) * 0.55
-                    + edge.abs() * 1.35
-                    + snapshot.venue_quality_score * 0.25
-                    - (snapshot.reference_age_seconds as f64 / 3_600.0) * 0.08
-                    - (snapshot.market_data_age_seconds as f64 / 300.0) * 0.04
-            )
-            .clamp(0.05, 0.95);
+            let confidence = (snapshot.weather_reference_confidence.unwrap_or(0.05) * 0.55
+                + edge.abs() * 1.35
+                + snapshot.venue_quality_score * 0.25
+                - (snapshot.reference_age_seconds as f64 / 3_600.0) * 0.08
+                - (snapshot.market_data_age_seconds as f64 / 300.0) * 0.04)
+                .clamp(0.05, 0.95);
             let mut reasons = Vec::new();
             if snapshot.weather_forecast_temperature_f.is_none() {
                 reasons.push("missing_weather_reference".to_string());
@@ -312,23 +331,8 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
             .as_ref()
             .and_then(|policy| policy.current_champion_model.clone())
             .unwrap_or_else(|| BASELINE_LOGIT_V1.to_string());
-        let feature_vector = FeatureVector {
-            market_prob: snapshot.market_prob,
-            reference_yes_prob: snapshot.reference_yes_prob,
-            reference_gap_bps_scaled: (snapshot.reference_gap_bps / 1_000.0).clamp(-1.5, 1.5),
-            threshold_distance_bps_scaled: (snapshot.threshold_distance_bps_proxy / 500.0)
-                .clamp(-1.5, 1.5),
-            order_book_imbalance: snapshot.order_book_imbalance,
-            aggressive_buy_ratio: snapshot.aggressive_buy_ratio,
-            venue_quality_score: snapshot.venue_quality_score,
-            market_data_age_scaled: (snapshot.market_data_age_seconds as f64 / 20.0)
-                .clamp(0.0, 1.5),
-            reference_age_scaled: (snapshot.reference_age_seconds as f64 / 20.0)
-                .clamp(0.0, 1.5),
-            averaging_window_progress: snapshot.averaging_window_progress.clamp(0.0, 1.0),
-            seconds_to_expiry_scaled: (snapshot.seconds_to_expiry as f64 / 900.0)
-                .clamp(0.0, 1.0),
-        };
+        let regime = get_regime(i64::from(snapshot.seconds_to_expiry));
+        let feature_vector = regime_adjusted_feature_vector(&snapshot, regime);
         let trained_artifact = if uses_trained_linear_weights(&model_name) {
             if !trained_artifact_cache.contains_key(&snapshot.symbol) {
                 let artifact = storage
@@ -356,6 +360,9 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
             &feature_vector,
             trained_artifact.as_ref().map(|artifact| &artifact.weights),
         );
+        let crossing_probability = crossing_probability_v1(&feature_vector, regime);
+        let model_probability_yes =
+            blended_probability_yes(model.probability_yes, crossing_probability, regime);
         let calibration = storage
             .latest_probability_calibration(
                 snapshot.market_family,
@@ -367,9 +374,9 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
             .await?;
         let calibrated_probability_yes = if let Some(calibration) = &calibration {
             let weight = (f64::from(calibration.sample_count) / 24.0).clamp(0.0, 1.0);
-            (model.probability_yes + (calibration.mean_error * weight)).clamp(0.01, 0.99)
+            (model_probability_yes + (calibration.mean_error * weight)).clamp(0.01, 0.99)
         } else {
-            model.probability_yes
+            model_probability_yes
         };
 
         let min_edge = trained_policy
@@ -386,7 +393,26 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
             .unwrap_or(120)
             .max(0);
 
-        let edge = calibrated_probability_yes - snapshot.market_prob;
+        let signed_edge = calibrated_probability_yes - snapshot.market_prob;
+        let preview_side = if signed_edge >= 0.0 {
+            "buy_yes"
+        } else {
+            "buy_no"
+        };
+        let raw_edge_bps = directional_raw_edge_bps(
+            preview_side,
+            calibrated_probability_yes,
+            snapshot.market_prob,
+        );
+        let queue_snapshot = load_queue_snapshot(&mut redis, &snapshot.market_ticker).await?;
+        let execution_score = build_execution_score(
+            &snapshot,
+            preview_side,
+            raw_edge_bps,
+            queue_snapshot.as_ref(),
+        );
+        let current_execution_score = compute_execution_score(&execution_score);
+        let edge = signed_edge;
         let side = if edge >= 0.0 { "buy_yes" } else { "buy_no" };
         let lane = lane_key(
             "kalshi",
@@ -415,6 +441,9 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
         }
         if model.confidence < min_confidence {
             reasons.push("low_confidence".to_string());
+        }
+        if current_execution_score <= EXECUTION_SCORE_THRESHOLD_BPS {
+            reasons.push("execution_score_below_threshold".to_string());
         }
         if snapshot.venue_quality_score < min_venue_quality {
             reasons.push("low_venue_quality".to_string());
@@ -447,10 +476,12 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
         };
         let theoretical_entry_price = contract_price_for_side(side, snapshot.market_prob);
         let position_cap = (bankroll * max_position_pct_for_mode(config, intent_mode)).max(0.0);
+        let execution_quality_multiplier = (current_execution_score / 100.0).clamp(0.15, 1.25);
         let raw_size = bankroll
             * edge.abs()
             * model.confidence
             * snapshot.venue_quality_score
+            * execution_quality_multiplier
             * max_position_pct_for_mode(config, intent_mode);
         let recommended_size = if position_cap >= 5.0 {
             raw_size.clamp(5.0, position_cap)
@@ -526,6 +557,27 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
                 "reference_gap_bps": snapshot.reference_gap_bps,
                 "reference_price_change_bps": snapshot.reference_price_change_bps,
                 "threshold_distance_bps_proxy": snapshot.threshold_distance_bps_proxy,
+                "distance_to_strike_bps": snapshot.distance_to_strike_bps,
+                "reference_velocity": snapshot.reference_velocity,
+                "realized_vol_short": snapshot.realized_vol_short,
+                "time_decay_factor": snapshot.time_decay_factor,
+                "size_ahead": snapshot.size_ahead,
+                "trade_rate": snapshot.trade_rate,
+                "quote_churn": snapshot.quote_churn,
+                "size_ahead_real": snapshot.size_ahead_real,
+                "trade_consumption_rate": snapshot.trade_consumption_rate,
+                "cancel_rate": snapshot.cancel_rate,
+                "queue_decay_rate": snapshot.queue_decay_rate,
+                "regime": regime_name(regime),
+                "crossing_probability": crossing_probability,
+                "raw_edge_bps": raw_edge_bps,
+                "execution_score_bps": current_execution_score,
+                "fill_probability": execution_score.fill_probability,
+                "expected_slippage_bps": execution_score.expected_slippage_bps,
+                "adverse_selection_bps": execution_score.adverse_selection_bps,
+                "execution_score_threshold_bps": EXECUTION_SCORE_THRESHOLD_BPS,
+                "queue_market_ticker": queue_snapshot.as_ref().map(|queue| queue.market_ticker.clone()),
+                "queue_side": queue_contract_side(side).map(queue_side_name),
                 "settlement_regime": snapshot.settlement_regime,
                 "market_data_age_seconds": snapshot.market_data_age_seconds,
                 "reference_age_seconds": snapshot.reference_age_seconds,
@@ -562,16 +614,43 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
             && !storage.has_open_trade_for_lane(&lane).await?
             && !storage.has_active_execution_intent_for_lane(&lane).await?
         {
+            let stop_conditions = vec![
+                "expiry_exit".to_string(),
+                format!("execution_score_bps:{current_execution_score:.4}"),
+                format!("execution_score_threshold_bps:{EXECUTION_SCORE_THRESHOLD_BPS:.4}"),
+                format!("fill_probability:{:.4}", execution_score.fill_probability),
+                format!(
+                    "queue_size_ahead_real:{:.4}",
+                    execution_score_size_ahead(&snapshot, queue_snapshot.as_ref(), side)
+                ),
+                format!(
+                    "queue_trade_consumption_rate:{:.4}",
+                    execution_score_trade_consumption_rate(
+                        &snapshot,
+                        queue_snapshot.as_ref(),
+                        side
+                    )
+                ),
+                format!(
+                    "queue_cancel_rate:{:.4}",
+                    execution_score_cancel_rate(&snapshot, queue_snapshot.as_ref(), side)
+                ),
+                format!("spread_bps:{:.4}", snapshot.spread_bps),
+            ];
             storage
                 .insert_execution_intent(
                     decision_id,
                     snapshot.market_family,
                     intent_mode,
-                    "midpoint",
+                    if current_execution_score >= 40.0 {
+                        "maker_priority"
+                    } else {
+                        "midpoint"
+                    },
                     &[1.0],
                     snapshot.seconds_to_expiry.max(120),
                     45,
-                    &["expiry_exit".to_string()],
+                    &stop_conditions,
                 )
                 .await?;
             match intent_mode {
@@ -656,7 +735,10 @@ fn crypto_decision_horizon_seconds(window_minutes: i32) -> i32 {
     (window_minutes.max(1) * 60 * 3).max(45 * 60)
 }
 
-fn should_skip_recent_lane_decision(last_created_at: chrono::DateTime<Utc>, poll_seconds: u64) -> bool {
+fn should_skip_recent_lane_decision(
+    last_created_at: chrono::DateTime<Utc>,
+    poll_seconds: u64,
+) -> bool {
     last_created_at > Utc::now() - Duration::seconds(poll_seconds as i64 - 1)
 }
 
@@ -692,23 +774,20 @@ fn live_drawdown_triggered(bankroll: f64, initial_bankroll: f64, kill_pct: f64) 
     bankroll <= (initial_bankroll * (1.0 - kill_pct.clamp(0.0, 0.95)))
 }
 
-fn trained_policy_from_artifact(artifact: &TrainedModelArtifactCard) -> Option<TrainedDecisionPolicy> {
+fn trained_policy_from_artifact(
+    artifact: &TrainedModelArtifactCard,
+) -> Option<TrainedDecisionPolicy> {
     let policy = artifact.metrics_json.get("policy")?;
     Some(TrainedDecisionPolicy {
         min_edge: policy.get("min_edge")?.as_f64()?,
         min_confidence: policy.get("min_confidence")?.as_f64()?,
         min_venue_quality: policy.get("min_venue_quality")?.as_f64()?,
-        min_seconds_to_expiry_scaled: policy
-            .get("min_seconds_to_expiry_scaled")?
-            .as_f64()?,
+        min_seconds_to_expiry_scaled: policy.get("min_seconds_to_expiry_scaled")?.as_f64()?,
     })
 }
 
 fn uses_trained_linear_weights(model_name: &str) -> bool {
-    matches!(
-        model_name,
-        TRAINED_LINEAR_V1 | TRAINED_LINEAR_CONTRARIAN_V1
-    )
+    matches!(model_name, TRAINED_LINEAR_V1 | TRAINED_LINEAR_CONTRARIAN_V1)
 }
 
 fn exposure_key(mode: TradeMode, value: &str) -> String {
@@ -735,11 +814,259 @@ fn contract_price_for_side(side: &str, market_prob: f64) -> f64 {
     }
 }
 
+fn build_feature_vector(snapshot: &common::MarketFeatureSnapshotRecord) -> FeatureVector {
+    FeatureVector {
+        market_prob: snapshot.market_prob,
+        reference_yes_prob: snapshot.reference_yes_prob,
+        reference_gap_bps_scaled: (snapshot.reference_gap_bps / 1_000.0).clamp(-1.5, 1.5),
+        threshold_distance_bps_scaled: (snapshot.threshold_distance_bps_proxy / 500.0)
+            .clamp(-1.5, 1.5),
+        distance_to_strike_bps_scaled: (snapshot.distance_to_strike_bps / 500.0).clamp(-2.5, 2.5),
+        reference_velocity_scaled: (snapshot.reference_velocity / 25.0).clamp(-2.0, 2.0),
+        realized_vol_short_scaled: (snapshot.realized_vol_short / 50.0).clamp(0.0, 2.0),
+        time_decay_factor: snapshot.time_decay_factor.clamp(0.0, 1.0),
+        order_book_imbalance: snapshot.order_book_imbalance,
+        aggressive_buy_ratio: snapshot.aggressive_buy_ratio,
+        size_ahead_scaled: (snapshot.size_ahead / 100.0).clamp(0.0, 3.0),
+        trade_rate_scaled: (snapshot.trade_rate / 50.0).clamp(0.0, 3.0),
+        quote_churn_scaled: snapshot.quote_churn.clamp(0.0, 3.0),
+        size_ahead_real_scaled: (snapshot.size_ahead_real / 100.0).clamp(0.0, 5.0),
+        trade_consumption_rate_scaled: (snapshot.trade_consumption_rate / 25.0).clamp(0.0, 5.0),
+        cancel_rate_scaled: (snapshot.cancel_rate / 25.0).clamp(0.0, 5.0),
+        queue_decay_rate_scaled: (snapshot.queue_decay_rate / 25.0).clamp(0.0, 5.0),
+        spread_bps_scaled: (snapshot.spread_bps / 1_000.0).clamp(0.0, 2.0),
+        venue_quality_score: snapshot.venue_quality_score,
+        market_data_age_scaled: (snapshot.market_data_age_seconds as f64 / 20.0).clamp(0.0, 1.5),
+        reference_age_scaled: (snapshot.reference_age_seconds as f64 / 20.0).clamp(0.0, 1.5),
+        averaging_window_progress: snapshot.averaging_window_progress.clamp(0.0, 1.0),
+        seconds_to_expiry_scaled: (snapshot.seconds_to_expiry as f64 / 900.0).clamp(0.0, 1.0),
+    }
+}
+
+fn regime_adjusted_feature_vector(
+    snapshot: &common::MarketFeatureSnapshotRecord,
+    regime: Regime,
+) -> FeatureVector {
+    let mut features = build_feature_vector(snapshot);
+    match regime {
+        Regime::Early => {
+            features.reference_gap_bps_scaled *= 1.25;
+            features.reference_velocity_scaled *= 1.20;
+            features.trade_rate_scaled *= 1.10;
+            features.order_book_imbalance *= 0.85;
+            features.spread_bps_scaled *= 0.90;
+        }
+        Regime::Mid => {}
+        Regime::Late => {
+            features.order_book_imbalance *= 1.30;
+            features.aggressive_buy_ratio =
+                (0.5 + ((features.aggressive_buy_ratio - 0.5) * 1.20)).clamp(0.0, 1.0);
+            features.spread_bps_scaled *= 1.20;
+            features.reference_gap_bps_scaled *= 0.90;
+            features.reference_velocity_scaled *= 0.85;
+            features.quote_churn_scaled *= 1.15;
+        }
+    }
+    features
+}
+
+fn get_regime(seconds_to_expiry: i64) -> Regime {
+    match seconds_to_expiry {
+        s if s > 300 => Regime::Early,
+        s if s > 60 => Regime::Mid,
+        _ => Regime::Late,
+    }
+}
+
+fn regime_name(regime: Regime) -> &'static str {
+    match regime {
+        Regime::Early => "early",
+        Regime::Mid => "mid",
+        Regime::Late => "late",
+    }
+}
+
+fn crossing_probability_v1(features: &FeatureVector, regime: Regime) -> f64 {
+    let regime_bias = match regime {
+        Regime::Early => 0.18,
+        Regime::Mid => 0.08,
+        Regime::Late => -0.04,
+    };
+    let score = features.distance_to_strike_bps_scaled * 1.35
+        + features.reference_velocity_scaled * 0.75
+        + features.realized_vol_short_scaled * 0.60
+        + features.order_book_imbalance * 0.45
+        + ((features.aggressive_buy_ratio - 0.5) * 0.55)
+        + features.time_decay_factor * 0.35
+        + features.trade_rate_scaled * 0.18
+        - features.spread_bps_scaled * 0.30
+        - features.size_ahead_scaled * 0.12
+        - features.quote_churn_scaled * 0.10
+        + regime_bias;
+    (1.0 / (1.0 + (-score).exp())).clamp(0.01, 0.99)
+}
+
+fn blended_probability_yes(
+    model_probability_yes: f64,
+    crossing_probability: f64,
+    regime: Regime,
+) -> f64 {
+    let crossing_weight = match regime {
+        Regime::Early => 0.45,
+        Regime::Mid => 0.50,
+        Regime::Late => 0.60,
+    };
+    ((model_probability_yes * (1.0 - crossing_weight)) + (crossing_probability * crossing_weight))
+        .clamp(0.01, 0.99)
+}
+
+async fn load_queue_snapshot(
+    redis: &mut redis::aio::MultiplexedConnection,
+    market_ticker: &str,
+) -> Result<Option<QueueSnapshot>> {
+    let raw: Option<String> = redis
+        .get(format!("{REDIS_QUEUE_PREFIX}{market_ticker}"))
+        .await
+        .ok();
+    Ok(raw
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<QueueSnapshot>(value).ok()))
+}
+
+fn queue_contract_side(side: &str) -> Option<ContractSide> {
+    match side {
+        "buy_yes" => Some(ContractSide::Yes),
+        "buy_no" => Some(ContractSide::No),
+        _ => None,
+    }
+}
+
+fn queue_side_name(side: ContractSide) -> &'static str {
+    match side {
+        ContractSide::Yes => "yes",
+        ContractSide::No => "no",
+    }
+}
+
+fn queue_side_summary<'a>(
+    queue_snapshot: Option<&'a QueueSnapshot>,
+    side: &str,
+) -> Option<&'a QueueSideSummary> {
+    match (queue_snapshot, queue_contract_side(side)) {
+        (Some(queue), Some(ContractSide::Yes)) => Some(&queue.yes),
+        (Some(queue), Some(ContractSide::No)) => Some(&queue.no),
+        _ => None,
+    }
+}
+
+fn execution_score_size_ahead(
+    snapshot: &common::MarketFeatureSnapshotRecord,
+    queue_snapshot: Option<&QueueSnapshot>,
+    side: &str,
+) -> f64 {
+    queue_side_summary(queue_snapshot, side)
+        .map(|queue| queue.size_ahead_real)
+        .unwrap_or(snapshot.size_ahead_real.max(snapshot.size_ahead.max(1.0)))
+        .max(1.0)
+}
+
+fn execution_score_trade_consumption_rate(
+    snapshot: &common::MarketFeatureSnapshotRecord,
+    queue_snapshot: Option<&QueueSnapshot>,
+    side: &str,
+) -> f64 {
+    queue_side_summary(queue_snapshot, side)
+        .map(|queue| queue.trade_consumption_rate)
+        .unwrap_or(snapshot.trade_consumption_rate.max(snapshot.trade_rate))
+        .max(0.0)
+}
+
+fn execution_score_cancel_rate(
+    snapshot: &common::MarketFeatureSnapshotRecord,
+    queue_snapshot: Option<&QueueSnapshot>,
+    side: &str,
+) -> f64 {
+    queue_side_summary(queue_snapshot, side)
+        .map(|queue| queue.cancel_rate)
+        .unwrap_or(snapshot.cancel_rate.max(0.0))
+        .max(0.0)
+}
+
+fn execution_score_queue_decay_rate(
+    snapshot: &common::MarketFeatureSnapshotRecord,
+    queue_snapshot: Option<&QueueSnapshot>,
+    side: &str,
+) -> f64 {
+    queue_side_summary(queue_snapshot, side)
+        .map(|queue| queue.queue_decay_rate)
+        .unwrap_or(snapshot.queue_decay_rate.max(0.0))
+        .max(0.0)
+}
+
+fn estimate_fill_probability(
+    size_ahead: f64,
+    trade_consumption_rate: f64,
+    cancel_rate: f64,
+    seconds_to_expiry: f64,
+) -> f64 {
+    let effective_rate = (trade_consumption_rate + cancel_rate).max(0.0);
+    if effective_rate <= f64::EPSILON {
+        return 0.0;
+    }
+    let expected_fill_time = size_ahead.max(1.0) / effective_rate;
+    if !expected_fill_time.is_finite() || expected_fill_time <= f64::EPSILON {
+        return 0.0;
+    }
+    (seconds_to_expiry / expected_fill_time).clamp(0.0, 1.0)
+}
+
+fn build_execution_score(
+    snapshot: &common::MarketFeatureSnapshotRecord,
+    side: &str,
+    raw_edge_bps: f64,
+    queue_snapshot: Option<&QueueSnapshot>,
+) -> ExecutionScore {
+    let size_ahead = execution_score_size_ahead(snapshot, queue_snapshot, side);
+    let trade_consumption_rate =
+        execution_score_trade_consumption_rate(snapshot, queue_snapshot, side);
+    let cancel_rate = execution_score_cancel_rate(snapshot, queue_snapshot, side);
+    let queue_decay_rate = execution_score_queue_decay_rate(snapshot, queue_snapshot, side);
+    let fill_probability = estimate_fill_probability(
+        size_ahead,
+        trade_consumption_rate,
+        cancel_rate,
+        f64::from(snapshot.seconds_to_expiry.max(1)),
+    );
+    let expected_slippage_bps = snapshot.spread_bps * 0.5;
+    let adverse_selection_bps = (snapshot.aggressive_buy_ratio * snapshot.spread_bps)
+        + ((cancel_rate + queue_decay_rate) * 10.0)
+        + (snapshot.quote_churn * 5.0);
+    ExecutionScore {
+        raw_edge_bps,
+        fill_probability,
+        expected_slippage_bps,
+        adverse_selection_bps,
+    }
+}
+
+fn compute_execution_score(s: &ExecutionScore) -> f64 {
+    (s.raw_edge_bps * s.fill_probability) - s.expected_slippage_bps - s.adverse_selection_bps
+}
+
+fn directional_raw_edge_bps(side: &str, model_prob: f64, market_prob: f64) -> f64 {
+    if side == "buy_no" {
+        ((market_prob - model_prob) * 10_000.0).max(0.0)
+    } else {
+        ((model_prob - market_prob) * 10_000.0).max(0.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        AppConfig, MarketFamily, PromotionState, TradeMode, crypto_decision_horizon_seconds,
-        live_contract_count, live_drawdown_triggered, max_position_pct_for_mode,
+        AppConfig, ExecutionScore, MarketFamily, PromotionState, Regime, TradeMode,
+        compute_execution_score, crypto_decision_horizon_seconds, directional_raw_edge_bps,
+        get_regime, live_contract_count, live_drawdown_triggered, max_position_pct_for_mode,
         select_decision_snapshots, should_skip_recent_lane_decision, target_intent_mode,
     };
     use chrono::{Duration, Utc};
@@ -886,6 +1213,17 @@ mod tests {
             reference_yes_prob: 0.52,
             reference_gap_bps: 200.0,
             threshold_distance_bps_proxy: 0.0,
+            distance_to_strike_bps: 150.0,
+            reference_velocity: 4.0,
+            realized_vol_short: 8.0,
+            time_decay_factor: 0.4,
+            size_ahead: 20.0,
+            trade_rate: 10.0,
+            quote_churn: 0.2,
+            size_ahead_real: 22.0,
+            trade_consumption_rate: 9.5,
+            cancel_rate: 2.0,
+            queue_decay_rate: 4.0,
             averaging_window_progress: 0.0,
             settlement_regime: "mid_window".to_string(),
             last_minute_avg_proxy: 1.0,
@@ -914,8 +1252,16 @@ mod tests {
         ]);
 
         assert_eq!(selected.len(), 2);
-        assert!(selected.iter().any(|row| row.market_ticker == "KXBTC15M-near"));
-        assert!(!selected.iter().any(|row| row.market_ticker == "KXBTC15M-far"));
+        assert!(
+            selected
+                .iter()
+                .any(|row| row.market_ticker == "KXBTC15M-near")
+        );
+        assert!(
+            !selected
+                .iter()
+                .any(|row| row.market_ticker == "KXBTC15M-far")
+        );
     }
 
     #[test]
@@ -938,10 +1284,43 @@ mod tests {
 
     #[test]
     fn recent_lane_decisions_are_deduped_by_poll_window() {
-        assert!(should_skip_recent_lane_decision(Utc::now() - Duration::seconds(5), 15));
+        assert!(should_skip_recent_lane_decision(
+            Utc::now() - Duration::seconds(5),
+            15
+        ));
         assert!(!should_skip_recent_lane_decision(
             Utc::now() - Duration::seconds(20),
             15
         ));
+    }
+
+    #[test]
+    fn expiry_regime_split_matches_expected_buckets() {
+        assert_eq!(get_regime(301), Regime::Early);
+        assert_eq!(get_regime(120), Regime::Mid);
+        assert_eq!(get_regime(45), Regime::Late);
+    }
+
+    #[test]
+    fn execution_score_penalizes_bad_fill_and_slippage() {
+        let strong = compute_execution_score(&ExecutionScore {
+            raw_edge_bps: 90.0,
+            fill_probability: 0.8,
+            expected_slippage_bps: 10.0,
+            adverse_selection_bps: 12.0,
+        });
+        let weak = compute_execution_score(&ExecutionScore {
+            raw_edge_bps: 40.0,
+            fill_probability: 0.2,
+            expected_slippage_bps: 15.0,
+            adverse_selection_bps: 12.0,
+        });
+        assert!(strong > weak);
+    }
+
+    #[test]
+    fn directional_raw_edge_handles_buy_no() {
+        assert_eq!(directional_raw_edge_bps("buy_yes", 0.62, 0.50), 1200.0);
+        assert_eq!(directional_raw_edge_bps("buy_no", 0.38, 0.50), 1200.0);
     }
 }

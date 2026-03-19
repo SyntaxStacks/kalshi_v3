@@ -5,8 +5,8 @@ use common::{
     LaneTradeCard, LiveExceptionSnapshot, LiveExchangeSyncSummary, LiveFillCard, LiveIntentCard,
     LiveOrderCard, LivePositionCard, LiveTradeExceptionCard, MarketFamily,
     MarketFeatureSnapshotRecord, ModelInference, OpenTradeSummary, OperatorActionEvent,
-    OperatorControlState, OpportunityCard, OpportunityDecision, PromotionState,
-    ReadinessSummary, ReplayBenchmarkCard, StrategyFamily, TradeMode,
+    OperatorControlState, OpportunityCard, OpportunityDecision, PromotionState, ReadinessSummary,
+    ReplayBenchmarkCard, StrategyFamily, TradeMode,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -27,10 +27,14 @@ pub struct PendingExecutionIntent {
     pub strategy_family: StrategyFamily,
     pub side: String,
     pub market_prob: f64,
+    pub model_prob: f64,
+    pub confidence: f64,
     pub recommended_size: f64,
     pub mode: TradeMode,
+    pub entry_style: String,
     pub timeout_seconds: i32,
     pub force_exit_buffer_seconds: i32,
+    pub stop_conditions_json: Vec<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -348,7 +352,10 @@ impl Storage {
         Ok(())
     }
 
-    pub async fn dashboard_snapshot(&self, family: Option<MarketFamily>) -> Result<DashboardSnapshot> {
+    pub async fn dashboard_snapshot(
+        &self,
+        family: Option<MarketFamily>,
+    ) -> Result<DashboardSnapshot> {
         let bankrolls = self.list_latest_bankrolls(family).await?;
         let lanes = self.list_lane_states(family).await?;
         let open_trades = self.list_open_trades(family).await?;
@@ -411,6 +418,13 @@ impl Storage {
             "liquidity": snapshot.liquidity,
             "order_book_imbalance": snapshot.order_book_imbalance,
             "aggressive_buy_ratio": snapshot.aggressive_buy_ratio,
+            "size_ahead": snapshot.size_ahead,
+            "trade_rate": snapshot.trade_rate,
+            "quote_churn": snapshot.quote_churn,
+            "size_ahead_real": snapshot.size_ahead_real,
+            "trade_consumption_rate": snapshot.trade_consumption_rate,
+            "cancel_rate": snapshot.cancel_rate,
+            "queue_decay_rate": snapshot.queue_decay_rate,
         }))
         .bind(json!({
             "seconds_to_expiry": snapshot.seconds_to_expiry,
@@ -418,6 +432,8 @@ impl Storage {
             "settlement_regime": snapshot.settlement_regime,
             "averaging_window_progress": snapshot.averaging_window_progress,
             "threshold_distance_bps_proxy": snapshot.threshold_distance_bps_proxy,
+            "distance_to_strike_bps": snapshot.distance_to_strike_bps,
+            "time_decay_factor": snapshot.time_decay_factor,
             "last_minute_avg_proxy": snapshot.last_minute_avg_proxy,
             "weather_city": snapshot.weather_city,
             "weather_contract_kind": snapshot.weather_contract_kind,
@@ -430,6 +446,8 @@ impl Storage {
             "reference_price": snapshot.reference_price,
             "reference_previous_price": snapshot.reference_previous_price,
             "reference_price_change_bps": snapshot.reference_price_change_bps,
+            "reference_velocity": snapshot.reference_velocity,
+            "realized_vol_short": snapshot.realized_vol_short,
             "reference_yes_prob": snapshot.reference_yes_prob,
             "reference_gap_bps": snapshot.reference_gap_bps,
             "reference_age_seconds": snapshot.reference_age_seconds,
@@ -1912,7 +1930,9 @@ impl Storage {
         .bind(lane_key)
         .fetch_all(&self.pool)
         .await?;
-        let replay_summary = self.latest_model_benchmark_summary_for_lane(lane_key).await?;
+        let replay_summary = self
+            .latest_model_benchmark_summary_for_lane(lane_key)
+            .await?;
 
         Ok(LaneInspectionSnapshot {
             lane_key: lane_key.to_string(),
@@ -2130,10 +2150,14 @@ impl Storage {
                 od.strategy_family,
                 od.side,
                 od.market_prob,
+                od.model_prob,
+                od.confidence,
                 od.recommended_size,
                 ei.mode,
+                ei.entry_style,
                 ei.timeout_seconds,
                 ei.force_exit_buffer_seconds,
+                ei.stop_conditions_json,
                 ei.created_at
             from execution_intent ei
             join opportunity_decision od on od.id = ei.decision_id
@@ -2165,10 +2189,14 @@ impl Storage {
                 od.strategy_family,
                 od.side,
                 od.market_prob,
+                od.model_prob,
+                od.confidence,
                 od.recommended_size,
                 ei.mode,
+                ei.entry_style,
                 ei.timeout_seconds,
                 ei.force_exit_buffer_seconds,
+                ei.stop_conditions_json,
                 ei.created_at
             from execution_intent ei
             join opportunity_decision od on od.id = ei.decision_id
@@ -2282,7 +2310,9 @@ impl Storage {
         extra_metadata: &serde_json::Value,
         status_on_open: &str,
     ) -> Result<i64> {
-        let snapshot = self.latest_feature_snapshot_for_market(intent.market_id).await?;
+        let snapshot = self
+            .latest_feature_snapshot_for_market(intent.market_id)
+            .await?;
         let expires_at = snapshot.as_ref().map(|snapshot| {
             snapshot.created_at + chrono::Duration::seconds(snapshot.seconds_to_expiry as i64)
         });
@@ -2290,7 +2320,11 @@ impl Storage {
             .get("market_ticker")
             .and_then(serde_json::Value::as_str)
             .map(ToOwned::to_owned)
-            .or_else(|| snapshot.as_ref().map(|snapshot| snapshot.market_ticker.clone()));
+            .or_else(|| {
+                snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.market_ticker.clone())
+            });
         let metadata = json!({
             "market_id": intent.market_id,
             "side": intent.side,
@@ -3206,7 +3240,11 @@ impl Storage {
     }
 
     pub async fn reconcile_bankroll_for_mode(&self, mode: TradeMode) -> Result<()> {
-        for family in [MarketFamily::All, MarketFamily::Crypto, MarketFamily::Weather] {
+        for family in [
+            MarketFamily::All,
+            MarketFamily::Crypto,
+            MarketFamily::Weather,
+        ] {
             let scope = portfolio_scope(mode, family);
             let base_bankroll = self
                 .bootstrap_bankroll(scope, mode, family)
@@ -3288,7 +3326,10 @@ impl Storage {
         Ok(())
     }
 
-    async fn list_latest_bankrolls(&self, family: Option<MarketFamily>) -> Result<Vec<BankrollCard>> {
+    async fn list_latest_bankrolls(
+        &self,
+        family: Option<MarketFamily>,
+    ) -> Result<Vec<BankrollCard>> {
         let rows = sqlx::query_as::<_, BankrollRow>(
             r#"
             select scope, market_family, mode, strategy_family, bankroll, deployable_balance, open_exposure,
@@ -3367,7 +3408,10 @@ impl Storage {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
-    async fn list_open_trades(&self, family: Option<MarketFamily>) -> Result<Vec<OpenTradeSummary>> {
+    async fn list_open_trades(
+        &self,
+        family: Option<MarketFamily>,
+    ) -> Result<Vec<OpenTradeSummary>> {
         let rows = sqlx::query_as::<_, OpenTradeRow>(
             r#"
             select
@@ -3424,7 +3468,11 @@ impl Storage {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
-    async fn list_latest_opportunities(&self, family: Option<MarketFamily>, limit: i64) -> Result<Vec<OpportunityCard>> {
+    async fn list_latest_opportunities(
+        &self,
+        family: Option<MarketFamily>,
+        limit: i64,
+    ) -> Result<Vec<OpportunityCard>> {
         let freshness_cutoff = Utc::now() - opportunity_card_freshness_window(family);
         let rows = sqlx::query(
             r#"
@@ -3563,7 +3611,8 @@ impl Storage {
         .unwrap_or(0);
 
         if snapshot_count == 0 {
-            self.insert_bankroll_seed(scope, market_family, bankroll, mode).await?;
+            self.insert_bankroll_seed(scope, market_family, bankroll, mode)
+                .await?;
             return Ok(());
         }
 
@@ -3920,10 +3969,14 @@ struct PendingExecutionIntentRow {
     strategy_family: SqlStrategyFamily,
     side: String,
     market_prob: f64,
+    model_prob: f64,
+    confidence: f64,
     recommended_size: f64,
     mode: SqlTradeMode,
+    entry_style: String,
     timeout_seconds: i32,
     force_exit_buffer_seconds: i32,
+    stop_conditions_json: serde_json::Value,
     created_at: DateTime<Utc>,
 }
 
@@ -4436,6 +4489,17 @@ impl TryFrom<FeatureSnapshotRow> for MarketFeatureSnapshotRecord {
             reference_yes_prob: json_f64(&external, "reference_yes_prob"),
             reference_gap_bps: json_f64(&external, "reference_gap_bps"),
             threshold_distance_bps_proxy: json_f64(&settlement, "threshold_distance_bps_proxy"),
+            distance_to_strike_bps: json_f64(&settlement, "distance_to_strike_bps"),
+            reference_velocity: json_f64(&external, "reference_velocity"),
+            realized_vol_short: json_f64(&external, "realized_vol_short"),
+            time_decay_factor: json_f64(&settlement, "time_decay_factor"),
+            size_ahead: json_f64(&venue, "size_ahead"),
+            trade_rate: json_f64(&venue, "trade_rate"),
+            quote_churn: json_f64(&venue, "quote_churn"),
+            size_ahead_real: json_f64(&venue, "size_ahead_real"),
+            trade_consumption_rate: json_f64(&venue, "trade_consumption_rate"),
+            cancel_rate: json_f64(&venue, "cancel_rate"),
+            queue_decay_rate: json_f64(&venue, "queue_decay_rate"),
             averaging_window_progress: json_f64(&settlement, "averaging_window_progress"),
             settlement_regime: json_text(&settlement, "settlement_regime"),
             last_minute_avg_proxy: json_f64(&settlement, "last_minute_avg_proxy"),
@@ -4481,8 +4545,20 @@ impl TryFrom<HistoricalReplayExampleRow> for HistoricalReplayExampleCard {
                 reference_yes_prob: json_f64(features, "reference_yes_prob"),
                 reference_gap_bps_scaled: json_f64(features, "reference_gap_bps_scaled"),
                 threshold_distance_bps_scaled: json_f64(features, "threshold_distance_bps_scaled"),
+                distance_to_strike_bps_scaled: json_f64(features, "distance_to_strike_bps_scaled"),
+                reference_velocity_scaled: json_f64(features, "reference_velocity_scaled"),
+                realized_vol_short_scaled: json_f64(features, "realized_vol_short_scaled"),
+                time_decay_factor: json_f64(features, "time_decay_factor"),
                 order_book_imbalance: json_f64(features, "order_book_imbalance"),
                 aggressive_buy_ratio: json_f64(features, "aggressive_buy_ratio"),
+                size_ahead_scaled: json_f64(features, "size_ahead_scaled"),
+                trade_rate_scaled: json_f64(features, "trade_rate_scaled"),
+                quote_churn_scaled: json_f64(features, "quote_churn_scaled"),
+                size_ahead_real_scaled: json_f64(features, "size_ahead_real_scaled"),
+                trade_consumption_rate_scaled: json_f64(features, "trade_consumption_rate_scaled"),
+                cancel_rate_scaled: json_f64(features, "cancel_rate_scaled"),
+                queue_decay_rate_scaled: json_f64(features, "queue_decay_rate_scaled"),
+                spread_bps_scaled: json_f64(features, "spread_bps_scaled"),
                 venue_quality_score: json_f64(features, "venue_quality_score"),
                 market_data_age_scaled: json_f64(features, "market_data_age_scaled"),
                 reference_age_scaled: json_f64(features, "reference_age_scaled"),
@@ -4504,10 +4580,23 @@ impl From<PendingExecutionIntentRow> for PendingExecutionIntent {
             strategy_family: value.strategy_family.into(),
             side: value.side,
             market_prob: value.market_prob,
+            model_prob: value.model_prob,
+            confidence: value.confidence,
             recommended_size: value.recommended_size,
             mode: value.mode.into(),
+            entry_style: value.entry_style,
             timeout_seconds: value.timeout_seconds,
             force_exit_buffer_seconds: value.force_exit_buffer_seconds,
+            stop_conditions_json: value
+                .stop_conditions_json
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(ToOwned::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default(),
             created_at: value.created_at,
         }
     }

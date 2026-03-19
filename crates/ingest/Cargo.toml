@@ -25,3 +25,4 @@ tokio-tungstenite.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 futures.workspace = true
+market-data = { path = "../market-data" }

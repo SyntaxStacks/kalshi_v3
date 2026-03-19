@@ -1,16 +1,14 @@
 [package]
-name = "replay"
+name = "market-data"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 chrono.workspace = true
-common = { path = "../common" }
-market-data = { path = "../market-data" }
-market-models = { path = "../market-models" }
 serde.workspace = true
+serde_json.workspace = true
 
 [lib]
-name = "replay"
+name = "market_data"
 path = "src/lib.rs"

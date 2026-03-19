@@ -1,13 +1,26 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct FeatureVector {
     pub market_prob: f64,
     pub reference_yes_prob: f64,
     pub reference_gap_bps_scaled: f64,
     pub threshold_distance_bps_scaled: f64,
+    pub distance_to_strike_bps_scaled: f64,
+    pub reference_velocity_scaled: f64,
+    pub realized_vol_short_scaled: f64,
+    pub time_decay_factor: f64,
     pub order_book_imbalance: f64,
     pub aggressive_buy_ratio: f64,
+    pub size_ahead_scaled: f64,
+    pub trade_rate_scaled: f64,
+    pub quote_churn_scaled: f64,
+    pub size_ahead_real_scaled: f64,
+    pub trade_consumption_rate_scaled: f64,
+    pub cancel_rate_scaled: f64,
+    pub queue_decay_rate_scaled: f64,
+    pub spread_bps_scaled: f64,
     pub venue_quality_score: f64,
     pub market_data_age_scaled: f64,
     pub reference_age_scaled: f64,
@@ -22,15 +35,24 @@ pub struct ModelOutput {
     pub confidence: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct TrainedLinearWeights {
     pub bias: f64,
     pub market_prob: f64,
     pub reference_yes_prob: f64,
     pub reference_gap_bps_scaled: f64,
     pub threshold_distance_bps_scaled: f64,
+    pub distance_to_strike_bps_scaled: f64,
+    pub reference_velocity_scaled: f64,
+    pub realized_vol_short_scaled: f64,
+    pub time_decay_factor: f64,
     pub order_book_imbalance: f64,
     pub aggressive_buy_ratio: f64,
+    pub size_ahead_scaled: f64,
+    pub trade_rate_scaled: f64,
+    pub quote_churn_scaled: f64,
+    pub spread_bps_scaled: f64,
     pub venue_quality_score: f64,
     pub market_data_age_scaled: f64,
     pub reference_age_scaled: f64,
@@ -59,8 +81,16 @@ pub fn baseline_logit(features: &FeatureVector) -> ModelOutput {
     let score = (features.reference_yes_prob - features.market_prob) * 2.2
         + (features.reference_gap_bps_scaled * 0.55)
         + (features.threshold_distance_bps_scaled * 0.35)
+        + (features.distance_to_strike_bps_scaled * 0.45)
+        + (features.reference_velocity_scaled * 0.28)
+        + (features.realized_vol_short_scaled * 0.20)
+        + (features.time_decay_factor * 0.12)
         + (features.order_book_imbalance * 0.9)
         + ((features.aggressive_buy_ratio - 0.5) * 0.8)
+        - (features.size_ahead_scaled * 0.18)
+        + (features.trade_rate_scaled * 0.22)
+        - (features.quote_churn_scaled * 0.10)
+        - (features.spread_bps_scaled * 0.16)
         + (features.venue_quality_score * 0.7)
         - (features.market_data_age_scaled * 0.45)
         - (features.reference_age_scaled * 0.35)
@@ -70,7 +100,10 @@ pub fn baseline_logit(features: &FeatureVector) -> ModelOutput {
     let confidence = ((probability_yes - features.market_prob).abs() * 1.6
         + features.venue_quality_score * 0.25
         + features.reference_gap_bps_scaled.abs() * 0.12
+        + features.distance_to_strike_bps_scaled.abs() * 0.08
+        + features.reference_velocity_scaled.abs() * 0.05
         + features.averaging_window_progress * 0.05
+        - features.spread_bps_scaled * 0.06
         - features.market_data_age_scaled * 0.08
         - features.reference_age_scaled * 0.05)
         .clamp(0.05, 0.95);
@@ -85,8 +118,15 @@ pub fn flow_weighted_logit(features: &FeatureVector) -> ModelOutput {
     let score = (features.reference_yes_prob - features.market_prob) * 1.6
         + (features.reference_gap_bps_scaled * 0.45)
         + (features.threshold_distance_bps_scaled * 0.2)
+        + (features.distance_to_strike_bps_scaled * 0.34)
+        + (features.reference_velocity_scaled * 0.45)
+        + (features.realized_vol_short_scaled * 0.16)
         + (features.order_book_imbalance * 1.35)
         + ((features.aggressive_buy_ratio - 0.5) * 1.2)
+        - (features.size_ahead_scaled * 0.14)
+        + (features.trade_rate_scaled * 0.28)
+        - (features.quote_churn_scaled * 0.08)
+        - (features.spread_bps_scaled * 0.20)
         + (features.venue_quality_score * 0.55)
         - (features.market_data_age_scaled * 0.4)
         - (features.reference_age_scaled * 0.3)
@@ -97,6 +137,8 @@ pub fn flow_weighted_logit(features: &FeatureVector) -> ModelOutput {
         + features.venue_quality_score * 0.22
         + features.order_book_imbalance.abs() * 0.1
         + features.reference_gap_bps_scaled.abs() * 0.1
+        + features.trade_rate_scaled * 0.05
+        - features.spread_bps_scaled * 0.05
         - features.market_data_age_scaled * 0.08
         - features.reference_age_scaled * 0.05)
         .clamp(0.05, 0.95);
@@ -111,6 +153,14 @@ pub fn settlement_anchor_logit(features: &FeatureVector) -> ModelOutput {
     let score = (features.reference_yes_prob - features.market_prob) * 2.6
         + (features.reference_gap_bps_scaled * 0.7)
         + (features.threshold_distance_bps_scaled * 0.5)
+        + (features.distance_to_strike_bps_scaled * 0.52)
+        + (features.reference_velocity_scaled * 0.22)
+        + (features.realized_vol_short_scaled * 0.18)
+        + (features.time_decay_factor * 0.10)
+        - (features.size_ahead_scaled * 0.08)
+        + (features.trade_rate_scaled * 0.14)
+        - (features.quote_churn_scaled * 0.06)
+        - (features.spread_bps_scaled * 0.14)
         + (features.venue_quality_score * 0.45)
         + (features.averaging_window_progress * 0.4)
         - (features.market_data_age_scaled * 0.35)
@@ -119,8 +169,10 @@ pub fn settlement_anchor_logit(features: &FeatureVector) -> ModelOutput {
     let probability_yes = 1.0 / (1.0 + (-score).exp());
     let confidence = ((probability_yes - features.market_prob).abs() * 1.5
         + features.reference_gap_bps_scaled.abs() * 0.14
+        + features.distance_to_strike_bps_scaled.abs() * 0.08
         + features.venue_quality_score * 0.18
         + features.averaging_window_progress * 0.08
+        - features.spread_bps_scaled * 0.05
         - features.market_data_age_scaled * 0.06)
         .clamp(0.05, 0.95);
     ModelOutput {
@@ -136,8 +188,16 @@ pub fn trained_linear(features: &FeatureVector, weights: &TrainedLinearWeights) 
         + (features.reference_yes_prob * weights.reference_yes_prob)
         + (features.reference_gap_bps_scaled * weights.reference_gap_bps_scaled)
         + (features.threshold_distance_bps_scaled * weights.threshold_distance_bps_scaled)
+        + (features.distance_to_strike_bps_scaled * weights.distance_to_strike_bps_scaled)
+        + (features.reference_velocity_scaled * weights.reference_velocity_scaled)
+        + (features.realized_vol_short_scaled * weights.realized_vol_short_scaled)
+        + (features.time_decay_factor * weights.time_decay_factor)
         + (features.order_book_imbalance * weights.order_book_imbalance)
         + (features.aggressive_buy_ratio * weights.aggressive_buy_ratio)
+        + (features.size_ahead_scaled * weights.size_ahead_scaled)
+        + (features.trade_rate_scaled * weights.trade_rate_scaled)
+        + (features.quote_churn_scaled * weights.quote_churn_scaled)
+        + (features.spread_bps_scaled * weights.spread_bps_scaled)
         + (features.venue_quality_score * weights.venue_quality_score)
         + (features.market_data_age_scaled * weights.market_data_age_scaled)
         + (features.reference_age_scaled * weights.reference_age_scaled)
@@ -147,7 +207,9 @@ pub fn trained_linear(features: &FeatureVector, weights: &TrainedLinearWeights) 
     let confidence = ((probability_yes - features.market_prob).abs() * 1.75
         + features.venue_quality_score * 0.24
         + features.reference_gap_bps_scaled.abs() * 0.08
+        + features.distance_to_strike_bps_scaled.abs() * 0.07
         - features.market_data_age_scaled * 0.06
+        - features.spread_bps_scaled * 0.04
         - features.reference_age_scaled * 0.04)
         .clamp(0.05, 0.95);
     ModelOutput {
@@ -198,11 +260,10 @@ pub fn run_model_with_weights(
 #[cfg(test)]
 mod tests {
     use super::{
-        BASELINE_CONTRARIAN_V1, BASELINE_LOGIT_V1, FLOW_WEIGHTED_CONTRARIAN_V2,
-        FLOW_WEIGHTED_V2, FeatureVector, SETTLEMENT_ANCHOR_CONTRARIAN_V3,
-        SETTLEMENT_ANCHOR_V3, TRAINED_LINEAR_CONTRARIAN_V1, TRAINED_LINEAR_V1,
-        TrainedLinearWeights, baseline_logit, run_model, run_model_with_weights,
-        supported_models,
+        BASELINE_CONTRARIAN_V1, BASELINE_LOGIT_V1, FLOW_WEIGHTED_CONTRARIAN_V2, FLOW_WEIGHTED_V2,
+        FeatureVector, SETTLEMENT_ANCHOR_CONTRARIAN_V3, SETTLEMENT_ANCHOR_V3,
+        TRAINED_LINEAR_CONTRARIAN_V1, TRAINED_LINEAR_V1, TrainedLinearWeights, baseline_logit,
+        run_model, run_model_with_weights, supported_models,
     };
 
     #[test]
@@ -212,8 +273,20 @@ mod tests {
             reference_yes_prob: 0.56,
             reference_gap_bps_scaled: 0.70,
             threshold_distance_bps_scaled: 0.15,
+            distance_to_strike_bps_scaled: 0.18,
+            reference_velocity_scaled: 0.24,
+            realized_vol_short_scaled: 0.12,
+            time_decay_factor: 0.42,
             order_book_imbalance: 0.20,
             aggressive_buy_ratio: 0.66,
+            size_ahead_scaled: 0.20,
+            trade_rate_scaled: 0.38,
+            quote_churn_scaled: 0.10,
+            size_ahead_real_scaled: 0.22,
+            trade_consumption_rate_scaled: 0.32,
+            cancel_rate_scaled: 0.08,
+            queue_decay_rate_scaled: 0.12,
+            spread_bps_scaled: 0.16,
             venue_quality_score: 0.83,
             market_data_age_scaled: 0.05,
             reference_age_scaled: 0.04,
@@ -231,8 +304,20 @@ mod tests {
             reference_yes_prob: 0.56,
             reference_gap_bps_scaled: 0.70,
             threshold_distance_bps_scaled: 0.15,
+            distance_to_strike_bps_scaled: 0.18,
+            reference_velocity_scaled: 0.24,
+            realized_vol_short_scaled: 0.12,
+            time_decay_factor: 0.42,
             order_book_imbalance: 0.20,
             aggressive_buy_ratio: 0.66,
+            size_ahead_scaled: 0.20,
+            trade_rate_scaled: 0.38,
+            quote_churn_scaled: 0.10,
+            size_ahead_real_scaled: 0.22,
+            trade_consumption_rate_scaled: 0.32,
+            cancel_rate_scaled: 0.08,
+            queue_decay_rate_scaled: 0.12,
+            spread_bps_scaled: 0.16,
             venue_quality_score: 0.83,
             market_data_age_scaled: 0.05,
             reference_age_scaled: 0.04,
@@ -266,8 +351,20 @@ mod tests {
             reference_yes_prob: 0.60,
             reference_gap_bps_scaled: 0.25,
             threshold_distance_bps_scaled: 0.10,
+            distance_to_strike_bps_scaled: 0.22,
+            reference_velocity_scaled: 0.18,
+            realized_vol_short_scaled: 0.09,
+            time_decay_factor: 0.36,
             order_book_imbalance: 0.15,
             aggressive_buy_ratio: 0.62,
+            size_ahead_scaled: 0.24,
+            trade_rate_scaled: 0.31,
+            quote_churn_scaled: 0.08,
+            size_ahead_real_scaled: 0.25,
+            trade_consumption_rate_scaled: 0.28,
+            cancel_rate_scaled: 0.06,
+            queue_decay_rate_scaled: 0.10,
+            spread_bps_scaled: 0.14,
             venue_quality_score: 0.85,
             market_data_age_scaled: 0.03,
             reference_age_scaled: 0.04,
@@ -280,8 +377,16 @@ mod tests {
             reference_yes_prob: 1.5,
             reference_gap_bps_scaled: 0.3,
             threshold_distance_bps_scaled: 0.2,
+            distance_to_strike_bps_scaled: 0.35,
+            reference_velocity_scaled: 0.18,
+            realized_vol_short_scaled: 0.07,
+            time_decay_factor: 0.10,
             order_book_imbalance: 0.4,
             aggressive_buy_ratio: 0.5,
+            size_ahead_scaled: -0.08,
+            trade_rate_scaled: 0.16,
+            quote_churn_scaled: -0.04,
+            spread_bps_scaled: -0.10,
             venue_quality_score: 0.35,
             market_data_age_scaled: -0.2,
             reference_age_scaled: -0.1,

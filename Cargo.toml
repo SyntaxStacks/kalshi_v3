@@ -6,6 +6,7 @@ members = [
     "crates/execution",
     "crates/feature",
     "crates/ingest",
+    "crates/market-data",
     "crates/market-models",
     "crates/notifier",
     "crates/replay",

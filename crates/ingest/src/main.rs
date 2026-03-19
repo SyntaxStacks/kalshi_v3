@@ -3,16 +3,22 @@ use async_nats::Client as NatsClient;
 use chrono::{DateTime, Utc};
 use common::{
     AppConfig, KalshiMarketState, MarketFamily, ReferencePriceState, TradeMode,
-    WeatherReferenceState, events::ReferencePriceTick,
-    kalshi_api_key_id, kalshi_private_key, kalshi_sign_rest_request,
-    kalshi_sign_ws_connect_request, kalshi_timestamp_ms, subjects,
+    WeatherReferenceState, events::ReferencePriceTick, kalshi_api_key_id, kalshi_private_key,
+    kalshi_sign_rest_request, kalshi_sign_ws_connect_request, kalshi_timestamp_ms, subjects,
 };
 use futures::{SinkExt, StreamExt};
+use market_data::{
+    ContractSide, OrderBookDelta, OrderBookSnapshot, OrderBookState, PriceLevel, QueueSnapshot,
+    TradePrint,
+};
 use redis::AsyncCommands;
 use reqwest::Client as HttpClient;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{collections::{HashMap, HashSet}, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 use storage::{LiveFillSyncRecord, LiveOrderSyncRecord, LivePositionSyncRecord};
 use tokio::{
     sync::RwLock,
@@ -29,11 +35,13 @@ use tokio_tungstenite::{
 use tracing::{info, warn};
 
 const REDIS_MARKETS_KEY: &str = "v3:kalshi:markets";
+const REDIS_QUEUE_PREFIX: &str = "v3:queue:";
 const REDIS_WEATHER_REFERENCE_PREFIX: &str = "v3:weather:reference:";
 const REDIS_TTL_SECONDS: u64 = 300;
 const WS_RECONNECT_MAX_SECONDS: u64 = 30;
 
 type MarketCache = Arc<RwLock<HashMap<String, KalshiMarketState>>>;
+type OrderBookCache = Arc<RwLock<HashMap<String, OrderBookState>>>;
 type ReferenceCache = Arc<RwLock<HashMap<String, ReferencePriceState>>>;
 type WeatherReferenceCache = Arc<RwLock<HashMap<String, WeatherReferenceState>>>;
 
@@ -154,6 +162,7 @@ async fn main() -> Result<()> {
         .await?;
 
     let market_cache: MarketCache = Arc::new(RwLock::new(HashMap::new()));
+    let orderbook_cache: OrderBookCache = Arc::new(RwLock::new(HashMap::new()));
     let reference_cache: ReferenceCache = Arc::new(RwLock::new(HashMap::new()));
     let weather_reference_cache: WeatherReferenceCache = Arc::new(RwLock::new(HashMap::new()));
 
@@ -185,6 +194,7 @@ async fn main() -> Result<()> {
             storage.clone(),
             nats.clone(),
             market_cache.clone(),
+            orderbook_cache.clone(),
         ));
         tokio::spawn(run_coinbase_websocket(
             config.clone(),
@@ -352,6 +362,7 @@ async fn run_kalshi_websocket(
     storage: storage::Storage,
     nats: Option<NatsClient>,
     market_cache: MarketCache,
+    orderbook_cache: OrderBookCache,
 ) {
     let mut backoff_seconds = 1u64;
     loop {
@@ -361,6 +372,7 @@ async fn run_kalshi_websocket(
             &storage,
             nats.as_ref(),
             &market_cache,
+            &orderbook_cache,
         )
         .await
         {
@@ -380,6 +392,7 @@ async fn kalshi_websocket_session(
     storage: &storage::Storage,
     nats: Option<&NatsClient>,
     market_cache: &MarketCache,
+    orderbook_cache: &OrderBookCache,
 ) -> Result<()> {
     let mut request = config.kalshi_ws_url.clone().into_client_request()?;
     if let Some(api_key_id) = kalshi_api_key_id(config)? {
@@ -430,6 +443,20 @@ async fn kalshi_websocket_session(
                 .into(),
             ))
             .await?;
+        socket
+            .send(Message::Text(
+                json!({
+                    "id": 3,
+                    "cmd": "subscribe",
+                    "params": {
+                        "channels": ["orderbook_delta"],
+                        "market_tickers": trade_tickers
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await?;
     }
 
     while let Some(message) = socket.next().await {
@@ -437,14 +464,28 @@ async fn kalshi_websocket_session(
         match message {
             Message::Text(text) => {
                 if let Ok(payload) = serde_json::from_str::<Value>(&text) {
-                    process_kalshi_ws_message(redis_client, storage, nats, market_cache, &payload)
-                        .await?;
+                    process_kalshi_ws_message(
+                        redis_client,
+                        storage,
+                        nats,
+                        market_cache,
+                        orderbook_cache,
+                        &payload,
+                    )
+                    .await?;
                 }
             }
             Message::Binary(bytes) => {
                 if let Ok(payload) = serde_json::from_slice::<Value>(&bytes) {
-                    process_kalshi_ws_message(redis_client, storage, nats, market_cache, &payload)
-                        .await?;
+                    process_kalshi_ws_message(
+                        redis_client,
+                        storage,
+                        nats,
+                        market_cache,
+                        orderbook_cache,
+                        &payload,
+                    )
+                    .await?;
                 }
             }
             Message::Ping(payload) => socket.send(Message::Pong(payload)).await?,
@@ -463,6 +504,7 @@ async fn process_kalshi_ws_message(
     storage: &storage::Storage,
     nats: Option<&NatsClient>,
     market_cache: &MarketCache,
+    orderbook_cache: &OrderBookCache,
     payload: &Value,
 ) -> Result<()> {
     let msg_type = payload
@@ -496,6 +538,17 @@ async fn process_kalshi_ws_message(
             let Some(market_ticker) = msg.get("market_ticker").and_then(Value::as_str) else {
                 return Ok(());
             };
+            if let Some(trade) = normalize_trade_print(msg) {
+                apply_trade_print(
+                    redis_client,
+                    storage,
+                    nats,
+                    orderbook_cache,
+                    trade,
+                    "kalshi_ws_trade",
+                )
+                .await?;
+            }
             let Some(updated_market) =
                 update_market_from_trade_msg(market_cache, market_ticker, msg).await
             else {
@@ -510,6 +563,32 @@ async fn process_kalshi_ws_message(
                 "kalshi_ws_trade",
             )
             .await?;
+        }
+        "orderbook_snapshot" => {
+            if let Some(snapshot) = normalize_orderbook_snapshot(msg) {
+                apply_orderbook_snapshot(
+                    redis_client,
+                    storage,
+                    nats,
+                    orderbook_cache,
+                    snapshot,
+                    "kalshi_ws_orderbook_snapshot",
+                )
+                .await?;
+            }
+        }
+        "orderbook_delta" => {
+            if let Some(delta) = normalize_orderbook_delta(msg) {
+                apply_orderbook_delta(
+                    redis_client,
+                    storage,
+                    nats,
+                    orderbook_cache,
+                    delta,
+                    "kalshi_ws_orderbook_delta",
+                )
+                .await?;
+            }
         }
         "error" => {
             warn!(payload = %payload, "kalshi_websocket_error_message");
@@ -725,6 +804,105 @@ async fn upsert_market_state(
     Ok(())
 }
 
+async fn apply_orderbook_snapshot(
+    redis_client: &redis::Client,
+    storage: &storage::Storage,
+    nats: Option<&NatsClient>,
+    orderbook_cache: &OrderBookCache,
+    snapshot: OrderBookSnapshot,
+    source: &str,
+) -> Result<()> {
+    let queue_snapshot = {
+        let mut cache = orderbook_cache.write().await;
+        let state = cache
+            .entry(snapshot.market_ticker.clone())
+            .or_insert_with(|| OrderBookState::new(snapshot.market_ticker.clone()));
+        state.apply_snapshot(snapshot.clone());
+        state.queue_snapshot()
+    };
+    upsert_queue_snapshot(redis_client, storage, nats, queue_snapshot, source).await
+}
+
+async fn apply_orderbook_delta(
+    redis_client: &redis::Client,
+    storage: &storage::Storage,
+    nats: Option<&NatsClient>,
+    orderbook_cache: &OrderBookCache,
+    delta: OrderBookDelta,
+    source: &str,
+) -> Result<()> {
+    let queue_snapshot = {
+        let mut cache = orderbook_cache.write().await;
+        let state = cache
+            .entry(delta.market_ticker.clone())
+            .or_insert_with(|| OrderBookState::new(delta.market_ticker.clone()));
+        state.apply_delta(delta.clone());
+        state.queue_snapshot()
+    };
+    upsert_queue_snapshot(redis_client, storage, nats, queue_snapshot, source).await
+}
+
+async fn apply_trade_print(
+    redis_client: &redis::Client,
+    storage: &storage::Storage,
+    nats: Option<&NatsClient>,
+    orderbook_cache: &OrderBookCache,
+    trade: TradePrint,
+    source: &str,
+) -> Result<()> {
+    let queue_snapshot = {
+        let mut cache = orderbook_cache.write().await;
+        let state = cache
+            .entry(trade.market_ticker.clone())
+            .or_insert_with(|| OrderBookState::new(trade.market_ticker.clone()));
+        state.apply_trade(trade.clone());
+        state.queue_snapshot()
+    };
+    upsert_queue_snapshot(redis_client, storage, nats, queue_snapshot, source).await
+}
+
+async fn upsert_queue_snapshot(
+    redis_client: &redis::Client,
+    storage: &storage::Storage,
+    nats: Option<&NatsClient>,
+    snapshot: QueueSnapshot,
+    source: &str,
+) -> Result<()> {
+    let mut redis = redis_client.get_multiplexed_async_connection().await?;
+    let _: () = redis
+        .set_ex(
+            format!("{REDIS_QUEUE_PREFIX}{}", snapshot.market_ticker),
+            serde_json::to_string(&snapshot)?,
+            REDIS_TTL_SECONDS,
+        )
+        .await?;
+
+    if let Some(client) = nats {
+        let subject = if source.contains("trade") {
+            subjects::KALSHI_TRADE_PRINT
+        } else {
+            subjects::KALSHI_ORDERBOOK_DELTA
+        };
+        if let Err(error) = client
+            .publish(subject, serde_json::to_vec(&snapshot)?.into())
+            .await
+        {
+            warn!(error = %error, "kalshi_queue_snapshot_publish_failed");
+        }
+    }
+
+    storage
+        .insert_ingest_event(
+            "kalshi",
+            source,
+            &snapshot.market_ticker,
+            &serde_json::to_value(&snapshot)?,
+            snapshot.updated_at,
+        )
+        .await?;
+    Ok(())
+}
+
 async fn upsert_reference_state(
     redis_client: &redis::Client,
     storage: &storage::Storage,
@@ -810,6 +988,122 @@ async fn update_market_from_trade_msg(
         created_at: updated_at,
         ..existing
     })
+}
+
+fn normalize_trade_print(msg: &Value) -> Option<TradePrint> {
+    let market_ticker = msg.get("market_ticker")?.as_str()?.to_string();
+    let side = parse_contract_side(
+        msg.get("side")
+            .or_else(|| msg.get("taker_side"))
+            .or_else(|| msg.get("maker_side")),
+    )?;
+    let price = parse_f64_from_candidates(
+        msg,
+        &[
+            "yes_price_dollars",
+            "yes_price",
+            "price_dollars",
+            "price",
+            "last_price_dollars",
+        ],
+    )?;
+    let quantity = parse_f64_from_candidates(msg, &["count", "quantity", "size", "fill_count"])?;
+    let ts = msg
+        .get("created_time")
+        .and_then(parse_time)
+        .or_else(|| msg.get("time").and_then(parse_time))
+        .or_else(|| msg.get("ts").and_then(parse_time))
+        .unwrap_or_else(Utc::now);
+    Some(TradePrint {
+        market_ticker,
+        side,
+        price,
+        quantity,
+        ts,
+    })
+}
+
+fn normalize_orderbook_snapshot(msg: &Value) -> Option<OrderBookSnapshot> {
+    let market_ticker = msg.get("market_ticker")?.as_str()?.to_string();
+    let yes = parse_price_levels(
+        msg.get("yes")
+            .or_else(|| msg.get("yes_levels"))
+            .or_else(|| msg.get("yes_book")),
+    );
+    let no = parse_price_levels(
+        msg.get("no")
+            .or_else(|| msg.get("no_levels"))
+            .or_else(|| msg.get("no_book")),
+    );
+    let ts = msg
+        .get("ts")
+        .and_then(parse_time)
+        .or_else(|| msg.get("time").and_then(parse_time))
+        .or_else(|| msg.get("created_time").and_then(parse_time))
+        .unwrap_or_else(Utc::now);
+    Some(OrderBookSnapshot {
+        market_ticker,
+        yes,
+        no,
+        ts,
+    })
+}
+
+fn normalize_orderbook_delta(msg: &Value) -> Option<OrderBookDelta> {
+    let market_ticker = msg.get("market_ticker")?.as_str()?.to_string();
+    let side = parse_contract_side(msg.get("side"))?;
+    let price =
+        parse_f64_from_candidates(msg, &["price_dollars", "price", "yes_price", "no_price"])?;
+    let delta_size = parse_f64_from_candidates(
+        msg,
+        &["delta", "delta_size", "quantity_delta", "count_delta"],
+    )?;
+    let ts = msg
+        .get("ts")
+        .and_then(parse_time)
+        .or_else(|| msg.get("time").and_then(parse_time))
+        .or_else(|| msg.get("created_time").and_then(parse_time))
+        .unwrap_or_else(Utc::now);
+    Some(OrderBookDelta {
+        market_ticker,
+        side,
+        price,
+        delta_size,
+        ts,
+    })
+}
+
+fn parse_contract_side(value: Option<&Value>) -> Option<ContractSide> {
+    match value.and_then(Value::as_str)?.to_ascii_lowercase().as_str() {
+        "yes" | "buy_yes" => Some(ContractSide::Yes),
+        "no" | "buy_no" => Some(ContractSide::No),
+        _ => None,
+    }
+}
+
+fn parse_price_levels(value: Option<&Value>) -> Vec<PriceLevel> {
+    value
+        .and_then(Value::as_array)
+        .map(|levels| {
+            levels
+                .iter()
+                .filter_map(|level| {
+                    if let Some(items) = level.as_array() {
+                        let price = parse_f64(items.first())?;
+                        let total_size = parse_f64(items.get(1))?;
+                        return Some(PriceLevel { price, total_size });
+                    }
+                    Some(PriceLevel {
+                        price: parse_f64_from_candidates(level, &["price_dollars", "price"])?,
+                        total_size: parse_f64_from_candidates(
+                            level,
+                            &["count", "quantity", "size", "total_size"],
+                        )?,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 async fn fetch_kalshi_markets(
@@ -1090,7 +1384,9 @@ async fn fetch_weather_reference_state(
     http: &HttpClient,
     metadata: &WeatherMarketMetadata,
 ) -> Result<Option<WeatherReferenceState>> {
-    let Some((latitude, longitude)) = resolve_weather_city_coordinates(config, http, &metadata.city).await? else {
+    let Some((latitude, longitude)) =
+        resolve_weather_city_coordinates(config, http, &metadata.city).await?
+    else {
         return Ok(None);
     };
     let points_url = format!(
@@ -1118,7 +1414,11 @@ async fn fetch_weather_reference_state(
         .periods
         .iter()
         .filter(|period| period.start_time.starts_with(&metadata.market_date))
-        .filter_map(|period| period.temperature.map(|value| nws_temperature_to_fahrenheit(value, period.temperature_unit.as_deref())))
+        .filter_map(|period| {
+            period.temperature.map(|value| {
+                nws_temperature_to_fahrenheit(value, period.temperature_unit.as_deref())
+            })
+        })
         .collect::<Vec<_>>();
     let forecast_temperature_f = match metadata.contract_kind.as_str() {
         WEATHER_LOW_KIND => forecast_temperatures.iter().copied().reduce(f64::min),
@@ -1150,14 +1450,22 @@ async fn fetch_weather_reference_state(
             .error_for_status()?
             .json()
             .await?;
-        observation.properties.temperature.value.map(celsius_to_fahrenheit)
+        observation
+            .properties
+            .temperature
+            .value
+            .map(celsius_to_fahrenheit)
     } else {
         None
     };
 
     let days_out = date_days_from_now(&metadata.market_date);
     let hourly_coverage = (forecast_temperatures.len() as f64 / 24.0).clamp(0.0, 1.0);
-    let observation_bonus = if observation_temperature_f.is_some() { 0.06 } else { 0.0 };
+    let observation_bonus = if observation_temperature_f.is_some() {
+        0.06
+    } else {
+        0.0
+    };
     let confidence_score = (0.72 + (hourly_coverage * 0.16) + observation_bonus
         - (days_out as f64 * 0.04))
         .clamp(0.35, 0.96);
@@ -1539,10 +1847,16 @@ fn normalize_weather_metadata(
     market_title: &str,
     series_title: Option<&str>,
 ) -> Option<WeatherMarketMetadata> {
-    let metadata = series_title.and_then(parse_weather_series_metadata).or_else(|| {
-        parse_weather_series_metadata(market_title).or_else(|| parse_weather_market_city(market_title))
-    })?;
-    let event_ticker = value.get("event_ticker").and_then(Value::as_str).unwrap_or_default();
+    let metadata = series_title
+        .and_then(parse_weather_series_metadata)
+        .or_else(|| {
+            parse_weather_series_metadata(market_title)
+                .or_else(|| parse_weather_market_city(market_title))
+        })?;
+    let event_ticker = value
+        .get("event_ticker")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let market_date = parse_market_date_from_event_ticker(event_ticker)?;
     Some(WeatherMarketMetadata {
         city: metadata.city,
