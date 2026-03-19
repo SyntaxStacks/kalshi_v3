@@ -164,6 +164,10 @@ h3 {
   margin-bottom: 12px;
 }
 
+.panel-head > *:first-child {
+  min-width: 0;
+}
+
 .decision-grid,
 .state-strip,
 .bankroll-list,
@@ -188,6 +192,8 @@ h3 {
   border: 1px solid var(--line);
   border-radius: var(--radius-lg);
   background: var(--surface-strong);
+  min-width: 0;
+  overflow: hidden;
 }
 
 .decision-tile {
@@ -243,6 +249,10 @@ h3 {
   justify-content: space-between;
   align-items: start;
   gap: 10px;
+}
+
+.triage-head > * {
+  min-width: 0;
 }
 
 .triage-meta {
@@ -401,6 +411,12 @@ h3 {
   gap: 10px;
 }
 
+.trade-card header > *,
+.metric-card header > *,
+.lane-card header > * {
+  min-width: 0;
+}
+
 .trade-heading-row {
   display: flex;
   flex-wrap: wrap;
@@ -426,6 +442,20 @@ h3 {
   margin-top: 4px;
   font-size: 1.1rem;
   line-height: 1.08;
+}
+
+.lane-card strong,
+.trade-card strong,
+.triage-card strong,
+.stack-row strong,
+.issue-item strong,
+.state-pill strong,
+.decision-tile strong,
+.trade-headline,
+.trade-subtitle,
+.muted {
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .trade-subtitle {
