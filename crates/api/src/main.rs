@@ -1807,6 +1807,8 @@ mod tests {
                 live_sample_sufficient: false,
                 replay_sample_sufficient: false,
             },
+            family_execution_truth: Vec::new(),
+            lane_execution_truth: Vec::new(),
             live_sync: None,
             live_exceptions: LiveExceptionSnapshot {
                 operator_control: None,

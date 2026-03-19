@@ -476,6 +476,54 @@ pub struct ExecutionQualitySummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FamilyExecutionTruthSummary {
+    pub market_family: MarketFamily,
+    pub mode: TradeMode,
+    pub lane_count: i64,
+    pub recent_live_terminal_intent_count: i64,
+    pub recent_live_predicted_fill_sample_count: i64,
+    // Null means the typed execution forecast is still missing for the current sample.
+    pub recent_live_predicted_fill_probability_mean: Option<f64>,
+    // Quantity-based live truth. This is the fraction of submitted live quantity that actually filled.
+    pub recent_live_filled_quantity_ratio: Option<f64>,
+    // Intent hit rate is intentionally separate from filled quantity ratio because fills can be partial.
+    pub recent_live_actual_fill_hit_rate: Option<f64>,
+    // Replay remains diagnostic until it is proven comparable to live outcomes.
+    pub replay_trade_weighted_edge_realization_ratio_diag: Option<f64>,
+    pub live_vs_replay_fill_gap: Option<f64>,
+    pub status: String,
+    pub degraded_lane_count: i64,
+    pub quarantine_candidate_count: i64,
+    pub live_sample_sufficient: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaneExecutionTruthSummary {
+    pub lane_key: String,
+    pub market_family: MarketFamily,
+    pub mode: TradeMode,
+    pub promotion_state: Option<PromotionState>,
+    pub current_champion_model: Option<String>,
+    pub recent_live_terminal_intent_count: i64,
+    pub recent_live_predicted_fill_sample_count: i64,
+    // Null means the typed execution forecast was not available for enough recent live intents.
+    pub recent_live_predicted_fill_probability_mean: Option<f64>,
+    // Quantity-based live truth. This excludes ambiguous statuses like `opened`.
+    pub recent_live_filled_quantity_ratio: Option<f64>,
+    pub recent_live_actual_fill_hit_rate: Option<f64>,
+    pub replay_trade_weighted_edge_realization_ratio_diag: Option<f64>,
+    pub predicted_vs_realized_fill_gap: Option<f64>,
+    pub live_vs_replay_fill_gap: Option<f64>,
+    pub status: String,
+    pub degrade_live_recommended: bool,
+    pub block_promotion_recommended: bool,
+    pub manual_reenable_required: bool,
+    pub recommended_size_multiplier: Option<f64>,
+    pub recommendation_reason: Option<String>,
+    pub live_sample_sufficient: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DashboardSnapshot {
     pub market_family: Option<MarketFamily>,
     pub bankrolls: Vec<BankrollCard>,
@@ -483,6 +531,8 @@ pub struct DashboardSnapshot {
     pub open_trades: Vec<OpenTradeSummary>,
     pub opportunities: Vec<OpportunityCard>,
     pub execution_quality: ExecutionQualitySummary,
+    pub family_execution_truth: Vec<FamilyExecutionTruthSummary>,
+    pub lane_execution_truth: Vec<LaneExecutionTruthSummary>,
     pub live_sync: Option<LiveExchangeSyncSummary>,
     pub live_exceptions: LiveExceptionSnapshot,
 }

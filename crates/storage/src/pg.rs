@@ -1,12 +1,13 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use common::{
-    BankrollCard, DashboardSnapshot, ExecutionQualitySummary, LaneInspectionSnapshot,
-    LaneReplaySummary, LaneState, LaneTradeCard, LiveExceptionSnapshot, LiveExchangeSyncSummary,
-    LiveFillCard, LiveIntentCard, LiveOrderCard, LivePositionCard, LiveTradeExceptionCard,
-    MarketFamily, MarketFeatureSnapshotRecord, ModelInference, OpenTradeSummary,
-    OperatorActionEvent, OperatorControlState, OpportunityCard, OpportunityDecision,
-    PromotionState, ReadinessSummary, ReplayBenchmarkCard, StrategyFamily, TradeMode,
+    BankrollCard, DashboardSnapshot, ExecutionQualitySummary, FamilyExecutionTruthSummary,
+    LaneExecutionTruthSummary, LaneInspectionSnapshot, LaneReplaySummary, LaneState, LaneTradeCard,
+    LiveExceptionSnapshot, LiveExchangeSyncSummary, LiveFillCard, LiveIntentCard, LiveOrderCard,
+    LivePositionCard, LiveTradeExceptionCard, MarketFamily, MarketFeatureSnapshotRecord,
+    ModelInference, OpenTradeSummary, OperatorActionEvent, OperatorControlState, OpportunityCard,
+    OpportunityDecision, PromotionState, ReadinessSummary, ReplayBenchmarkCard, StrategyFamily,
+    TradeMode,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -395,6 +396,8 @@ impl Storage {
         let open_trades = self.list_open_trades(family).await?;
         let opportunities = self.list_latest_opportunities(family, 6).await?;
         let execution_quality = self.execution_quality_summary(family).await?;
+        let lane_execution_truth = self.lane_execution_truth_summaries(family, &lanes).await?;
+        let family_execution_truth = summarize_family_execution_truth(&lane_execution_truth);
         let live_sync = self.latest_live_exchange_sync_summary().await?;
         let live_exceptions = self.live_exception_snapshot().await?;
 
@@ -415,6 +418,8 @@ impl Storage {
             open_trades,
             opportunities,
             execution_quality,
+            family_execution_truth,
+            lane_execution_truth,
             live_sync,
             live_exceptions,
         })
@@ -817,6 +822,68 @@ impl Storage {
             live_sample_sufficient: live.live_sample_sufficient,
             replay_sample_sufficient: replay.replay_sample_sufficient,
         })
+    }
+
+    pub async fn lane_execution_truth_summaries(
+        &self,
+        family: Option<MarketFamily>,
+        lane_states: &[LaneState],
+    ) -> Result<Vec<LaneExecutionTruthSummary>> {
+        let family_key = family.map(|value| SqlMarketFamily::from(value).as_key().to_string());
+        let live_rows = sqlx::query_as::<_, LiveLaneExecutionTruthRow>(
+            r#"
+            select
+                od.market_family,
+                od.lane_key,
+                ei.predicted_fill_probability,
+                ei.submitted_quantity,
+                ei.filled_quantity
+            from execution_intent ei
+            join opportunity_decision od on od.id = ei.decision_id
+            where ei.processed_at is not null
+              and ei.mode = 'live'
+              and ($1::text is null or od.market_family = $1)
+              and ei.status in ('filled', 'partially_filled', 'cancelled', 'rejected', 'expired', 'superseded', 'orphaned')
+            order by ei.processed_at desc, ei.id desc
+            limit 1000
+            "#,
+        )
+        .bind(&family_key)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let replay_rows = sqlx::query_as::<_, ReplayLaneExecutionTruthRow>(
+            r#"
+            with latest_runs as (
+                select distinct on (lane_key)
+                    id,
+                    lane_key,
+                    market_family,
+                    created_at
+                from model_benchmark_run
+                where ($1::text is null or market_family = $1)
+                order by lane_key, created_at desc, id desc
+            )
+            select
+                lr.market_family,
+                lr.lane_key,
+                mbr.trade_count,
+                mbr.fill_rate,
+                mbr.edge_realization_ratio
+            from latest_runs lr
+            join model_benchmark_result mbr on mbr.run_id = lr.id
+            where mbr.rank = 1
+            "#,
+        )
+        .bind(&family_key)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(build_lane_execution_truth_summaries(
+            &live_rows,
+            &replay_rows,
+            lane_states,
+        ))
     }
 
     pub async fn list_latest_feature_snapshots(
@@ -4412,6 +4479,24 @@ struct LiveExecutionQualityRow {
     filled_quantity: f64,
 }
 
+#[derive(sqlx::FromRow)]
+struct ReplayLaneExecutionTruthRow {
+    market_family: SqlMarketFamily,
+    lane_key: String,
+    trade_count: i32,
+    fill_rate: f64,
+    edge_realization_ratio: f64,
+}
+
+#[derive(sqlx::FromRow)]
+struct LiveLaneExecutionTruthRow {
+    market_family: SqlMarketFamily,
+    lane_key: String,
+    predicted_fill_probability: Option<f64>,
+    submitted_quantity: f64,
+    filled_quantity: f64,
+}
+
 #[derive(sqlx::Type, Clone, Copy)]
 #[sqlx(type_name = "text", rename_all = "snake_case")]
 enum SqlMarketFamily {
@@ -5231,6 +5316,89 @@ struct LiveExecutionQualityAggregate {
     live_sample_sufficient: bool,
 }
 
+#[derive(Default)]
+struct LaneExecutionTruthAggregate {
+    market_family: MarketFamily,
+    lane_key: String,
+    recent_live_terminal_intent_count: i64,
+    recent_live_predicted_fill_sample_count: i64,
+    recent_live_predicted_fill_probability_sum: f64,
+    recent_live_submitted_quantity_total: f64,
+    recent_live_filled_quantity_total: f64,
+    recent_live_predicted_submitted_quantity_total: f64,
+    recent_live_predicted_filled_quantity_total: f64,
+    recent_live_predicted_filled_intent_count: i64,
+    replay_trade_count: i64,
+    replay_fill_rate_weighted_sum: f64,
+    replay_edge_realization_weighted_sum: f64,
+}
+
+impl LaneExecutionTruthAggregate {
+    fn from_live_row(row: &LiveLaneExecutionTruthRow) -> Self {
+        let submitted = row.submitted_quantity.max(0.0);
+        let filled = row.filled_quantity.clamp(0.0, submitted);
+        let predicted_sample = if row.predicted_fill_probability.is_some() && submitted > 0.0 {
+            1
+        } else {
+            0
+        };
+        let predicted_fill_probability_sum = row.predicted_fill_probability.unwrap_or_default();
+        let predicted_submitted_total = if predicted_sample == 1 {
+            submitted
+        } else {
+            0.0
+        };
+        let predicted_filled_total = if predicted_sample == 1 { filled } else { 0.0 };
+        let predicted_filled_intent_count = if predicted_sample == 1 && filled > 0.0 {
+            1
+        } else {
+            0
+        };
+        Self {
+            market_family: MarketFamily::from(row.market_family),
+            lane_key: row.lane_key.clone(),
+            recent_live_terminal_intent_count: 1,
+            recent_live_predicted_fill_sample_count: predicted_sample,
+            recent_live_predicted_fill_probability_sum: predicted_fill_probability_sum,
+            recent_live_submitted_quantity_total: submitted,
+            recent_live_filled_quantity_total: filled,
+            recent_live_predicted_submitted_quantity_total: predicted_submitted_total,
+            recent_live_predicted_filled_quantity_total: predicted_filled_total,
+            recent_live_predicted_filled_intent_count: predicted_filled_intent_count,
+            ..Default::default()
+        }
+    }
+
+    fn apply_live_row(&mut self, row: &LiveLaneExecutionTruthRow) {
+        let submitted = row.submitted_quantity.max(0.0);
+        let filled = row.filled_quantity.clamp(0.0, submitted);
+        self.recent_live_terminal_intent_count += 1;
+        self.recent_live_submitted_quantity_total += submitted;
+        self.recent_live_filled_quantity_total += filled;
+        if let Some(predicted_fill_probability) = row.predicted_fill_probability {
+            if submitted > 0.0 {
+                self.recent_live_predicted_fill_sample_count += 1;
+                self.recent_live_predicted_fill_probability_sum += predicted_fill_probability;
+                self.recent_live_predicted_submitted_quantity_total += submitted;
+                self.recent_live_predicted_filled_quantity_total += filled;
+                if filled > 0.0 {
+                    self.recent_live_predicted_filled_intent_count += 1;
+                }
+            }
+        }
+    }
+
+    fn attach_replay(&mut self, row: &ReplayLaneExecutionTruthRow) {
+        let weight = i64::from(row.trade_count.max(0));
+        if weight <= 0 {
+            return;
+        }
+        self.replay_trade_count += weight;
+        self.replay_fill_rate_weighted_sum += row.fill_rate * weight as f64;
+        self.replay_edge_realization_weighted_sum += row.edge_realization_ratio * weight as f64;
+    }
+}
+
 fn summarize_replay_execution_quality(
     rows: &[ReplayExecutionQualityRow],
 ) -> ReplayExecutionQualityAggregate {
@@ -5345,6 +5513,406 @@ fn summarize_live_execution_quality(
     }
 }
 
+fn build_lane_execution_truth_summaries(
+    live_rows: &[LiveLaneExecutionTruthRow],
+    replay_rows: &[ReplayLaneExecutionTruthRow],
+    lane_states: &[LaneState],
+) -> Vec<LaneExecutionTruthSummary> {
+    use std::collections::{BTreeMap, HashMap, HashSet};
+
+    let mut aggregates: BTreeMap<String, LaneExecutionTruthAggregate> = BTreeMap::new();
+    let lane_state_map = lane_states
+        .iter()
+        .map(|lane| (lane.lane_key.as_str(), lane))
+        .collect::<HashMap<_, _>>();
+    let tracked_lane_keys = lane_states
+        .iter()
+        .map(|lane| lane.lane_key.clone())
+        .collect::<HashSet<_>>();
+    for row in live_rows {
+        aggregates
+            .entry(row.lane_key.clone())
+            .and_modify(|aggregate| aggregate.apply_live_row(row))
+            .or_insert_with(|| LaneExecutionTruthAggregate::from_live_row(row));
+    }
+
+    for row in replay_rows {
+        if !tracked_lane_keys.contains(&row.lane_key) && !aggregates.contains_key(&row.lane_key) {
+            continue;
+        }
+        aggregates
+            .entry(row.lane_key.clone())
+            .and_modify(|aggregate| aggregate.attach_replay(row))
+            .or_insert_with(|| {
+                let mut aggregate = LaneExecutionTruthAggregate {
+                    market_family: MarketFamily::from(row.market_family),
+                    lane_key: row.lane_key.clone(),
+                    ..Default::default()
+                };
+                aggregate.attach_replay(row);
+                aggregate
+            });
+    }
+
+    let mut summaries = aggregates
+        .into_values()
+        .map(|aggregate| {
+            let lane_state = lane_state_map.get(aggregate.lane_key.as_str()).copied();
+            lane_execution_truth_summary(aggregate, lane_state)
+        })
+        .collect::<Vec<_>>();
+
+    summaries.sort_by(|left, right| {
+        execution_truth_status_rank(&left.status)
+            .cmp(&execution_truth_status_rank(&right.status))
+            .then_with(|| {
+                right
+                    .recent_live_terminal_intent_count
+                    .cmp(&left.recent_live_terminal_intent_count)
+            })
+            .then_with(|| left.lane_key.cmp(&right.lane_key))
+    });
+    summaries
+}
+
+fn lane_execution_truth_summary(
+    aggregate: LaneExecutionTruthAggregate,
+    lane_state: Option<&LaneState>,
+) -> LaneExecutionTruthSummary {
+    let predicted_fill_probability_mean = if aggregate.recent_live_predicted_fill_sample_count > 0 {
+        Some(
+            aggregate.recent_live_predicted_fill_probability_sum
+                / aggregate.recent_live_predicted_fill_sample_count as f64,
+        )
+    } else {
+        None
+    };
+    let filled_quantity_ratio = if aggregate.recent_live_submitted_quantity_total > 0.0 {
+        Some(
+            aggregate.recent_live_filled_quantity_total
+                / aggregate.recent_live_submitted_quantity_total,
+        )
+    } else {
+        None
+    };
+    let actual_fill_hit_rate = if aggregate.recent_live_predicted_fill_sample_count > 0 {
+        Some(
+            aggregate.recent_live_predicted_filled_intent_count as f64
+                / aggregate.recent_live_predicted_fill_sample_count as f64,
+        )
+    } else {
+        None
+    };
+    let replay_edge = if aggregate.replay_trade_count > 0 {
+        Some(aggregate.replay_edge_realization_weighted_sum / aggregate.replay_trade_count as f64)
+    } else {
+        None
+    };
+    let replay_fill_rate = if aggregate.replay_trade_count > 0 {
+        Some(aggregate.replay_fill_rate_weighted_sum / aggregate.replay_trade_count as f64)
+    } else {
+        None
+    };
+    let predicted_vs_realized_fill_gap = predicted_fill_probability_mean
+        .zip(actual_fill_hit_rate)
+        .map(|(predicted, actual)| actual - predicted);
+    let live_vs_replay_fill_gap = replay_fill_rate
+        .zip(actual_fill_hit_rate)
+        .map(|(replay, live)| live - replay);
+    let live_sample_sufficient = aggregate.recent_live_terminal_intent_count >= 5
+        && aggregate.recent_live_predicted_fill_sample_count >= 5;
+    let recommendation = lane_execution_truth_recommendation(
+        live_sample_sufficient,
+        lane_state.and_then(|lane| Some(lane.promotion_state)),
+        filled_quantity_ratio,
+        actual_fill_hit_rate,
+        replay_edge,
+        predicted_vs_realized_fill_gap,
+        live_vs_replay_fill_gap,
+    );
+
+    LaneExecutionTruthSummary {
+        lane_key: aggregate.lane_key,
+        market_family: aggregate.market_family,
+        mode: TradeMode::Live,
+        promotion_state: lane_state.map(|lane| lane.promotion_state),
+        current_champion_model: lane_state.and_then(|lane| lane.current_champion_model.clone()),
+        recent_live_terminal_intent_count: aggregate.recent_live_terminal_intent_count,
+        recent_live_predicted_fill_sample_count: aggregate.recent_live_predicted_fill_sample_count,
+        recent_live_predicted_fill_probability_mean: predicted_fill_probability_mean,
+        recent_live_filled_quantity_ratio: filled_quantity_ratio,
+        recent_live_actual_fill_hit_rate: actual_fill_hit_rate,
+        replay_trade_weighted_edge_realization_ratio_diag: replay_edge,
+        predicted_vs_realized_fill_gap,
+        live_vs_replay_fill_gap,
+        status: recommendation.status,
+        degrade_live_recommended: recommendation.degrade_live_recommended,
+        block_promotion_recommended: recommendation.block_promotion_recommended,
+        manual_reenable_required: recommendation.manual_reenable_required,
+        recommended_size_multiplier: recommendation.recommended_size_multiplier,
+        recommendation_reason: recommendation.recommendation_reason,
+        live_sample_sufficient,
+    }
+}
+
+fn summarize_family_execution_truth(
+    lane_summaries: &[LaneExecutionTruthSummary],
+) -> Vec<FamilyExecutionTruthSummary> {
+    use std::collections::HashMap;
+
+    #[derive(Default)]
+    struct Aggregate {
+        lane_count: i64,
+        terminal_count: i64,
+        predicted_count: i64,
+        predicted_fill_probability_sum: f64,
+        filled_quantity_ratio_weighted_sum: f64,
+        filled_quantity_ratio_weight: i64,
+        actual_fill_hit_rate_weighted_sum: f64,
+        actual_fill_hit_rate_weight: i64,
+        replay_edge_weighted_sum: f64,
+        replay_edge_weight: i64,
+        live_vs_replay_fill_gap_weighted_sum: f64,
+        live_vs_replay_fill_gap_weight: i64,
+        degraded_lane_count: i64,
+        quarantine_candidate_count: i64,
+        live_sample_sufficient_count: i64,
+    }
+
+    let mut grouped: HashMap<MarketFamily, Aggregate> = HashMap::new();
+    for lane in lane_summaries {
+        let aggregate = grouped.entry(lane.market_family).or_default();
+        aggregate.lane_count += 1;
+        aggregate.terminal_count += lane.recent_live_terminal_intent_count;
+        aggregate.predicted_count += lane.recent_live_predicted_fill_sample_count;
+        if let Some(predicted_mean) = lane.recent_live_predicted_fill_probability_mean {
+            aggregate.predicted_fill_probability_sum +=
+                predicted_mean * lane.recent_live_predicted_fill_sample_count as f64;
+        }
+        if let Some(filled_ratio) = lane.recent_live_filled_quantity_ratio {
+            aggregate.filled_quantity_ratio_weighted_sum +=
+                filled_ratio * lane.recent_live_terminal_intent_count as f64;
+            aggregate.filled_quantity_ratio_weight += lane.recent_live_terminal_intent_count;
+        }
+        if let Some(actual_hit_rate) = lane.recent_live_actual_fill_hit_rate {
+            aggregate.actual_fill_hit_rate_weighted_sum +=
+                actual_hit_rate * lane.recent_live_predicted_fill_sample_count as f64;
+            aggregate.actual_fill_hit_rate_weight += lane.recent_live_predicted_fill_sample_count;
+        }
+        if let Some(replay_edge) = lane.replay_trade_weighted_edge_realization_ratio_diag {
+            let weight = lane.recent_live_terminal_intent_count.max(1);
+            aggregate.replay_edge_weighted_sum += replay_edge * weight as f64;
+            aggregate.replay_edge_weight += weight;
+        }
+        if let Some(gap) = lane.live_vs_replay_fill_gap {
+            let weight = lane.recent_live_predicted_fill_sample_count.max(1);
+            aggregate.live_vs_replay_fill_gap_weighted_sum += gap * weight as f64;
+            aggregate.live_vs_replay_fill_gap_weight += weight;
+        }
+        if lane.degrade_live_recommended {
+            aggregate.degraded_lane_count += 1;
+        }
+        if lane.status == "quarantine_candidate" {
+            aggregate.quarantine_candidate_count += 1;
+        }
+        if lane.live_sample_sufficient {
+            aggregate.live_sample_sufficient_count += 1;
+        }
+    }
+
+    let mut summaries = grouped
+        .into_iter()
+        .map(|(market_family, aggregate)| {
+            let predicted_mean = if aggregate.predicted_count > 0 {
+                Some(aggregate.predicted_fill_probability_sum / aggregate.predicted_count as f64)
+            } else {
+                None
+            };
+            let filled_ratio = if aggregate.filled_quantity_ratio_weight > 0 {
+                Some(
+                    aggregate.filled_quantity_ratio_weighted_sum
+                        / aggregate.filled_quantity_ratio_weight as f64,
+                )
+            } else {
+                None
+            };
+            let actual_hit_rate = if aggregate.actual_fill_hit_rate_weight > 0 {
+                Some(
+                    aggregate.actual_fill_hit_rate_weighted_sum
+                        / aggregate.actual_fill_hit_rate_weight as f64,
+                )
+            } else {
+                None
+            };
+            let replay_edge = if aggregate.replay_edge_weight > 0 {
+                Some(aggregate.replay_edge_weighted_sum / aggregate.replay_edge_weight as f64)
+            } else {
+                None
+            };
+            let live_vs_replay_fill_gap = if aggregate.live_vs_replay_fill_gap_weight > 0 {
+                Some(
+                    aggregate.live_vs_replay_fill_gap_weighted_sum
+                        / aggregate.live_vs_replay_fill_gap_weight as f64,
+                )
+            } else {
+                None
+            };
+            let status = if aggregate.quarantine_candidate_count > 0 {
+                "quarantine_candidate"
+            } else if aggregate.degraded_lane_count > 0 {
+                "watch"
+            } else if aggregate.live_sample_sufficient_count == 0 {
+                "insufficient_sample"
+            } else {
+                "good"
+            };
+            FamilyExecutionTruthSummary {
+                market_family,
+                mode: TradeMode::Live,
+                lane_count: aggregate.lane_count,
+                recent_live_terminal_intent_count: aggregate.terminal_count,
+                recent_live_predicted_fill_sample_count: aggregate.predicted_count,
+                recent_live_predicted_fill_probability_mean: predicted_mean,
+                recent_live_filled_quantity_ratio: filled_ratio,
+                recent_live_actual_fill_hit_rate: actual_hit_rate,
+                replay_trade_weighted_edge_realization_ratio_diag: replay_edge,
+                live_vs_replay_fill_gap,
+                status: status.to_string(),
+                degraded_lane_count: aggregate.degraded_lane_count,
+                quarantine_candidate_count: aggregate.quarantine_candidate_count,
+                live_sample_sufficient: aggregate.live_sample_sufficient_count > 0,
+            }
+        })
+        .collect::<Vec<_>>();
+    summaries.sort_by(|left, right| {
+        execution_truth_status_rank(&left.status)
+            .cmp(&execution_truth_status_rank(&right.status))
+            .then_with(|| {
+                market_family_sort_key(left.market_family)
+                    .cmp(market_family_sort_key(right.market_family))
+            })
+    });
+    summaries
+}
+
+struct LaneExecutionTruthRecommendation {
+    status: String,
+    degrade_live_recommended: bool,
+    block_promotion_recommended: bool,
+    manual_reenable_required: bool,
+    recommended_size_multiplier: Option<f64>,
+    recommendation_reason: Option<String>,
+}
+
+fn lane_execution_truth_recommendation(
+    live_sample_sufficient: bool,
+    promotion_state: Option<PromotionState>,
+    filled_quantity_ratio: Option<f64>,
+    actual_fill_hit_rate: Option<f64>,
+    replay_edge: Option<f64>,
+    predicted_vs_realized_fill_gap: Option<f64>,
+    live_vs_replay_fill_gap: Option<f64>,
+) -> LaneExecutionTruthRecommendation {
+    if !live_sample_sufficient {
+        return LaneExecutionTruthRecommendation {
+            status: "insufficient_sample".to_string(),
+            degrade_live_recommended: false,
+            block_promotion_recommended: false,
+            manual_reenable_required: false,
+            recommended_size_multiplier: None,
+            recommendation_reason: Some("need_more_live_sample".to_string()),
+        };
+    }
+
+    let actual_fill_hit_rate = actual_fill_hit_rate.unwrap_or_default();
+    let filled_quantity_ratio = filled_quantity_ratio.unwrap_or_default();
+    let predicted_gap = predicted_vs_realized_fill_gap.unwrap_or_default();
+    let replay_gap = live_vs_replay_fill_gap.unwrap_or_default();
+    let replay_edge = replay_edge.unwrap_or(0.0);
+
+    if actual_fill_hit_rate < 0.25
+        || filled_quantity_ratio < 0.35
+        || predicted_gap < -0.30
+        || replay_gap < -0.25
+        || replay_edge < 0.0
+    {
+        let is_live_lane = matches!(
+            promotion_state,
+            Some(PromotionState::LiveMicro | PromotionState::LiveScaled)
+        );
+        return LaneExecutionTruthRecommendation {
+            status: "quarantine_candidate".to_string(),
+            degrade_live_recommended: true,
+            block_promotion_recommended: true,
+            manual_reenable_required: is_live_lane,
+            recommended_size_multiplier: Some(0.25),
+            recommendation_reason: Some(if replay_edge < 0.0 {
+                "live_truth_invalidates_replay".to_string()
+            } else if predicted_gap < -0.30 {
+                "predicted_fills_overstated".to_string()
+            } else if actual_fill_hit_rate < 0.25 {
+                "live_fill_hit_rate_too_low".to_string()
+            } else if filled_quantity_ratio < 0.35 {
+                "filled_quantity_ratio_too_low".to_string()
+            } else {
+                "live_fill_vs_replay_gap_too_negative".to_string()
+            }),
+        };
+    }
+
+    if actual_fill_hit_rate < 0.50
+        || filled_quantity_ratio < 0.55
+        || predicted_gap < -0.15
+        || replay_gap < -0.10
+        || replay_edge < 0.5
+    {
+        return LaneExecutionTruthRecommendation {
+            status: "watch".to_string(),
+            degrade_live_recommended: true,
+            block_promotion_recommended: true,
+            manual_reenable_required: false,
+            recommended_size_multiplier: Some(0.5),
+            recommendation_reason: Some(if replay_edge < 0.5 {
+                "replay_edge_diag_soft".to_string()
+            } else if predicted_gap < -0.15 {
+                "predicted_fill_gap_widening".to_string()
+            } else if actual_fill_hit_rate < 0.50 {
+                "live_fill_hit_rate_soft".to_string()
+            } else if filled_quantity_ratio < 0.55 {
+                "filled_quantity_ratio_soft".to_string()
+            } else {
+                "live_fill_vs_replay_gap_soft".to_string()
+            }),
+        };
+    }
+
+    LaneExecutionTruthRecommendation {
+        status: "good".to_string(),
+        degrade_live_recommended: false,
+        block_promotion_recommended: false,
+        manual_reenable_required: false,
+        recommended_size_multiplier: Some(1.0),
+        recommendation_reason: Some("live_truth_supports_lane".to_string()),
+    }
+}
+
+fn execution_truth_status_rank(status: &str) -> i32 {
+    match status {
+        "quarantine_candidate" => 0,
+        "watch" => 1,
+        "good" => 2,
+        _ => 3,
+    }
+}
+
+fn market_family_sort_key(value: MarketFamily) -> &'static str {
+    match value {
+        MarketFamily::Crypto => "crypto",
+        MarketFamily::Weather => "weather",
+        MarketFamily::All => "all",
+    }
+}
+
 fn weighted_average_by_trade_count<I>(items: I) -> Option<f64>
 where
     I: Iterator<Item = (f64, i32)>,
@@ -5388,11 +5956,58 @@ fn proportional_entry_fee(total_entry_fee: f64, exit_quantity: f64, total_quanti
 #[cfg(test)]
 mod tests {
     use super::{
-        LiveExecutionQualityRow, ReplayExecutionQualityRow, opportunity_card_freshness_window,
+        LiveExecutionQualityRow, LiveLaneExecutionTruthRow, ReplayExecutionQualityRow,
+        ReplayLaneExecutionTruthRow, SqlMarketFamily, build_lane_execution_truth_summaries,
+        opportunity_card_freshness_window, summarize_family_execution_truth,
         summarize_live_execution_quality, summarize_replay_execution_quality,
     };
     use chrono::Utc;
-    use common::MarketFamily;
+    use common::{LaneState, MarketFamily, PromotionState};
+
+    fn lane_state(lane_key: &str, promotion_state: PromotionState) -> LaneState {
+        LaneState {
+            lane_key: lane_key.to_string(),
+            market_family: MarketFamily::Crypto,
+            promotion_state,
+            promotion_reason: Some("paper_ready".to_string()),
+            recent_pnl: 0.0,
+            recent_brier: 0.2,
+            recent_execution_quality: 0.8,
+            recent_replay_expectancy: 1.0,
+            quarantine_reason: None,
+            current_champion_model: Some("trained_linear_v1".to_string()),
+        }
+    }
+
+    fn live_lane_row(
+        lane_key: &str,
+        predicted_fill_probability: Option<f64>,
+        submitted_quantity: f64,
+        filled_quantity: f64,
+    ) -> LiveLaneExecutionTruthRow {
+        LiveLaneExecutionTruthRow {
+            market_family: SqlMarketFamily::Crypto,
+            lane_key: lane_key.to_string(),
+            predicted_fill_probability,
+            submitted_quantity,
+            filled_quantity,
+        }
+    }
+
+    fn replay_lane_row(
+        lane_key: &str,
+        trade_count: i32,
+        fill_rate: f64,
+        edge_realization_ratio: f64,
+    ) -> ReplayLaneExecutionTruthRow {
+        ReplayLaneExecutionTruthRow {
+            market_family: SqlMarketFamily::Crypto,
+            lane_key: lane_key.to_string(),
+            trade_count,
+            fill_rate,
+            edge_realization_ratio,
+        }
+    }
 
     #[test]
     fn opportunity_card_freshness_is_family_aware() {
@@ -5518,5 +6133,75 @@ mod tests {
         assert_eq!(summary.recent_live_predicted_fill_probability_mean, None);
         assert_eq!(summary.recent_live_filled_quantity_ratio, None);
         assert!(!summary.live_sample_sufficient);
+    }
+
+    #[test]
+    fn lane_execution_truth_marks_bad_live_lane_for_quarantine_candidate() {
+        let lane = "kalshi:xrp:15:buy_no:directional_settlement:trained_linear_v1";
+        let live_rows = (0..6)
+            .map(|_| live_lane_row(lane, Some(0.8), 1.0, 0.0))
+            .collect::<Vec<_>>();
+        let replay_rows = vec![replay_lane_row(lane, 40, 0.7, 0.8)];
+        let lane_states = vec![lane_state(lane, PromotionState::LiveMicro)];
+
+        let summaries =
+            build_lane_execution_truth_summaries(&live_rows, &replay_rows, &lane_states);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].status, "quarantine_candidate");
+        assert!(summaries[0].degrade_live_recommended);
+        assert!(summaries[0].block_promotion_recommended);
+        assert!(summaries[0].manual_reenable_required);
+        assert_eq!(summaries[0].recommended_size_multiplier, Some(0.25));
+    }
+
+    #[test]
+    fn lane_execution_truth_ignores_replay_only_rows_without_tracking_scope() {
+        let lane = "kalshi:btc:15:buy_yes:directional_settlement:trained_linear_v1";
+        let replay_rows = vec![replay_lane_row(lane, 100, 0.6, 0.9)];
+        let summaries = build_lane_execution_truth_summaries(&[], &replay_rows, &[]);
+        assert!(summaries.is_empty());
+    }
+
+    #[test]
+    fn family_execution_truth_counts_degraded_lanes() {
+        let bad_lane = "kalshi:sol:15:buy_no:directional_settlement:trained_linear_v1";
+        let good_lane = "kalshi:xrp:15:buy_yes:directional_settlement:trained_linear_v1";
+        let mut live_rows = (0..6)
+            .map(|_| live_lane_row(bad_lane, Some(0.75), 1.0, 0.0))
+            .collect::<Vec<_>>();
+        live_rows.extend((0..6).map(|_| live_lane_row(good_lane, Some(0.65), 1.0, 1.0)));
+        let replay_rows = vec![
+            replay_lane_row(bad_lane, 40, 0.7, 0.4),
+            replay_lane_row(good_lane, 50, 0.6, 0.9),
+        ];
+        let lane_states = vec![
+            lane_state(bad_lane, PromotionState::PaperActive),
+            lane_state(good_lane, PromotionState::PaperActive),
+        ];
+
+        let lane_summaries =
+            build_lane_execution_truth_summaries(&live_rows, &replay_rows, &lane_states);
+        let family_summaries = summarize_family_execution_truth(&lane_summaries);
+        assert_eq!(family_summaries.len(), 1);
+        assert_eq!(family_summaries[0].market_family, MarketFamily::Crypto);
+        assert_eq!(family_summaries[0].degraded_lane_count, 1);
+        assert_eq!(family_summaries[0].quarantine_candidate_count, 1);
+        assert_eq!(family_summaries[0].status, "quarantine_candidate");
+    }
+
+    #[test]
+    fn lane_execution_truth_hides_untracked_replay_only_challengers() {
+        let active_lane = "kalshi:btc:15:buy_yes:directional_settlement:trained_linear_v1";
+        let challenger_lane =
+            "kalshi:btc:15:buy_yes:directional_settlement:trained_linear_contrarian_v1";
+        let lane_states = vec![lane_state(active_lane, PromotionState::PaperActive)];
+        let replay_rows = vec![
+            replay_lane_row(active_lane, 100, 0.6, 0.8),
+            replay_lane_row(challenger_lane, 100, 0.7, 1.1),
+        ];
+
+        let summaries = build_lane_execution_truth_summaries(&[], &replay_rows, &lane_states);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].lane_key, active_lane);
     }
 }

@@ -493,6 +493,181 @@ function renderExecutionQuality(summary) {
   `;
 }
 
+function executionTruthStatusTone(status) {
+  switch (status) {
+    case "good":
+      return "good";
+    case "watch":
+      return "warn";
+    case "quarantine_candidate":
+      return "bad";
+    default:
+      return "warn";
+  }
+}
+
+function formatLaneTruthLabel(laneKey) {
+  const parsed = parseLaneKey(laneKey);
+  const pieces = [];
+  if (parsed.symbol) pieces.push(String(parsed.symbol).toUpperCase());
+  if (parsed.side) pieces.push(titleCase(parsed.side));
+  if (parsed.windowMinutes) pieces.push(`${parsed.windowMinutes}m`);
+  return pieces.join(" · ") || laneKey;
+}
+
+function familyLabel(value) {
+  return titleCase(value || "unknown");
+}
+
+function renderMoneyView(payload) {
+  const badge = document.getElementById("money-view-badge");
+  const root = document.getElementById("money-view-list");
+  const laneRows = payload?.lane_execution_truth || [];
+  const familyRows = payload?.family_execution_truth || [];
+  if (!laneRows.length && !familyRows.length) {
+    badge.textContent = "Unavailable";
+    badge.className = "readiness-badge warn";
+    root.innerHTML = `<div class="empty">Lane-level live execution truth is not available yet.</div>`;
+    return;
+  }
+
+  const worstLane = laneRows[0];
+  const worstTone = executionTruthStatusTone(worstLane?.status || familyRows[0]?.status || "insufficient_sample");
+  badge.textContent = titleCase(worstLane?.status || familyRows[0]?.status || "insufficient_sample");
+  badge.className = `readiness-badge ${worstTone}`;
+
+  const renderStatus = (row) =>
+    `<span class="truth-status ${executionTruthStatusTone(row.status)}">${titleCase(row.status)}</span>`;
+
+  const familyTable = familyRows.length
+    ? `
+      <section class="lane-card">
+        <header>
+          <div>
+            <p class="eyebrow">Family truth</p>
+            <strong>Capital protection by family</strong>
+          </div>
+        </header>
+        <div class="truth-table-wrap">
+          <table class="truth-table">
+            <thead>
+              <tr>
+                <th>Family</th>
+                <th>Mode</th>
+                <th>Terminal intents</th>
+                <th>Predicted sample</th>
+                <th>Predicted fill</th>
+                <th>Filled qty ratio</th>
+                <th>Actual fill hit</th>
+                <th>Replay edge diag</th>
+                <th>Live vs replay gap</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${familyRows
+                .map(
+                  (row) => `
+                    <tr>
+                      <td class="truth-family">
+                        <strong>${familyLabel(row.market_family)}</strong>
+                        <small>${row.degraded_lane_count} degraded · ${row.quarantine_candidate_count} quarantine candidate</small>
+                      </td>
+                      <td>${titleCase(row.mode)}</td>
+                      <td class="mono">${row.recent_live_terminal_intent_count}</td>
+                      <td class="mono">${row.recent_live_predicted_fill_sample_count}</td>
+                      <td class="mono">${row.recent_live_predicted_fill_probability_mean == null ? "Diagnostic Only" : pct(row.recent_live_predicted_fill_probability_mean)}</td>
+                      <td class="mono">${row.recent_live_filled_quantity_ratio == null ? "Diagnostic Only" : pct(row.recent_live_filled_quantity_ratio)}</td>
+                      <td class="mono">${row.recent_live_actual_fill_hit_rate == null ? "Diagnostic Only" : pct(row.recent_live_actual_fill_hit_rate)}</td>
+                      <td class="mono">${row.replay_trade_weighted_edge_realization_ratio_diag == null ? "Diagnostic Only" : ratio(row.replay_trade_weighted_edge_realization_ratio_diag)}</td>
+                      <td class="mono">${row.live_vs_replay_fill_gap == null ? "Diagnostic Only" : `${row.live_vs_replay_fill_gap >= 0 ? "+" : ""}${pct(row.live_vs_replay_fill_gap)}`}</td>
+                      <td>${renderStatus(row)}${!row.live_sample_sufficient ? `<span class="truth-note">Diagnostic Only</span>` : ""}</td>
+                    </tr>
+                  `,
+                )
+                .join("")}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    `
+    : "";
+
+  const laneTable = laneRows.length
+    ? `
+      <section class="lane-card">
+        <header>
+          <div>
+            <p class="eyebrow">Lane truth</p>
+            <strong>Exact lanes that deserve money</strong>
+          </div>
+        </header>
+        <div class="truth-table-wrap">
+          <table class="truth-table">
+            <thead>
+              <tr>
+                <th>Lane</th>
+                <th>Mode</th>
+                <th>Terminal intents</th>
+                <th>Predicted sample</th>
+                <th>Predicted fill</th>
+                <th>Filled qty ratio</th>
+                <th>Actual fill hit</th>
+                <th>Replay edge diag</th>
+                <th>Predicted vs real</th>
+                <th>Live vs replay</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${laneRows
+                .map(
+                  (row) => `
+                    <tr>
+                      <td class="truth-lane">
+                        <strong>${formatLaneTruthLabel(row.lane_key)}</strong>
+                        <small>${row.lane_key}</small>
+                        ${
+                          row.recommendation_reason
+                            ? `<span class="truth-note">${titleCase(row.recommendation_reason)}${row.recommended_size_multiplier != null && row.recommended_size_multiplier < 1 ? ` · size cap ${pct(row.recommended_size_multiplier)}` : ""}</span>`
+                            : ""
+                        }
+                      </td>
+                      <td>${titleCase(row.mode)}${row.promotion_state ? `<span class="truth-note">${titleCase(row.promotion_state)}</span>` : ""}</td>
+                      <td class="mono">${row.recent_live_terminal_intent_count}</td>
+                      <td class="mono">${row.recent_live_predicted_fill_sample_count}</td>
+                      <td class="mono">${row.recent_live_predicted_fill_probability_mean == null ? "Diagnostic Only" : pct(row.recent_live_predicted_fill_probability_mean)}</td>
+                      <td class="mono">${row.recent_live_filled_quantity_ratio == null ? "Diagnostic Only" : pct(row.recent_live_filled_quantity_ratio)}</td>
+                      <td class="mono">${row.recent_live_actual_fill_hit_rate == null ? "Diagnostic Only" : pct(row.recent_live_actual_fill_hit_rate)}</td>
+                      <td class="mono">${row.replay_trade_weighted_edge_realization_ratio_diag == null ? "Diagnostic Only" : ratio(row.replay_trade_weighted_edge_realization_ratio_diag)}</td>
+                      <td class="mono">${row.predicted_vs_realized_fill_gap == null ? "Diagnostic Only" : `${row.predicted_vs_realized_fill_gap >= 0 ? "+" : ""}${pct(row.predicted_vs_realized_fill_gap)}`}</td>
+                      <td class="mono">${row.live_vs_replay_fill_gap == null ? "Diagnostic Only" : `${row.live_vs_replay_fill_gap >= 0 ? "+" : ""}${pct(row.live_vs_replay_fill_gap)}`}</td>
+                      <td>
+                        ${renderStatus(row)}
+                        ${
+                          row.manual_reenable_required
+                            ? `<span class="truth-note">Manual re-enable recommended</span>`
+                            : row.block_promotion_recommended
+                              ? `<span class="truth-note">Block promotion recommended</span>`
+                              : !row.live_sample_sufficient
+                                ? `<span class="truth-note">Insufficient Sample</span>`
+                                : ""
+                        }
+                      </td>
+                    </tr>
+                  `,
+                )
+                .join("")}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    `
+    : "";
+
+  root.innerHTML = `${familyTable}${laneTable}`;
+}
+
 function freshnessLabel(seconds, staleAfter) {
   if (seconds == null) return { label: "Unknown", tone: "warn" };
   if (seconds > staleAfter) return { label: `Stale ${seconds}s`, tone: "bad" };
@@ -952,6 +1127,7 @@ async function refreshScreen() {
     renderLiveSync(payload.live_sync || null);
     renderOperatorState(runtime, readiness);
     renderExecutionQuality(payload.execution_quality || runtime?.execution_quality || null);
+    renderMoneyView(payload);
     renderLiveExceptions(payload);
     renderTrades(payload.open_trades || []);
     renderOpportunities(payload.opportunities || []);
