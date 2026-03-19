@@ -1,5 +1,8 @@
 use chrono::{DateTime, Utc};
-use market_models::{FeatureVector, TrainedLinearWeights, run_model_with_weights};
+use market_models::{
+    FeatureVector, TRAINED_LINEAR_CONTRARIAN_V1, TRAINED_LINEAR_V1, TrainedLinearWeights,
+    run_model_with_weights,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,6 +73,7 @@ pub fn benchmark_model_set(
     examples: &[ReplayExample],
     policy: ReplayPolicy,
     trained_weights: Option<&TrainedLinearWeights>,
+    trained_policy: Option<ReplayPolicy>,
 ) -> Option<BenchmarkLeaderboard> {
     if examples.is_empty() || model_names.is_empty() {
         return None;
@@ -77,44 +81,17 @@ pub fn benchmark_model_set(
 
     let mut results = Vec::with_capacity(model_names.len());
     for model_name in model_names {
-        let mut brier = 0.0;
-        let mut execution_pnl = 0.0;
-        let mut trade_count = 0usize;
-        let mut winning_trades = 0usize;
-        for example in examples {
-            let output = run_model_with_weights(model_name, &example.features, trained_weights);
-            brier += (output.probability_yes - example.target_yes_probability).powi(2);
-            let trade_result = execution_delta(
-                output.probability_yes,
-                output.confidence,
-                example.market_prob,
-                example.target_yes_probability,
-                example.features.venue_quality_score,
-                example.features.seconds_to_expiry_scaled,
-                policy,
-            );
-            execution_pnl += trade_result;
-            if trade_result.abs() > f64::EPSILON {
-                trade_count += 1;
-                if trade_result > 0.0 {
-                    winning_trades += 1;
-                }
-            }
+        let effective_policy =
+            if *model_name == TRAINED_LINEAR_V1 || *model_name == TRAINED_LINEAR_CONTRARIAN_V1 {
+            trained_policy.unwrap_or(policy)
+        } else {
+            policy
+        };
+        if let Some(result) =
+            benchmark_single_model(lane_key, model_name, examples, effective_policy, trained_weights)
+        {
+            results.push(result);
         }
-        let sample_count = examples.len();
-        results.push(ModelBenchmark {
-            lane_key: lane_key.to_string(),
-            model_name: (*model_name).to_string(),
-            brier: brier / sample_count as f64,
-            execution_pnl,
-            sample_count,
-            trade_count,
-            win_rate: if trade_count > 0 {
-                winning_trades as f64 / trade_count as f64
-            } else {
-                0.0
-            },
-        });
     }
 
     results.sort_by(|left, right| {
@@ -129,6 +106,57 @@ pub fn benchmark_model_set(
     Some(BenchmarkLeaderboard {
         lane_key: lane_key.to_string(),
         results,
+    })
+}
+
+pub fn benchmark_single_model(
+    lane_key: &str,
+    model_name: &str,
+    examples: &[ReplayExample],
+    policy: ReplayPolicy,
+    trained_weights: Option<&TrainedLinearWeights>,
+) -> Option<ModelBenchmark> {
+    if examples.is_empty() {
+        return None;
+    }
+
+    let mut brier = 0.0;
+    let mut execution_pnl = 0.0;
+    let mut trade_count = 0usize;
+    let mut winning_trades = 0usize;
+    for example in examples {
+        let output = run_model_with_weights(model_name, &example.features, trained_weights);
+        brier += (output.probability_yes - example.target_yes_probability).powi(2);
+        let trade_result = execution_delta(
+            output.probability_yes,
+            output.confidence,
+            example.market_prob,
+            example.target_yes_probability,
+            example.features.venue_quality_score,
+            example.features.seconds_to_expiry_scaled,
+            policy,
+        );
+        execution_pnl += trade_result;
+        if trade_result.abs() > f64::EPSILON {
+            trade_count += 1;
+            if trade_result > 0.0 {
+                winning_trades += 1;
+            }
+        }
+    }
+    let sample_count = examples.len();
+    Some(ModelBenchmark {
+        lane_key: lane_key.to_string(),
+        model_name: model_name.to_string(),
+        brier: brier / sample_count as f64,
+        execution_pnl,
+        sample_count,
+        trade_count,
+        win_rate: if trade_count > 0 {
+            winning_trades as f64 / trade_count as f64
+        } else {
+            0.0
+        },
     })
 }
 
@@ -202,6 +230,7 @@ mod tests {
                 &[weak],
                 ReplayPolicy::directional_default(),
                 None,
+                None,
             )
             .expect("leaderboard");
         assert_eq!(board.results[0].trade_count, 0);
@@ -219,6 +248,7 @@ mod tests {
                 &[strong],
                 ReplayPolicy::directional_default(),
                 None,
+                None,
             )
             .expect("leaderboard");
         assert_eq!(board.results[0].trade_count, 1);
@@ -235,6 +265,7 @@ mod tests {
             &[market_models::BASELINE_LOGIT_V1],
             &[late],
             ReplayPolicy::directional_default(),
+            None,
             None,
         )
         .expect("leaderboard");

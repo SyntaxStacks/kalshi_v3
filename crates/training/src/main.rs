@@ -1,8 +1,13 @@
 use anyhow::Result;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use common::{AppConfig, LaneState, PromotionState, StrategyFamily, lane_key};
-use market_models::{BASELINE_LOGIT_V1, FeatureVector, TRAINED_LINEAR_V1, TrainedLinearWeights, supported_models};
-use replay::{BenchmarkLeaderboard, ReplayExample, ReplayPolicy, benchmark_model_set};
+use market_models::{
+    BASELINE_LOGIT_V1, FeatureVector, TRAINED_LINEAR_CONTRARIAN_V1, TRAINED_LINEAR_V1,
+    TrainedLinearWeights, supported_models,
+};
+use replay::{
+    BenchmarkLeaderboard, ReplayExample, ReplayPolicy, benchmark_model_set, benchmark_single_model,
+};
 use rusqlite::Connection;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -148,7 +153,16 @@ async fn training_pass(config: &AppConfig, storage: &storage::Storage) -> Result
             continue;
         }
 
+        let lane = lane_key(
+            "kalshi",
+            &symbol,
+            15,
+            "buy_yes",
+            StrategyFamily::DirectionalSettlement,
+            BASELINE_LOGIT_V1,
+        );
         let trained_weights = train_symbol_linear_weights(&examples);
+        let trained_policy = optimize_trained_policy(&lane, &examples, &trained_weights);
         storage
             .upsert_trained_model_artifact(
                 TRAINED_LINEAR_V1,
@@ -160,25 +174,23 @@ async fn training_pass(config: &AppConfig, storage: &storage::Storage) -> Result
                 &json!({
                     "symbol": symbol,
                     "training_examples": examples.len(),
-                    "policy": "resolved_history_preferred"
+                    "policy": {
+                        "min_edge": trained_policy.min_edge,
+                        "min_confidence": trained_policy.min_confidence,
+                        "min_venue_quality": trained_policy.min_venue_quality,
+                        "min_seconds_to_expiry_scaled": trained_policy.min_seconds_to_expiry_scaled,
+                        "execution_cost": trained_policy.execution_cost
+                    }
                 }),
             )
             .await?;
-
-        let lane = lane_key(
-            "kalshi",
-            &symbol,
-            15,
-            "buy_yes",
-            StrategyFamily::DirectionalSettlement,
-            BASELINE_LOGIT_V1,
-        );
         let Some(leaderboard) = benchmark_model_set(
             &lane,
             supported_models(),
             &examples,
             ReplayPolicy::directional_default(),
             Some(&trained_weights),
+            Some(trained_policy),
         ) else {
             continue;
         };
@@ -209,6 +221,9 @@ async fn training_pass(config: &AppConfig, storage: &storage::Storage) -> Result
         )
         .await?;
         let paper_metrics = storage
+            .recent_trade_metrics_for_lane(&champion_lane, common::TradeMode::Paper, 20)
+            .await?;
+        let symbol_paper_metrics = storage
             .recent_trade_metrics_for_symbol(
                 &symbol,
                 StrategyFamily::DirectionalSettlement,
@@ -217,12 +232,7 @@ async fn training_pass(config: &AppConfig, storage: &storage::Storage) -> Result
             )
             .await?;
         let live_metrics = storage
-            .recent_trade_metrics_for_symbol(
-                &symbol,
-                StrategyFamily::DirectionalSettlement,
-                common::TradeMode::Live,
-                10,
-            )
+            .recent_trade_metrics_for_lane(&champion_lane, common::TradeMode::Live, 10)
             .await?;
         persist_calibration(
             storage,
@@ -230,6 +240,11 @@ async fn training_pass(config: &AppConfig, storage: &storage::Storage) -> Result
             StrategyFamily::DirectionalSettlement,
             &champion.model_name,
             &examples,
+            if uses_trained_linear_weights(&champion.model_name) {
+                Some(&trained_weights)
+            } else {
+                None
+            },
         )
         .await?;
         let promotion_state = classify_promotion_state(
@@ -239,6 +254,8 @@ async fn training_pass(config: &AppConfig, storage: &storage::Storage) -> Result
             avg_execution_quality,
             paper_metrics.trade_count,
             paper_metrics.realized_pnl,
+            symbol_paper_metrics.trade_count,
+            symbol_paper_metrics.realized_pnl,
             live_metrics.trade_count,
             live_metrics.realized_pnl,
         );
@@ -253,6 +270,8 @@ async fn training_pass(config: &AppConfig, storage: &storage::Storage) -> Result
                     champion.execution_pnl,
                     paper_metrics.trade_count,
                     paper_metrics.realized_pnl,
+                    symbol_paper_metrics.trade_count,
+                    symbol_paper_metrics.realized_pnl,
                     live_metrics.trade_count,
                     live_metrics.realized_pnl,
                 )),
@@ -326,10 +345,12 @@ async fn persist_calibration(
     strategy_family: StrategyFamily,
     model_name: &str,
     examples: &[ReplayExample],
+    trained_weights: Option<&TrainedLinearWeights>,
 ) -> Result<()> {
     let mut grouped: BTreeMap<String, (f64, i32)> = BTreeMap::new();
     for example in examples {
-        let output = market_models::run_model(model_name, &example.features);
+        let output =
+            market_models::run_model_with_weights(model_name, &example.features, trained_weights);
         let error = example.target_yes_probability - output.probability_yes;
         let entry = grouped
             .entry(example.time_to_expiry_bucket.clone())
@@ -421,6 +442,104 @@ fn train_symbol_linear_weights(examples: &[ReplayExample]) -> TrainedLinearWeigh
     }
 
     weights
+}
+
+fn optimize_trained_policy(
+    lane_key: &str,
+    examples: &[ReplayExample],
+    trained_weights: &TrainedLinearWeights,
+) -> ReplayPolicy {
+    let default_policy = ReplayPolicy::directional_default();
+    let min_edges = [0.04, 0.08, 0.12, 0.16, 0.20];
+    let min_confidences = [0.50, 0.66, 0.80, 0.92];
+    let min_qualities = [0.20, 0.40, 0.60];
+    let min_seconds_to_expiry = [120.0 / 900.0, 270.0 / 900.0, 450.0 / 900.0];
+    let mut best_policy = default_policy;
+    let mut best_score = f64::NEG_INFINITY;
+    let mut best_trade_count = usize::MAX;
+    let mut best_brier = f64::INFINITY;
+
+    for min_edge in min_edges {
+        for min_confidence in min_confidences {
+            for min_venue_quality in min_qualities {
+                for min_seconds_to_expiry_scaled in min_seconds_to_expiry {
+                    let policy = ReplayPolicy {
+                        min_edge,
+                        min_confidence,
+                        min_venue_quality,
+                        min_seconds_to_expiry_scaled,
+                        execution_cost: default_policy.execution_cost,
+                    };
+                let Some(result) = benchmark_single_model(
+                    lane_key,
+                    TRAINED_LINEAR_V1,
+                    examples,
+                    policy,
+                    Some(trained_weights),
+                ) else {
+                    continue;
+                    };
+                    let replay_score = if result.execution_pnl >= 0.0 {
+                        result.execution_pnl - (result.trade_count as f64 * 0.0015)
+                    } else {
+                        (result.execution_pnl * 4.0) - (result.trade_count as f64 * 0.01)
+                    };
+                    let better = replay_score > best_score
+                        || ((replay_score - best_score).abs() < f64::EPSILON
+                            && result.execution_pnl > 0.0
+                            && result.trade_count < best_trade_count)
+                        || ((replay_score - best_score).abs() < f64::EPSILON
+                            && result.trade_count == best_trade_count
+                            && result.brier < best_brier);
+                    if better {
+                        best_policy = policy;
+                        best_score = replay_score;
+                        best_trade_count = result.trade_count;
+                        best_brier = result.brier;
+                    }
+                }
+            }
+        }
+    }
+
+    let abstain_policy = ReplayPolicy {
+        min_edge: 0.35,
+        min_confidence: 0.97,
+        min_venue_quality: 0.95,
+        min_seconds_to_expiry_scaled: 0.80,
+        execution_cost: default_policy.execution_cost,
+    };
+    if let Some(result) = benchmark_single_model(
+        lane_key,
+        TRAINED_LINEAR_V1,
+        examples,
+        abstain_policy,
+        Some(trained_weights),
+    ) {
+        let replay_score = if result.execution_pnl >= 0.0 {
+            result.execution_pnl - (result.trade_count as f64 * 0.0015)
+        } else {
+            (result.execution_pnl * 4.0) - (result.trade_count as f64 * 0.01)
+        };
+        let better = replay_score > best_score
+            || ((replay_score - best_score).abs() < f64::EPSILON
+                && result.trade_count < best_trade_count)
+            || ((replay_score - best_score).abs() < f64::EPSILON
+                && result.trade_count == best_trade_count
+                && result.brier < best_brier);
+        if better {
+            best_policy = abstain_policy;
+        }
+    }
+
+    best_policy
+}
+
+fn uses_trained_linear_weights(model_name: &str) -> bool {
+    matches!(
+        model_name,
+        TRAINED_LINEAR_V1 | TRAINED_LINEAR_CONTRARIAN_V1
+    )
 }
 
 fn linear_score(weights: &TrainedLinearWeights, features: &FeatureVector) -> f64 {
@@ -643,6 +762,8 @@ fn classify_promotion_state(
     execution_quality: f64,
     paper_trade_count: i64,
     paper_realized_pnl: f64,
+    symbol_paper_trade_count: i64,
+    symbol_paper_realized_pnl: f64,
     live_trade_count: i64,
     live_realized_pnl: f64,
 ) -> PromotionState {
@@ -661,8 +782,7 @@ fn classify_promotion_state(
         return PromotionState::PaperActive;
     }
 
-    if config.live_trading_enabled
-        && replay_is_usable
+    if replay_is_usable
         && live_behavior_is_ok
         && live_trade_count >= i64::from(config.live_scaled_min_examples)
         && live_realized_pnl >= config.live_scaled_min_pnl
@@ -671,12 +791,18 @@ fn classify_promotion_state(
         return PromotionState::LiveScaled;
     }
 
-    if config.live_trading_enabled
-        && replay_is_usable
+    let symbol_fallback_examples = i64::from((config.live_micro_min_examples / 2).max(4));
+    let symbol_fallback_pnl = (config.live_micro_min_pnl / 2.0).max(5.0);
+    let fast_ramp_symbol_ready = paper_trade_count == 0
+        && symbol_paper_trade_count >= symbol_fallback_examples
+        && symbol_paper_realized_pnl >= symbol_fallback_pnl;
+
+    if replay_is_usable
         && live_behavior_is_ok
-        && paper_trade_count >= i64::from(config.live_micro_min_examples)
-        && paper_realized_pnl >= config.live_micro_min_pnl
         && champion_brier <= config.live_micro_max_brier
+        && ((paper_trade_count >= i64::from(config.live_micro_min_examples)
+            && paper_realized_pnl >= config.live_micro_min_pnl)
+            || fast_ramp_symbol_ready)
     {
         return PromotionState::LiveMicro;
     }
@@ -714,12 +840,25 @@ fn promotion_reason(
     champion_pnl: f64,
     paper_trade_count: i64,
     paper_realized_pnl: f64,
+    symbol_paper_trade_count: i64,
+    symbol_paper_realized_pnl: f64,
     live_trade_count: i64,
     live_realized_pnl: f64,
 ) -> String {
     match promotion_state {
         PromotionState::LiveScaled => "live_micro_passed_fast_ramp".to_string(),
-        PromotionState::LiveMicro => "paper_ready_for_live_micro".to_string(),
+        PromotionState::LiveMicro => {
+            let symbol_fallback_examples = i64::from((config.live_micro_min_examples / 2).max(4));
+            let symbol_fallback_pnl = (config.live_micro_min_pnl / 2.0).max(5.0);
+            if paper_trade_count == 0
+                && symbol_paper_trade_count >= symbol_fallback_examples
+                && symbol_paper_realized_pnl >= symbol_fallback_pnl
+            {
+                "symbol_fast_ramp_ready_for_live_micro".to_string()
+            } else {
+                "paper_ready_for_live_micro".to_string()
+            }
+        }
         PromotionState::PaperActive => {
             if live_trade_count >= 1 && live_realized_pnl < 0.0 {
                 "live_demoted_to_paper_active".to_string()

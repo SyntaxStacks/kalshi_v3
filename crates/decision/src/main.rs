@@ -5,13 +5,22 @@ use common::{
     lane_key,
 };
 use market_models::{
-    BASELINE_LOGIT_V1, FeatureVector, TRAINED_LINEAR_V1, TrainedLinearWeights,
+    BASELINE_LOGIT_V1, FeatureVector, TRAINED_LINEAR_CONTRARIAN_V1, TRAINED_LINEAR_V1,
     run_model_with_weights,
 };
 use serde_json::json;
 use std::collections::HashMap;
 use std::time::Instant;
+use storage::TrainedModelArtifactCard;
 use tracing::{info, warn};
+
+#[derive(Debug, Clone, Copy)]
+struct TrainedDecisionPolicy {
+    min_edge: f64,
+    min_confidence: f64,
+    min_venue_quality: f64,
+    min_seconds_to_expiry_scaled: f64,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -72,7 +81,7 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
     );
     let mut decisions = 0usize;
     let mut approved_count = 0usize;
-    let mut trained_artifact_cache: HashMap<String, Option<(TrainedLinearWeights, i32)>> =
+    let mut trained_artifact_cache: HashMap<String, Option<TrainedModelArtifactCard>> =
         HashMap::new();
     let paper_bankroll = storage
         .latest_portfolio_bankroll(TradeMode::Paper)
@@ -159,7 +168,7 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
             seconds_to_expiry_scaled: (snapshot.seconds_to_expiry as f64 / 900.0)
                 .clamp(0.0, 1.0),
         };
-        let trained_artifact = if model_name == TRAINED_LINEAR_V1 {
+        let trained_artifact = if uses_trained_linear_weights(&model_name) {
             if !trained_artifact_cache.contains_key(&snapshot.symbol) {
                 let artifact = storage
                     .latest_trained_model_artifact(
@@ -167,8 +176,7 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
                         StrategyFamily::DirectionalSettlement,
                         Some(&snapshot.symbol),
                     )
-                    .await?
-                    .map(|artifact| (artifact.weights, artifact.sample_count));
+                    .await?;
                 trained_artifact_cache.insert(snapshot.symbol.clone(), artifact);
             }
             trained_artifact_cache
@@ -178,10 +186,13 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
         } else {
             None
         };
+        let trained_policy = trained_artifact
+            .as_ref()
+            .and_then(trained_policy_from_artifact);
         let model = run_model_with_weights(
             &model_name,
             &feature_vector,
-            trained_artifact.as_ref().map(|(weights, _)| weights),
+            trained_artifact.as_ref().map(|artifact| &artifact.weights),
         );
         let calibration = storage
             .latest_probability_calibration(
@@ -198,6 +209,20 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
             model.probability_yes
         };
 
+        let min_edge = trained_policy
+            .map(|policy| policy.min_edge)
+            .unwrap_or(config.min_edge);
+        let min_confidence = trained_policy
+            .map(|policy| policy.min_confidence)
+            .unwrap_or(config.min_confidence);
+        let min_venue_quality = trained_policy
+            .map(|policy| policy.min_venue_quality)
+            .unwrap_or(config.min_venue_quality);
+        let min_seconds_to_expiry = trained_policy
+            .map(|policy| (policy.min_seconds_to_expiry_scaled * 900.0).round() as i64)
+            .unwrap_or(120)
+            .max(0);
+
         let edge = calibrated_probability_yes - snapshot.market_prob;
         let side = if edge >= 0.0 { "buy_yes" } else { "buy_no" };
         let lane = lane_key(
@@ -210,16 +235,16 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
         );
 
         let mut reasons = Vec::new();
-        if edge.abs() < config.min_edge {
+        if edge.abs() < min_edge {
             reasons.push("edge_below_threshold".to_string());
         }
-        if model.confidence < config.min_confidence {
+        if model.confidence < min_confidence {
             reasons.push("low_confidence".to_string());
         }
-        if snapshot.venue_quality_score < config.min_venue_quality {
+        if snapshot.venue_quality_score < min_venue_quality {
             reasons.push("low_venue_quality".to_string());
         }
-        if snapshot.seconds_to_expiry < 120 {
+        if i64::from(snapshot.seconds_to_expiry) < min_seconds_to_expiry {
             reasons.push("too_close_to_expiry".to_string());
         }
         let promotion_state = lane_policy.as_ref().map(|policy| policy.promotion_state);
@@ -316,7 +341,11 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
                 "market_title": snapshot.market_title,
                 "calibration_mean_error": calibration.as_ref().map(|row| row.mean_error),
                 "calibration_sample_count": calibration.as_ref().map(|row| row.sample_count),
-                "trained_artifact_sample_count": trained_artifact.as_ref().map(|(_, sample_count)| *sample_count),
+                "trained_artifact_sample_count": trained_artifact.as_ref().map(|artifact| artifact.sample_count),
+                "effective_min_edge": min_edge,
+                "effective_min_confidence": min_confidence,
+                "effective_min_venue_quality": min_venue_quality,
+                "effective_min_seconds_to_expiry": min_seconds_to_expiry,
                 "reference_yes_prob": snapshot.reference_yes_prob,
                 "reference_gap_bps": snapshot.reference_gap_bps,
                 "reference_price_change_bps": snapshot.reference_price_change_bps,
@@ -436,6 +465,25 @@ fn live_drawdown_triggered(bankroll: f64, initial_bankroll: f64, kill_pct: f64) 
         return false;
     }
     bankroll <= (initial_bankroll * (1.0 - kill_pct.clamp(0.0, 0.95)))
+}
+
+fn trained_policy_from_artifact(artifact: &TrainedModelArtifactCard) -> Option<TrainedDecisionPolicy> {
+    let policy = artifact.metrics_json.get("policy")?;
+    Some(TrainedDecisionPolicy {
+        min_edge: policy.get("min_edge")?.as_f64()?,
+        min_confidence: policy.get("min_confidence")?.as_f64()?,
+        min_venue_quality: policy.get("min_venue_quality")?.as_f64()?,
+        min_seconds_to_expiry_scaled: policy
+            .get("min_seconds_to_expiry_scaled")?
+            .as_f64()?,
+    })
+}
+
+fn uses_trained_linear_weights(model_name: &str) -> bool {
+    matches!(
+        model_name,
+        TRAINED_LINEAR_V1 | TRAINED_LINEAR_CONTRARIAN_V1
+    )
 }
 
 fn exposure_key(mode: TradeMode, value: &str) -> String {

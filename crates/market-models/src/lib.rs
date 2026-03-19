@@ -45,6 +45,7 @@ pub const FLOW_WEIGHTED_CONTRARIAN_V2: &str = "flow_weighted_contrarian_v2";
 pub const SETTLEMENT_ANCHOR_V3: &str = "settlement_anchor_v3";
 pub const SETTLEMENT_ANCHOR_CONTRARIAN_V3: &str = "settlement_anchor_contrarian_v3";
 pub const TRAINED_LINEAR_V1: &str = "trained_linear_v1";
+pub const TRAINED_LINEAR_CONTRARIAN_V1: &str = "trained_linear_contrarian_v1";
 
 fn invert_output(output: ModelOutput, confidence_boost: f64) -> ModelOutput {
     ModelOutput {
@@ -165,6 +166,7 @@ pub fn supported_models() -> &'static [&'static str] {
         SETTLEMENT_ANCHOR_V3,
         SETTLEMENT_ANCHOR_CONTRARIAN_V3,
         TRAINED_LINEAR_V1,
+        TRAINED_LINEAR_CONTRARIAN_V1,
     ]
 }
 
@@ -186,6 +188,9 @@ pub fn run_model_with_weights(
         TRAINED_LINEAR_V1 => trained_weights
             .map(|weights| trained_linear(features, weights))
             .unwrap_or_else(|| baseline_logit(features)),
+        TRAINED_LINEAR_CONTRARIAN_V1 => trained_weights
+            .map(|weights| invert_output(trained_linear(features, weights), 0.02))
+            .unwrap_or_else(|| invert_output(baseline_logit(features), 0.02)),
         _ => baseline_logit(features),
     }
 }
@@ -195,8 +200,9 @@ mod tests {
     use super::{
         BASELINE_CONTRARIAN_V1, BASELINE_LOGIT_V1, FLOW_WEIGHTED_CONTRARIAN_V2,
         FLOW_WEIGHTED_V2, FeatureVector, SETTLEMENT_ANCHOR_CONTRARIAN_V3,
-        SETTLEMENT_ANCHOR_V3, TRAINED_LINEAR_V1, TrainedLinearWeights, baseline_logit, run_model,
-        run_model_with_weights, supported_models,
+        SETTLEMENT_ANCHOR_V3, TRAINED_LINEAR_CONTRARIAN_V1, TRAINED_LINEAR_V1,
+        TrainedLinearWeights, baseline_logit, run_model, run_model_with_weights,
+        supported_models,
     };
 
     #[test]
@@ -239,15 +245,18 @@ mod tests {
         let v2_inverse = run_model(FLOW_WEIGHTED_CONTRARIAN_V2, &features);
         let v3 = run_model(SETTLEMENT_ANCHOR_V3, &features);
         let v3_inverse = run_model(SETTLEMENT_ANCHOR_CONTRARIAN_V3, &features);
+        let trained_inverse = run_model(TRAINED_LINEAR_CONTRARIAN_V1, &features);
         assert!(v1.probability_yes > 0.5);
         assert!(v2.probability_yes > 0.5);
         assert!(v3.probability_yes > 0.5);
         assert!(v1_inverse.probability_yes < 0.5);
         assert!(v2_inverse.probability_yes < 0.5);
         assert!(v3_inverse.probability_yes < 0.5);
+        assert!(trained_inverse.probability_yes < 0.5);
         assert_ne!(v1.raw_score, v2.raw_score);
         assert!(supported_models().contains(&SETTLEMENT_ANCHOR_V3));
         assert!(supported_models().contains(&SETTLEMENT_ANCHOR_CONTRARIAN_V3));
+        assert!(supported_models().contains(&TRAINED_LINEAR_CONTRARIAN_V1));
     }
 
     #[test]

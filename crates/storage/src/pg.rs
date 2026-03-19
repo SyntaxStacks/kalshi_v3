@@ -1684,6 +1684,38 @@ impl Storage {
         Ok(row.into())
     }
 
+    pub async fn recent_trade_metrics_for_lane(
+        &self,
+        lane_key: &str,
+        mode: TradeMode,
+        limit: i64,
+    ) -> Result<RecentTradeMetrics> {
+        let row = sqlx::query_as::<_, RecentTradeMetricsRow>(
+            r#"
+            with recent as (
+                select realized_pnl
+                from trade_lifecycle
+                where lane_key = $1
+                  and mode = $2
+                  and closed_at is not null
+                order by closed_at desc, id desc
+                limit $3
+            )
+            select
+                count(*) as trade_count,
+                coalesce(sum(case when coalesce(realized_pnl, 0) > 0 then 1 else 0 end), 0) as win_count,
+                coalesce(sum(coalesce(realized_pnl, 0)), 0) as realized_pnl
+            from recent
+            "#,
+        )
+        .bind(lane_key)
+        .bind(SqlTradeMode::from(mode))
+        .bind(limit)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.into())
+    }
+
     pub async fn has_open_trade_for_lane(&self, lane_key: &str) -> Result<bool> {
         let exists = sqlx::query_scalar::<_, bool>(
             r#"
