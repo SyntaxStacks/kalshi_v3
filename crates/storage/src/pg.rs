@@ -1085,11 +1085,9 @@ impl Storage {
         market_id: i64,
         market_ticker: Option<&str>,
     ) -> Result<Option<DateTime<Utc>>> {
-        let rows = sqlx::query_as::<_, RecentDecisionIdentityRow>(
+        let created_at = sqlx::query_scalar::<_, DateTime<Utc>>(
             r#"
             select
-                od.market_id,
-                latest_snapshot.market_ticker,
                 od.created_at
             from opportunity_decision od
             left join lateral (
@@ -1100,24 +1098,20 @@ impl Storage {
                 limit 1
             ) latest_snapshot on true
             where od.lane_key = $1
+              and (
+                    od.market_id = $2
+                    or ($3::text is not null and latest_snapshot.market_ticker = $3)
+              )
             order by od.created_at desc, od.id desc
-            limit 64
+            limit 1
             "#,
         )
         .bind(lane_key)
-        .fetch_all(&self.pool)
+        .bind(market_id)
+        .bind(market_ticker)
+        .fetch_optional(&self.pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .find(|row| {
-                market_identity_matches(
-                    row.market_id,
-                    row.market_ticker.as_deref(),
-                    market_id,
-                    market_ticker,
-                )
-            })
-            .map(|row| row.created_at))
+        Ok(created_at)
     }
 
     pub async fn insert_model_inference(&self, inference: &ModelInference) -> Result<i64> {
@@ -1408,6 +1402,24 @@ impl Storage {
         strategy_family: StrategyFamily,
         expiry_regime: Option<ExpiryRegime>,
     ) -> Result<Option<SymbolLanePolicy>> {
+        let policies = self
+            .lane_policy_candidates_for_symbol(market_family, symbol)
+            .await?;
+        Ok(select_lane_policy(
+            policies.iter(),
+            market_family,
+            symbol,
+            strategy_family,
+            expiry_regime,
+        )
+        .cloned())
+    }
+
+    async fn lane_policy_candidates_for_symbol(
+        &self,
+        market_family: MarketFamily,
+        symbol: &str,
+    ) -> Result<Vec<SymbolLanePolicy>> {
         let pattern = format!("kalshi:{}:%", symbol.to_lowercase());
         let rows = sqlx::query_as::<_, LaneStateRow>(
             r#"
@@ -1416,27 +1428,16 @@ impl Storage {
             from lane_state
             where market_family = $1
               and lane_key like $2
-              and current_champion_model is not null
             order by updated_at desc, lane_key asc
-            limit 64
+            limit 128
             "#,
         )
         .bind(SqlMarketFamily::from(market_family))
         .bind(pattern)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .find(|row| {
-                lane_policy_matches_request(
-                    &row.lane_key,
-                    market_family,
-                    symbol,
-                    strategy_family,
-                    expiry_regime,
-                )
-            })
-            .map(Into::into))
+
+        Ok(rows.into_iter().map(Into::into).collect())
     }
 
     pub async fn latest_portfolio_bankroll(&self, mode: TradeMode) -> Result<Option<BankrollCard>> {
@@ -3686,10 +3687,17 @@ impl Storage {
         symbol: &str,
         strategy_family: StrategyFamily,
     ) -> Result<Option<String>> {
-        Ok(self
-            .latest_lane_policy_for_symbol(market_family, symbol, strategy_family, None)
-            .await?
-            .and_then(|policy| policy.current_champion_model))
+        let policies = self
+            .lane_policy_candidates_for_symbol(market_family, symbol)
+            .await?;
+        Ok(select_lane_policy_with_champion(
+            policies.iter(),
+            market_family,
+            symbol,
+            strategy_family,
+            None,
+        )
+        .and_then(|policy| policy.current_champion_model.clone()))
     }
 
     pub async fn reconcile_bankroll_for_mode(&self, mode: TradeMode) -> Result<()> {
@@ -4558,13 +4566,6 @@ struct ReplacementDecisionCandidateRow {
     market_id: i64,
     market_ticker: Option<String>,
     approved: bool,
-    created_at: DateTime<Utc>,
-}
-
-#[derive(sqlx::FromRow)]
-struct RecentDecisionIdentityRow {
-    market_id: i64,
-    market_ticker: Option<String>,
     created_at: DateTime<Utc>,
 }
 
@@ -5745,6 +5746,7 @@ fn strategy_family_key(value: StrategyFamily) -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn market_identity_matches(
     row_market_id: i64,
     row_market_ticker: Option<&str>,
@@ -5778,6 +5780,43 @@ fn lane_policy_matches_request(
         && parsed.symbol == symbol.to_lowercase()
         && parsed.strategy_family == strategy_family_key(strategy_family)
         && parsed.expiry_regime == expiry_regime
+}
+
+fn select_lane_policy<'a>(
+    policies: impl IntoIterator<Item = &'a SymbolLanePolicy>,
+    market_family: MarketFamily,
+    symbol: &str,
+    strategy_family: StrategyFamily,
+    expiry_regime: Option<ExpiryRegime>,
+) -> Option<&'a SymbolLanePolicy> {
+    policies.into_iter().find(|policy| {
+        lane_policy_matches_request(
+            &policy.lane_key,
+            market_family,
+            symbol,
+            strategy_family,
+            expiry_regime,
+        )
+    })
+}
+
+fn select_lane_policy_with_champion<'a>(
+    policies: impl IntoIterator<Item = &'a SymbolLanePolicy>,
+    market_family: MarketFamily,
+    symbol: &str,
+    strategy_family: StrategyFamily,
+    expiry_regime: Option<ExpiryRegime>,
+) -> Option<&'a SymbolLanePolicy> {
+    policies.into_iter().find(|policy| {
+        policy.current_champion_model.is_some()
+            && lane_policy_matches_request(
+                &policy.lane_key,
+                market_family,
+                symbol,
+                strategy_family,
+                expiry_regime,
+            )
+    })
 }
 
 #[cfg(test)]
@@ -6501,7 +6540,8 @@ mod tests {
         ReplayLaneExecutionTruthRow, SqlMarketFamily, build_lane_execution_truth_summaries,
         compare_call_to_outcome, derive_model_call, derive_resolved_outcome,
         derive_trade_audit_note, derive_trade_call, lane_policy_matches_request,
-        market_identity_matches, opportunity_card_freshness_window,
+        market_identity_matches, opportunity_card_freshness_window, select_lane_policy,
+        select_lane_policy_with_champion, SymbolLanePolicy,
         summarize_family_execution_truth, summarize_live_execution_quality,
         summarize_replay_execution_quality,
     };
@@ -6906,5 +6946,119 @@ mod tests {
             StrategyFamily::DirectionalSettlement,
             Some(ExpiryRegime::Early),
         ));
+    }
+
+    #[test]
+    fn latest_lane_policy_selection_keeps_readiness_even_without_champion_model() {
+        let newer = SymbolLanePolicy {
+            lane_key: lane_key_with_regime(
+                "kalshi",
+                "btc",
+                15,
+                "buy_yes",
+                StrategyFamily::DirectionalSettlement,
+                "trained_linear_v1",
+                Some(ExpiryRegime::Early),
+            ),
+            market_family: MarketFamily::Crypto,
+            promotion_state: PromotionState::PaperActive,
+            promotion_reason: Some("paper_ready".to_string()),
+            recent_pnl: 1.0,
+            recent_brier: 0.1,
+            recent_execution_quality: 0.8,
+            recent_replay_expectancy: 1.1,
+            quarantine_reason: None,
+            current_champion_model: None,
+        };
+        let older_other_symbol = SymbolLanePolicy {
+            lane_key: lane_key_with_regime(
+                "kalshi",
+                "eth",
+                15,
+                "buy_yes",
+                StrategyFamily::DirectionalSettlement,
+                "trained_linear_v1",
+                Some(ExpiryRegime::Early),
+            ),
+            current_champion_model: Some("trained_linear_v1".to_string()),
+            ..newer.clone()
+        };
+
+        let selected = select_lane_policy(
+            [&newer, &older_other_symbol],
+            MarketFamily::Crypto,
+            "btc",
+            StrategyFamily::DirectionalSettlement,
+            Some(ExpiryRegime::Early),
+        )
+        .expect("matching readiness policy");
+
+        assert_eq!(selected.lane_key, newer.lane_key);
+        assert!(selected.current_champion_model.is_none());
+    }
+
+    #[test]
+    fn champion_selection_skips_null_champion_rows_and_keeps_exact_identity_match() {
+        let no_champion = SymbolLanePolicy {
+            lane_key: lane_key_with_regime(
+                "kalshi",
+                "btc",
+                15,
+                "buy_yes",
+                StrategyFamily::DirectionalSettlement,
+                "trained_linear_v1",
+                Some(ExpiryRegime::Mid),
+            ),
+            market_family: MarketFamily::Crypto,
+            promotion_state: PromotionState::PaperActive,
+            promotion_reason: Some("paper_ready".to_string()),
+            recent_pnl: 0.5,
+            recent_brier: 0.2,
+            recent_execution_quality: 0.7,
+            recent_replay_expectancy: 0.9,
+            quarantine_reason: None,
+            current_champion_model: None,
+        };
+        let with_champion = SymbolLanePolicy {
+            lane_key: lane_key_with_regime(
+                "kalshi",
+                "btc",
+                15,
+                "buy_no",
+                StrategyFamily::DirectionalSettlement,
+                "trained_linear_v1",
+                Some(ExpiryRegime::Mid),
+            ),
+            current_champion_model: Some("trained_linear_v1".to_string()),
+            ..no_champion.clone()
+        };
+        let other_regime = SymbolLanePolicy {
+            lane_key: lane_key_with_regime(
+                "kalshi",
+                "btc",
+                15,
+                "buy_yes",
+                StrategyFamily::DirectionalSettlement,
+                "trained_linear_v1",
+                Some(ExpiryRegime::Early),
+            ),
+            current_champion_model: Some("baseline_logit_v1".to_string()),
+            ..no_champion.clone()
+        };
+
+        let selected = select_lane_policy_with_champion(
+            [&no_champion, &other_regime, &with_champion],
+            MarketFamily::Crypto,
+            "btc",
+            StrategyFamily::DirectionalSettlement,
+            Some(ExpiryRegime::Mid),
+        )
+        .expect("matching champion policy");
+
+        assert_eq!(
+            selected.current_champion_model.as_deref(),
+            Some("trained_linear_v1")
+        );
+        assert_eq!(selected.lane_key, with_champion.lane_key);
     }
 }

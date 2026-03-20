@@ -29,6 +29,10 @@ Discord is notification-only here. A plain webhook cannot receive replies back i
   - written when the loop pauses for human action
 - `logs/`
   - stdout/stderr and prompt files for each iteration
+- `discord_operator.py`
+  - optional host-side Discord bot for `kalshi-v3` runtime + loop control
+- `requirements.txt`
+  - Python dependency for the host-side Discord bot
 
 ## Setup
 
@@ -48,11 +52,55 @@ Example:
 $env:DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..."
 $env:REPO_PATH="C:\code\kalshi-v3"
 $env:MAX_ITERATIONS="2"
-$env:CODEX_COMMAND='codex exec --cwd {repo_path} --output-file {output_file} --input-file {prompt_file}'
+$env:CODEX_COMMAND='type "{prompt_file}" | "C:\nvm4w\nodejs\codex.CMD" exec -C "{repo_path}" --dangerously-bypass-approvals-and-sandbox -o "{output_file}" -'
 python .ai-loop\run_loop.py
 ```
 
-The default `CODEX_COMMAND` is only a placeholder. Adjust it to match the Codex CLI installed on your machine.
+This repo now includes `.ai-loop/config.json` with a working Windows-local Codex command for this machine. Override it only if your local Codex path or flags differ.
+
+## Discord Operator
+
+This repo can expose a small host-side Discord bot for the `kalshi-v3` loop.
+
+Why host-side:
+- the AI loop lives in `.ai-loop/` on the host
+- Codex CLI is host-side, not in the Docker containers
+- the bot should talk to both:
+  - the live `kalshi-v3` API at `http://127.0.0.1:8080`
+  - the local `.ai-loop` files
+
+Setup:
+
+```powershell
+python -m pip install -r .ai-loop\requirements.txt
+python .ai-loop\discord_operator.py
+```
+
+The bot reads these env vars from the repo `.env`:
+- `DISCORD_BOT_TOKEN` or `DISCORD_BOT_TOKEN_FILE`
+- `DISCORD_BOT_GUILD_ID`
+- `DISCORD_BOT_ALLOWED_CHANNEL_IDS`
+- `DISCORD_BOT_ALLOWED_ROLE_IDS`
+
+Optional:
+- `DISCORD_OPERATOR_API_BASE`
+  - defaults to `http://127.0.0.1:8080`
+
+Current commands:
+- `/ai status`
+  - reads `kalshi-v3` runtime from `/v1/runtime`
+- `/ai loop_status`
+  - reads the local `.ai-loop` artifacts
+- `/ai approve_loop`
+  - writes `.ai-loop/operator_input.json` with `approved=true`
+- `/ai approve_loop <note>`
+  - writes `.ai-loop/operator_input.json` with `approved=true` and operator notes
+- `/ai run_loop`
+  - launches `.ai-loop/run_loop.py` on the host via the local Python/Codex CLI environment
+- `/ai run_loop <note>`
+  - writes operator notes first, then launches the loop
+- `/ai stop_loop`
+  - writes `.ai-loop/operator_input.json` with `stop=true`
 
 ## Human Input
 

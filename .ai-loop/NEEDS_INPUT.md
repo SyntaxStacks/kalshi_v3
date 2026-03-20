@@ -1,8 +1,8 @@
 # Needs Input
 
-- Time: `2026-03-20T04:22:17+00:00`
-- Reason: `codex_requested_input`
+- Time: `2026-03-20T06:31:59+00:00`
+- Reason: `codex_failed`
 
 ## Details
 
-Populate C:\code\kalshi-v3\.ai-loop\review_spec.md with a concrete tranche: goal, exact files/modules in scope, exact failure modes to fix, what must not change, and acceptance criteria. The current file is only the template.
+Codex command failed with exit code 2. See `C:\code\kalshi-v3\.ai-loop\logs\iteration-01-codex.stderr.log`.

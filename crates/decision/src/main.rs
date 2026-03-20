@@ -796,10 +796,7 @@ fn select_decision_snapshots(
             selected.push(snapshot);
             continue;
         }
-        if snapshot.seconds_to_expiry <= 0 {
-            continue;
-        }
-        if snapshot.seconds_to_expiry > crypto_decision_horizon_seconds(snapshot.window_minutes) {
+        if !is_eligible_crypto_decision_snapshot(&snapshot) {
             continue;
         }
         let key = (
@@ -821,6 +818,12 @@ fn select_decision_snapshots(
     selected
 }
 
+fn is_eligible_crypto_decision_snapshot(snapshot: &common::MarketFeatureSnapshotRecord) -> bool {
+    snapshot.market_family == MarketFamily::Crypto
+        && snapshot.seconds_to_expiry > 0
+        && snapshot.seconds_to_expiry <= crypto_decision_horizon_seconds(snapshot.window_minutes)
+}
+
 fn snapshot_staleness_rank(snapshot: &common::MarketFeatureSnapshotRecord) -> i32 {
     snapshot
         .market_data_age_seconds
@@ -836,14 +839,62 @@ fn snapshot_spread_rank_bps(snapshot: &common::MarketFeatureSnapshotRecord) -> f
     }
 }
 
+fn normalized_book_prices_for_side(
+    snapshot: &common::MarketFeatureSnapshotRecord,
+    side: &str,
+) -> (Option<f64>, Option<f64>) {
+    let best_bid = valid_contract_book_price(snapshot.best_bid);
+    let best_ask = valid_contract_book_price(snapshot.best_ask);
+    if side == "buy_no" {
+        (
+            best_ask.map(|price| (1.0 - price).clamp(0.01, 0.99)),
+            best_bid.map(|price| (1.0 - price).clamp(0.01, 0.99)),
+        )
+    } else {
+        (best_bid, best_ask)
+    }
+}
+
+fn valid_contract_book_price(price: f64) -> Option<f64> {
+    if price.is_finite() && price > 0.0 && price < 1.0 {
+        Some(price.clamp(0.01, 0.99))
+    } else {
+        None
+    }
+}
+
+fn snapshot_has_tradable_book(snapshot: &common::MarketFeatureSnapshotRecord) -> bool {
+    matches!(
+        (
+            valid_contract_book_price(snapshot.best_bid),
+            valid_contract_book_price(snapshot.best_ask),
+        ),
+        (Some(best_bid), Some(best_ask)) if best_ask + f64::EPSILON >= best_bid
+    )
+}
+
 fn should_prefer_crypto_snapshot(
     current: &common::MarketFeatureSnapshotRecord,
     candidate: &common::MarketFeatureSnapshotRecord,
 ) -> bool {
+    let current_eligible = is_eligible_crypto_decision_snapshot(current);
+    let candidate_eligible = is_eligible_crypto_decision_snapshot(candidate);
+    if current_eligible != candidate_eligible {
+        return candidate_eligible;
+    }
+    if !candidate_eligible {
+        return false;
+    }
+
     let current_staleness = snapshot_staleness_rank(current);
     let candidate_staleness = snapshot_staleness_rank(candidate);
     if candidate_staleness != current_staleness {
         return candidate_staleness < current_staleness;
+    }
+
+    let tradable_book_cmp = snapshot_has_tradable_book(candidate).cmp(&snapshot_has_tradable_book(current));
+    if tradable_book_cmp != std::cmp::Ordering::Equal {
+        return tradable_book_cmp.is_gt();
     }
 
     let venue_quality_cmp = candidate
@@ -863,7 +914,17 @@ fn should_prefer_crypto_snapshot(
         return candidate.seconds_to_expiry < current.seconds_to_expiry;
     }
 
-    candidate.created_at > current.created_at
+    let created_at_cmp = candidate.created_at.cmp(&current.created_at);
+    if created_at_cmp != std::cmp::Ordering::Equal {
+        return created_at_cmp.is_gt();
+    }
+
+    let market_id_cmp = candidate.market_id.cmp(&current.market_id);
+    if market_id_cmp != std::cmp::Ordering::Equal {
+        return market_id_cmp.is_lt();
+    }
+
+    candidate.market_ticker < current.market_ticker
 }
 
 fn crypto_decision_horizon_seconds(window_minutes: i32) -> i32 {
@@ -980,33 +1041,21 @@ fn contract_price_for_side(side: &str, market_prob: f64) -> f64 {
     }
 }
 
-fn contract_book_ask_for_side(snapshot: &common::MarketFeatureSnapshotRecord, side: &str) -> f64 {
-    let (best_bid, best_ask) = if side == "buy_no" {
-        (
-            (1.0 - snapshot.best_ask).clamp(0.01, 0.99),
-            (1.0 - snapshot.best_bid).clamp(0.01, 0.99),
-        )
-    } else {
-        (
-            snapshot.best_bid.clamp(0.01, 0.99),
-            snapshot.best_ask.clamp(0.01, 0.99),
-        )
-    };
-    best_ask.max(best_bid.min(best_ask))
+fn contract_book_ask_for_side(
+    snapshot: &common::MarketFeatureSnapshotRecord,
+    side: &str,
+) -> Option<f64> {
+    let (best_bid, best_ask) = normalized_book_prices_for_side(snapshot, side);
+    match (best_bid, best_ask) {
+        (Some(bid), Some(ask)) if ask + f64::EPSILON >= bid => Some(ask),
+        (None, Some(ask)) => Some(ask),
+        _ => None,
+    }
 }
 
 fn estimated_live_entry_price(snapshot: &common::MarketFeatureSnapshotRecord, side: &str) -> f64 {
     let theoretical = contract_price_for_side(side, snapshot.market_prob);
-    let executable = contract_book_ask_for_side(snapshot, side).clamp(0.01, 0.99);
-    if snapshot.best_bid <= 0.0
-        || snapshot.best_ask <= 0.0
-        || !executable.is_finite()
-        || executable <= 0.0
-    {
-        theoretical
-    } else {
-        executable
-    }
+    contract_book_ask_for_side(snapshot, side).unwrap_or(theoretical)
 }
 
 fn build_feature_vector(snapshot: &common::MarketFeatureSnapshotRecord) -> FeatureVector {
@@ -1487,6 +1536,29 @@ mod tests {
     }
 
     #[test]
+    fn tradable_book_beats_bookless_contract_when_freshness_ties() {
+        let mut tradable = sample_snapshot(MarketFamily::Crypto, "btc", "KXBTC15M-book", 420, 0);
+        tradable.market_data_age_seconds = 2;
+        tradable.reference_age_seconds = 2;
+        tradable.best_bid = 0.44;
+        tradable.best_ask = 0.46;
+        tradable.venue_quality_score = 0.70;
+        tradable.spread_bps = 120.0;
+
+        let mut bookless =
+            sample_snapshot(MarketFamily::Crypto, "btc", "KXBTC15M-no-book", 390, 5);
+        bookless.market_data_age_seconds = 2;
+        bookless.reference_age_seconds = 2;
+        bookless.best_bid = 0.0;
+        bookless.best_ask = 0.0;
+        bookless.venue_quality_score = 0.70;
+        bookless.spread_bps = 120.0;
+
+        assert!(!should_prefer_crypto_snapshot(&tradable, &bookless));
+        assert!(should_prefer_crypto_snapshot(&bookless, &tradable));
+    }
+
+    #[test]
     fn crypto_decision_horizon_matches_short_horizon_contracts() {
         assert_eq!(crypto_decision_horizon_seconds(15), 2700);
     }
@@ -1523,6 +1595,40 @@ mod tests {
         snapshot.market_prob = 0.61;
         snapshot.best_bid = 0.0;
         snapshot.best_ask = 0.0;
+
+        let theoretical = super::contract_price_for_side("buy_yes", snapshot.market_prob);
+        assert_eq!(
+            estimated_live_entry_price(&snapshot, "buy_yes"),
+            theoretical
+        );
+    }
+
+    #[test]
+    fn live_size_gate_uses_available_book_ask_when_bid_is_missing() {
+        let mut snapshot = sample_snapshot(MarketFamily::Crypto, "ada", "KXADA15M-live", 240, 0);
+        snapshot.market_prob = 0.74;
+        snapshot.best_bid = 0.0;
+        snapshot.best_ask = 0.33;
+
+        assert!((estimated_live_entry_price(&snapshot, "buy_yes") - 0.33).abs() < 1e-9);
+    }
+
+    #[test]
+    fn live_size_gate_uses_complementary_yes_book_for_buy_no() {
+        let mut snapshot = sample_snapshot(MarketFamily::Crypto, "ltc", "KXLTC15M-live", 240, 0);
+        snapshot.market_prob = 0.68;
+        snapshot.best_bid = 0.61;
+        snapshot.best_ask = 0.0;
+
+        assert!((estimated_live_entry_price(&snapshot, "buy_no") - 0.39).abs() < 1e-9);
+    }
+
+    #[test]
+    fn inconsistent_book_for_live_gate_falls_back_safely() {
+        let mut snapshot = sample_snapshot(MarketFamily::Crypto, "doge", "KXDOGE15M-live", 240, 0);
+        snapshot.market_prob = 0.58;
+        snapshot.best_bid = 0.62;
+        snapshot.best_ask = 0.55;
 
         let theoretical = super::contract_price_for_side("buy_yes", snapshot.market_prob);
         assert_eq!(

@@ -20,28 +20,133 @@ Operator input:
 Current tranche spec:
 # Active Tranche Spec
 
-Use this file as the only active implementation tranche for the local AI loop.
-
 ## Goal
 
-Describe the single current tranche clearly.
+Implement tranche 2 of false-negative trade blocker fixes in `kalshi-v3`.
+
+Mission:
+- increase valid trade creation and routing
+- remove cases where a good crypto trade is skipped or blocked incorrectly
+- preserve explicit live safety controls
+
+This tranche is about:
+1. recent-decision dedupe
+2. snapshot/front-contract selection
+3. live size gating using executable price instead of only theoretical price
+4. safer lane policy lookup to reduce false `lane_untrained` / readiness misses
 
 ## Scope
 
-- list exact files or modules in scope
-- list exact failure modes to fix
-- list what must not change
+In scope files and modules:
+- `crates/decision/src/main.rs`
+- `crates/storage/src/pg.rs`
+- small supporting changes in shared helpers only if required by the above
+- tests near the touched modules
+
+Exact failure modes to fix:
+
+1. Recent-decision dedupe is still lane-only.
+- Different markets in the same lane can still be skipped inside the poll window.
+- Deduping must become market-aware:
+  - primary key: `(lane_key, market_id)`
+  - `market_ticker` fallback only when needed
+
+2. Snapshot/front-contract selection is still not best-tradable-contract aware.
+- Regime-aware selection may still pick the wrong market inside a regime.
+- Selection must be deterministic and tradability-oriented.
+- Minimum acceptable ranking:
+  1. inside decision horizon
+  2. positive `seconds_to_expiry`
+  3. fresher market data
+  4. better venue/tradability when available
+  5. nearer tradable expiry inside the regime
+
+3. Live size gating still uses theoretical entry price.
+- Decision should not reject a live trade as `size_too_small_for_live_contract` if the estimated executable book price would support at least one contract.
+- Use available book fields first:
+  - `best_bid`
+  - `best_ask`
+  - side
+  - spread / venue quality when useful
+- Fall back deterministically when book data is missing.
+
+4. Lane policy lookup is still too brittle.
+- Do not rely on fragile SQL text slicing as the only identity check.
+- Reduce false negatives in:
+  - champion lookup
+  - readiness lookup
+  - `lane_untrained`
+- If full typed schema is too large for this tranche, use a safer validated helper that parses lane identity explicitly and matches:
+  - symbol
+  - strategy family
+  - expiry regime
+- Do not let unrelated/opposite-side rows win accidentally if side-specific behavior matters.
+
+What must not change:
+- do not add new strategies
+- do not add new model families
+- do not weaken exposure caps or drawdown controls
+- do not undo tranche 1 fixes:
+  - shared decision/execution score semantics
+  - false supersession fix
+  - market-aware trade/intent suppression
+- do not turn this into a broad refactor
 
 ## Acceptance Criteria
 
-- list the tests or behaviors that must hold
+### Recent-decision dedupe
+- same lane + same market + same poll window => duplicate skipped
+- same lane + different market + same poll window => not skipped
+
+### Snapshot selection
+- when two markets exist in the same `(symbol, window, regime)`, the nearer tradable contract wins
+- an out-of-horizon market must not win
+- a stale-but-newer snapshot must not beat a fresher/tradable candidate incorrectly
+
+### Live size gate
+- a trade that supports `>= 1` live contract at estimated executable price is not blocked solely by worse theoretical pricing
+- missing book data falls back safely and deterministically
+
+### Lane policy lookup
+- valid policy is found for the intended symbol / family / regime
+- lookup does not fail because of brittle `split_part(...)`-style parsing
+- unrelated or opposite-side rows do not incorrectly win if they should not
+
+### General
+- preserve current live safety controls
+- `cargo test --workspace` passes
+- any new tests for this tranche pass
 
 ## Deliverable Format
 
-- list the exact JSON/report fields the Codex pass must return
+Return JSON matching `.ai-loop/codex_result.schema.json` with:
+- `files_changed`
+- `behavior_changes`
+- `tests_added`
+- `schema_changes`
+- `verification`
+- `remaining_risks`
+- `needs_input`
+- `input_request`
+- `status`
+
+In `behavior_changes`, explicitly mention:
+- recent-decision dedupe behavior
+- snapshot selection ranking behavior
+- live size-gating behavior
+- lane policy lookup behavior
+
+In `verification`, include the exact tests/commands run.
 
 ## Notes
 
-- keep this file narrowly scoped
-- prefer one tranche at a time
+- Main bug class in this repo remains false-negative trade blockers.
+- Priority funnel:
+  - approved decisions
+  - intents inserted
+  - execution-score rejections
+  - duplicate suppression
+  - trades opened
+- Prefer exact, test-backed fixes over theory.
+- If a likely blocker is found but cannot be fixed safely in this tranche, leave it in `remaining_risks` instead of widening scope.
 

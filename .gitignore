@@ -3,7 +3,7 @@
 /docker-data/
 /.sqlx/
 /logs/
-/*.log
+/**/*.log
 /tmp/
 /.runtime/
 /.DS_Store
