@@ -1,8 +1,10 @@
 use anyhow::Result;
 use chrono::Utc;
 use common::{
-    AppConfig, MarketFamily, StrategyFamily, TradeMode, kalshi_api_key_id, kalshi_private_key,
-    kalshi_sign_rest_request, kalshi_timestamp_ms,
+    AppConfig, ExecutionScoreInputs, ExpiryRegime, MarketFamily, StrategyFamily, TradeMode,
+    build_execution_score, compute_execution_score_bps, directional_raw_edge_bps,
+    estimate_fill_probability, kalshi_api_key_id, kalshi_private_key, kalshi_sign_rest_request,
+    kalshi_timestamp_ms,
 };
 use market_data::{ContractSide, QueueSideSummary, QueueSnapshot};
 use redis::AsyncCommands;
@@ -23,6 +25,7 @@ const ENTRY_MAX_CROSS_QUEUE_AHEAD: f64 = 40.0;
 const MIN_POST_FEE_EDGE_BPS: f64 = 5.0;
 const CROSS_EXECUTION_SCORE_BPS: f64 = 40.0;
 const URGENT_EXIT_SECONDS: i32 = 90;
+const EXECUTION_SCORE_DIVERGENCE_WARN_BPS: f64 = 5.0;
 
 #[derive(Clone)]
 struct LiveKalshiClient {
@@ -315,12 +318,15 @@ async fn execute_once(
     let mut opened = 0usize;
     let mut rejected = 0usize;
     for intent in intents {
-        if storage.has_open_trade_for_lane(&intent.lane_key).await? {
+        if storage
+            .has_open_trade_for_market(intent.market_id, intent.market_ticker.as_deref())
+            .await?
+        {
             storage
                 .mark_execution_intent_status(
                     intent.intent_id,
                     "rejected",
-                    Some("existing_open_trade_for_lane"),
+                    Some("existing_open_trade_for_market"),
                 )
                 .await?;
             rejected += 1;
@@ -371,6 +377,7 @@ async fn execute_once(
                     let current_score =
                         current_crypto_execution_score(&intent, &snapshot, queue_snapshot.as_ref())
                             .unwrap_or(f64::NEG_INFINITY);
+                    maybe_warn_execution_score_divergence(&intent, current_score);
                     if current_score <= threshold {
                         storage
                             .mark_execution_intent_status(
@@ -451,6 +458,7 @@ async fn execute_once(
                 let current_score =
                     current_crypto_execution_score(&intent, &snapshot, queue_snapshot.as_ref())
                         .unwrap_or(f64::NEG_INFINITY);
+                maybe_warn_execution_score_divergence(&intent, current_score);
                 if intent.market_family == MarketFamily::Crypto && current_score <= threshold {
                     storage
                         .mark_execution_intent_status(
@@ -812,9 +820,12 @@ async fn reconcile_pending_intents(storage: &storage::Storage) -> Result<usize> 
     for intent in intents {
         let mut status = None;
         let mut reason = None;
-        if storage.has_open_trade_for_lane(&intent.lane_key).await? {
+        if storage
+            .has_open_trade_for_market(intent.market_id, intent.market_ticker.as_deref())
+            .await?
+        {
             status = Some("superseded");
-            reason = Some("open_trade_exists");
+            reason = Some("open_trade_exists_for_market");
         } else if let Some(snapshot) = storage
             .latest_feature_snapshot_for_market(intent.market_id)
             .await?
@@ -829,13 +840,17 @@ async fn reconcile_pending_intents(storage: &storage::Storage) -> Result<usize> 
         }
 
         if status.is_none() {
-            if let Some(last_created_at) = storage
-                .latest_decision_at_for_lane(&intent.lane_key)
+            if let Some(replacement) = storage
+                .latest_replacement_decision_for_lane(&intent.lane_key, intent.created_at)
                 .await?
             {
-                if last_created_at > intent.created_at {
+                if should_supersede_pending_intent(
+                    intent.market_id,
+                    intent.market_ticker.as_deref(),
+                    &replacement,
+                ) {
                     status = Some("superseded");
-                    reason = Some("newer_decision_exists");
+                    reason = Some("approved_replacement_for_same_market");
                 }
             }
         }
@@ -1063,7 +1078,10 @@ async fn sync_live_intent_from_exchange(
     let mut transitioned_via_trade_open = false;
 
     if fill_quantity >= 1.0 {
-        if storage.has_open_trade_for_lane(&intent.lane_key).await? {
+        if storage
+            .has_open_trade_for_market(intent.market_id, intent.market_ticker.as_deref())
+            .await?
+        {
             storage
                 .upsert_open_live_trade_fill_progress(
                     intent.decision_id,
@@ -1265,6 +1283,9 @@ async fn replace_live_entry_order(
     } else {
         f64::INFINITY
     };
+    if let Some(record) = pending_record.as_ref() {
+        maybe_warn_execution_score_divergence(record, current_score);
+    }
     let model_prob = pending_record
         .as_ref()
         .map(|record| record.model_prob)
@@ -1386,7 +1407,10 @@ async fn handle_live_entry_placement_result(
                 "entry_fee": fill.fees,
                 "entry_status": fill.status.clone(),
             });
-            if storage.has_open_trade_for_lane(&intent.lane_key).await? {
+            if storage
+                .has_open_trade_for_market(intent.market_id, intent.market_ticker.as_deref())
+                .await?
+            {
                 storage
                     .upsert_open_live_trade_fill_progress(
                         intent.decision_id,
@@ -2393,6 +2417,35 @@ fn route_skip(reason: &str) -> RoutingDecision {
     }
 }
 
+fn same_market_identity(
+    market_id: i64,
+    market_ticker: Option<&str>,
+    other_market_id: i64,
+    other_market_ticker: Option<&str>,
+) -> bool {
+    market_id == other_market_id
+        || match (market_ticker, other_market_ticker) {
+            (Some(left), Some(right)) if !left.trim().is_empty() && !right.trim().is_empty() => {
+                left == right
+            }
+            _ => false,
+        }
+}
+
+fn should_supersede_pending_intent(
+    intent_market_id: i64,
+    intent_market_ticker: Option<&str>,
+    replacement: &storage::ReplacementDecisionCandidate,
+) -> bool {
+    replacement.approved
+        && same_market_identity(
+            intent_market_id,
+            intent_market_ticker,
+            replacement.market_id,
+            replacement.market_ticker.as_deref(),
+        )
+}
+
 fn route_live_entry(
     snapshot: &common::MarketFeatureSnapshotRecord,
     side: &str,
@@ -2429,12 +2482,14 @@ fn route_live_entry(
         return route_skip("queue_ahead_above_cap");
     }
 
+    let regime = execution_regime(snapshot);
     let fill_probability = predicted_fill_probability.unwrap_or_else(|| {
         estimate_fill_probability(
             queue_ahead.max(1.0),
             execution_queue_trade_consumption_rate(snapshot, queue_snapshot, side),
             execution_queue_cancel_rate(snapshot, queue_snapshot, side),
             f64::from(snapshot.seconds_to_expiry.max(1)),
+            regime,
         )
     });
     let slippage_bps = predicted_slippage_bps.unwrap_or(snapshot.spread_bps * 0.5);
@@ -2590,6 +2645,39 @@ fn stop_condition_value(stop_conditions: &[String], key: &str) -> Option<f64> {
     })
 }
 
+fn maybe_warn_execution_score_divergence(
+    intent: &storage::PendingExecutionIntent,
+    recomputed_score_bps: f64,
+) {
+    let decision_score_bps =
+        stop_condition_value(&intent.stop_conditions_json, "execution_score_bps");
+    if let Some(decision_score_bps) = decision_score_bps {
+        let divergence_bps = (decision_score_bps - recomputed_score_bps).abs();
+        if divergence_bps >= EXECUTION_SCORE_DIVERGENCE_WARN_BPS {
+            warn!(
+                intent_id = intent.intent_id,
+                decision_id = intent.decision_id,
+                market_id = intent.market_id,
+                market_ticker = intent.market_ticker.as_deref().unwrap_or(""),
+                decision_execution_score_bps = decision_score_bps,
+                execution_recomputed_score_bps = recomputed_score_bps,
+                divergence_bps,
+                "execution_score_diverged_from_decision"
+            );
+        } else {
+            info!(
+                intent_id = intent.intent_id,
+                decision_id = intent.decision_id,
+                market_id = intent.market_id,
+                market_ticker = intent.market_ticker.as_deref().unwrap_or(""),
+                decision_execution_score_bps = decision_score_bps,
+                execution_recomputed_score_bps = recomputed_score_bps,
+                "execution_score_consistent_with_decision"
+            );
+        }
+    }
+}
+
 async fn load_queue_snapshot(
     redis: &mut redis::aio::MultiplexedConnection,
     market_ticker: &str,
@@ -2655,21 +2743,10 @@ fn execution_queue_decay_rate(
         .max(0.0)
 }
 
-fn estimate_fill_probability(
-    size_ahead: f64,
-    trade_consumption_rate: f64,
-    cancel_rate: f64,
-    seconds_to_expiry: f64,
-) -> f64 {
-    let effective_rate = (trade_consumption_rate + cancel_rate).max(0.0);
-    if effective_rate <= f64::EPSILON {
-        return 0.0;
-    }
-    let expected_fill_time = size_ahead.max(1.0) / effective_rate;
-    if !expected_fill_time.is_finite() || expected_fill_time <= f64::EPSILON {
-        return 0.0;
-    }
-    (seconds_to_expiry / expected_fill_time).clamp(0.0, 1.0)
+fn execution_regime(snapshot: &common::MarketFeatureSnapshotRecord) -> ExpiryRegime {
+    snapshot.expiry_regime.unwrap_or_else(|| {
+        ExpiryRegime::from_seconds_to_expiry(i64::from(snapshot.seconds_to_expiry))
+    })
 }
 
 fn current_crypto_execution_score(
@@ -2680,42 +2757,34 @@ fn current_crypto_execution_score(
     if intent.market_family != MarketFamily::Crypto {
         return None;
     }
-    let raw_edge_bps = if intent.side == "buy_no" {
-        ((snapshot.market_prob - intent.model_prob) * 10_000.0).max(0.0)
-    } else {
-        ((intent.model_prob - snapshot.market_prob) * 10_000.0).max(0.0)
-    };
+    let raw_edge_bps =
+        directional_raw_edge_bps(&intent.side, intent.model_prob, snapshot.market_prob);
     let queue_summary = queue_side_summary(queue_snapshot, &intent.side);
-    let size_ahead = queue_summary
-        .map(|queue| queue.size_ahead_real)
-        .unwrap_or(snapshot.size_ahead_real.max(snapshot.size_ahead.max(1.0)))
-        .max(1.0);
-    let trade_consumption_rate = queue_summary
-        .map(|queue| queue.trade_consumption_rate)
-        .unwrap_or(snapshot.trade_consumption_rate.max(snapshot.trade_rate))
-        .max(0.0);
-    let cancel_rate = queue_summary
-        .map(|queue| queue.cancel_rate)
-        .unwrap_or(snapshot.cancel_rate.max(0.0))
-        .max(0.0);
-    let queue_decay_rate = queue_summary
-        .map(|queue| queue.queue_decay_rate)
-        .unwrap_or(snapshot.queue_decay_rate.max(0.0))
-        .max(0.0);
-    let fill_probability = estimate_fill_probability(
-        size_ahead,
-        trade_consumption_rate,
-        cancel_rate,
-        f64::from(snapshot.seconds_to_expiry.max(1)),
-    );
-    let expected_slippage_bps = snapshot.spread_bps * 0.5;
-    let adverse_selection_bps = (snapshot.aggressive_buy_ratio * snapshot.spread_bps)
-        + ((cancel_rate + queue_decay_rate) * 10.0)
-        + (snapshot.quote_churn * 5.0);
-    Some(
-        (raw_edge_bps * fill_probability) - expected_slippage_bps - adverse_selection_bps
-            + (intent.confidence * 5.0),
-    )
+    let score = build_execution_score(ExecutionScoreInputs {
+        raw_edge_bps,
+        spread_bps: snapshot.spread_bps,
+        aggressive_buy_ratio: snapshot.aggressive_buy_ratio,
+        quote_churn: snapshot.quote_churn,
+        size_ahead: queue_summary
+            .map(|queue| queue.size_ahead_real)
+            .unwrap_or(snapshot.size_ahead_real.max(snapshot.size_ahead.max(1.0)))
+            .max(1.0),
+        trade_consumption_rate: queue_summary
+            .map(|queue| queue.trade_consumption_rate)
+            .unwrap_or(snapshot.trade_consumption_rate.max(snapshot.trade_rate))
+            .max(0.0),
+        cancel_rate: queue_summary
+            .map(|queue| queue.cancel_rate)
+            .unwrap_or(snapshot.cancel_rate.max(0.0))
+            .max(0.0),
+        queue_decay_rate: queue_summary
+            .map(|queue| queue.queue_decay_rate)
+            .unwrap_or(snapshot.queue_decay_rate.max(0.0))
+            .max(0.0),
+        seconds_to_expiry: f64::from(snapshot.seconds_to_expiry.max(1)),
+        regime: execution_regime(snapshot),
+    });
+    Some(compute_execution_score_bps(&score))
 }
 
 fn settlement_contract_price(side: &str, resolved_yes: bool) -> f64 {
@@ -2906,7 +2975,7 @@ fn parse_fp(raw: &str) -> f64 {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use common::ExpiryRegime;
+    use common::{ExpiryRegime, PromotionState};
 
     fn sample_open_trade(exit_fill_status: Option<&str>) -> OpenTradeForExit {
         OpenTradeForExit {
@@ -2961,6 +3030,47 @@ mod tests {
             avg_fill_price: None,
             terminal_outcome: None,
             last_transition_at: Utc::now(),
+        }
+    }
+
+    fn sample_pending_intent() -> storage::PendingExecutionIntent {
+        storage::PendingExecutionIntent {
+            intent_id: 1,
+            decision_id: 1,
+            market_id: 1,
+            market_ticker: Some("KXBTC15M-TEST".to_string()),
+            market_family: MarketFamily::Crypto,
+            lane_key: "kalshi:btc:15:buy_yes:directional_settlement:trained_linear_v1:mid"
+                .to_string(),
+            strategy_family: StrategyFamily::DirectionalSettlement,
+            side: "buy_yes".to_string(),
+            market_prob: 0.50,
+            model_prob: 0.56,
+            confidence: 0.72,
+            recommended_size: 25.0,
+            mode: TradeMode::Live,
+            entry_style: "maker_priority".to_string(),
+            timeout_seconds: 120,
+            force_exit_buffer_seconds: 45,
+            predicted_fill_probability: Some(0.35),
+            predicted_slippage_bps: Some(15.0),
+            predicted_queue_ahead: Some(10.0),
+            execution_forecast_version: Some("queue_fill_v1".to_string()),
+            submitted_quantity: 10.0,
+            accepted_quantity: 0.0,
+            filled_quantity: 0.0,
+            cancelled_quantity: 0.0,
+            rejected_quantity: 0.0,
+            avg_fill_price: None,
+            first_fill_at: None,
+            last_fill_at: None,
+            terminal_outcome: None,
+            promotion_state_at_creation: Some(PromotionState::LiveMicro),
+            stop_conditions_json: vec![
+                "execution_score_bps:42.5".to_string(),
+                "execution_score_threshold_bps:10.0".to_string(),
+            ],
+            created_at: Utc::now(),
         }
     }
 
@@ -3144,6 +3254,111 @@ mod tests {
             stop_condition_value(&stop_conditions, "fill_probability"),
             Some(0.75)
         );
+    }
+
+    #[test]
+    fn approved_crypto_with_missing_queue_data_stays_tradable_in_execution() {
+        let intent = sample_pending_intent();
+        let mut snapshot = sample_snapshot();
+        snapshot.market_prob = 0.50;
+        snapshot.spread_bps = 0.0;
+        snapshot.trade_consumption_rate = 0.0;
+        snapshot.trade_rate = 0.0;
+        snapshot.cancel_rate = 0.0;
+        snapshot.queue_decay_rate = 0.0;
+        let recomputed = current_crypto_execution_score(&intent, &snapshot, None).unwrap();
+        let expected = compute_execution_score_bps(&build_execution_score(ExecutionScoreInputs {
+            raw_edge_bps: directional_raw_edge_bps(
+                &intent.side,
+                intent.model_prob,
+                snapshot.market_prob,
+            ),
+            spread_bps: snapshot.spread_bps,
+            aggressive_buy_ratio: snapshot.aggressive_buy_ratio,
+            quote_churn: snapshot.quote_churn,
+            size_ahead: snapshot.size_ahead_real.max(snapshot.size_ahead.max(1.0)),
+            trade_consumption_rate: 0.0,
+            cancel_rate: 0.0,
+            queue_decay_rate: 0.0,
+            seconds_to_expiry: f64::from(snapshot.seconds_to_expiry),
+            regime: ExpiryRegime::Mid,
+        }));
+        assert!((recomputed - expected).abs() < 1e-9);
+        assert!(recomputed > EXECUTION_SCORE_THRESHOLD_BPS);
+    }
+
+    #[test]
+    fn pending_intent_is_not_superseded_by_newer_blocked_decision() {
+        let replacement = storage::ReplacementDecisionCandidate {
+            decision_id: 2,
+            market_id: 1,
+            market_ticker: Some("KXBTC15M-TEST".to_string()),
+            approved: false,
+            created_at: Utc::now(),
+        };
+        assert!(!should_supersede_pending_intent(
+            1,
+            Some("KXBTC15M-TEST"),
+            &replacement
+        ));
+    }
+
+    #[test]
+    fn pending_intent_is_not_superseded_by_newer_approved_decision_for_different_market() {
+        let replacement = storage::ReplacementDecisionCandidate {
+            decision_id: 2,
+            market_id: 2,
+            market_ticker: Some("KXBTC15M-OTHER".to_string()),
+            approved: true,
+            created_at: Utc::now(),
+        };
+        assert!(!should_supersede_pending_intent(
+            1,
+            Some("KXBTC15M-TEST"),
+            &replacement
+        ));
+    }
+
+    #[test]
+    fn pending_intent_can_be_superseded_by_newer_approved_decision_for_same_market() {
+        let replacement = storage::ReplacementDecisionCandidate {
+            decision_id: 2,
+            market_id: 1,
+            market_ticker: Some("KXBTC15M-TEST".to_string()),
+            approved: true,
+            created_at: Utc::now(),
+        };
+        assert!(should_supersede_pending_intent(
+            1,
+            Some("KXBTC15M-TEST"),
+            &replacement
+        ));
+    }
+
+    #[test]
+    fn different_markets_in_same_lane_do_not_match_for_suppression() {
+        assert!(!same_market_identity(
+            1,
+            Some("KXBTC15M-TEST"),
+            2,
+            Some("KXBTC15M-OTHER"),
+        ));
+    }
+
+    #[test]
+    fn same_market_duplicate_still_matches_for_suppression() {
+        assert!(same_market_identity(
+            1,
+            Some("KXBTC15M-TEST"),
+            1,
+            Some("KXBTC15M-OTHER"),
+        ));
+        assert!(same_market_identity(
+            99,
+            Some("KXBTC15M-TEST"),
+            100,
+            Some("KXBTC15M-TEST"),
+        ));
     }
 
     #[test]

@@ -1,13 +1,17 @@
+#![recursion_limit = "256"]
+
 use anyhow::Result;
 use chrono::{Duration, Utc};
 use common::{
-    AppConfig, ExpiryRegime, MarketFamily, ModelInference, OpportunityDecision, PromotionState,
-    StrategyFamily, TradeMode, lane_key, lane_key_with_regime,
+    AppConfig, ExecutionScore, ExecutionScoreInputs, ExpiryRegime, MarketFamily, ModelInference,
+    OpportunityDecision, PromotionState, StrategyFamily, TradeMode, build_execution_score,
+    compute_execution_score_bps, directional_raw_edge_bps, estimate_fill_probability, lane_key,
+    lane_key_with_regime,
 };
 use market_data::{ContractSide, QueueSideSummary, QueueSnapshot};
 use market_models::{
-    BASELINE_LOGIT_V1, FeatureVector, TRAINED_LINEAR_CONTRARIAN_V1, TRAINED_LINEAR_V1,
-    run_model_with_weights,
+    BASELINE_LOGIT_V1, FeatureVector, SETTLEMENT_ANCHOR_V3, TRAINED_LINEAR_CONTRARIAN_V1,
+    TRAINED_LINEAR_V1, run_model_with_weights,
 };
 use redis::AsyncCommands;
 use serde_json::json;
@@ -28,14 +32,6 @@ struct TrainedDecisionPolicy {
     min_confidence: f64,
     min_venue_quality: f64,
     min_seconds_to_expiry_scaled: f64,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ExecutionScore {
-    raw_edge_bps: f64,
-    fill_probability: f64,
-    expected_slippage_bps: f64,
-    adverse_selection_bps: f64,
 }
 
 #[tokio::main]
@@ -179,7 +175,14 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
                 StrategyFamily::DirectionalSettlement,
                 &model_name,
             );
-            if let Some(last_created_at) = storage.latest_decision_at_for_lane(&lane).await? {
+            if let Some(last_created_at) = storage
+                .latest_decision_at_for_market(
+                    &lane,
+                    snapshot.market_id,
+                    Some(&snapshot.market_ticker),
+                )
+                .await?
+            {
                 if should_skip_recent_lane_decision(last_created_at, config.decision_poll_seconds) {
                     continue;
                 }
@@ -290,8 +293,15 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
             let decision_id = storage.insert_opportunity_decision(&decision).await?;
             decisions += 1;
             if approved
-                && !storage.has_open_trade_for_lane(&lane).await?
-                && !storage.has_active_execution_intent_for_lane(&lane).await?
+                && !storage
+                    .has_open_trade_for_market(snapshot.market_id, Some(&snapshot.market_ticker))
+                    .await?
+                && !storage
+                    .has_active_execution_intent_for_market(
+                        snapshot.market_id,
+                        Some(&snapshot.market_ticker),
+                    )
+                    .await?
             {
                 storage
                     .insert_execution_intent(
@@ -390,7 +400,8 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
         };
         let trained_policy = trained_artifact
             .as_ref()
-            .and_then(trained_policy_from_artifact);
+            .and_then(trained_policy_from_artifact)
+            .filter(|policy| !should_ignore_trained_policy(policy, regime));
         let model = run_model_with_weights(
             &model_name,
             &feature_vector,
@@ -428,6 +439,10 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
             .map(|policy| (policy.min_seconds_to_expiry_scaled * 900.0).round() as i64)
             .unwrap_or(120)
             .max(0);
+        let effective_min_confidence =
+            regime_adjusted_min_confidence(model_name.as_str(), regime, min_confidence);
+        let effective_min_seconds_to_expiry =
+            regime_adjusted_min_seconds_to_expiry(regime, min_seconds_to_expiry);
 
         let signed_edge = calibrated_probability_yes - snapshot.market_prob;
         let preview_side = if signed_edge >= 0.0 {
@@ -441,13 +456,14 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
             snapshot.market_prob,
         );
         let queue_snapshot = load_queue_snapshot(&mut redis, &snapshot.market_ticker).await?;
-        let execution_score = build_execution_score(
+        let execution_score = snapshot_execution_score(
             &snapshot,
             preview_side,
             raw_edge_bps,
             queue_snapshot.as_ref(),
+            regime,
         );
-        let current_execution_score = compute_execution_score(&execution_score);
+        let current_execution_score = compute_execution_score_bps(&execution_score);
         let edge = signed_edge;
         let side = if edge >= 0.0 { "buy_yes" } else { "buy_no" };
         let lane = lane_key_with_regime(
@@ -459,7 +475,10 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
             &model_name,
             Some(regime),
         );
-        if let Some(last_created_at) = storage.latest_decision_at_for_lane(&lane).await? {
+        if let Some(last_created_at) = storage
+            .latest_decision_at_for_market(&lane, snapshot.market_id, Some(&snapshot.market_ticker))
+            .await?
+        {
             if should_skip_recent_lane_decision(last_created_at, config.decision_poll_seconds) {
                 info!(
                     market_id = snapshot.market_id,
@@ -476,7 +495,7 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
         if edge.abs() < min_edge {
             reasons.push("edge_below_threshold".to_string());
         }
-        if model.confidence < min_confidence {
+        if model.confidence < effective_min_confidence {
             reasons.push("low_confidence".to_string());
         }
         if current_execution_score <= EXECUTION_SCORE_THRESHOLD_BPS {
@@ -485,7 +504,7 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
         if snapshot.venue_quality_score < min_venue_quality {
             reasons.push("low_venue_quality".to_string());
         }
-        if i64::from(snapshot.seconds_to_expiry) < min_seconds_to_expiry {
+        if i64::from(snapshot.seconds_to_expiry) < effective_min_seconds_to_expiry {
             reasons.push("too_close_to_expiry".to_string());
         }
         let promotion_state = effective_lane_policy.map(|policy| policy.promotion_state);
@@ -515,6 +534,7 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
             TradeMode::Live => live_remaining,
         };
         let theoretical_entry_price = contract_price_for_side(side, snapshot.market_prob);
+        let executable_entry_price = estimated_live_entry_price(&snapshot, side);
         let position_cap = (bankroll * max_position_pct_for_mode(config, intent_mode)).max(0.0);
         let execution_quality_multiplier = (current_execution_score / 100.0).clamp(0.15, 1.25);
         let raw_size = bankroll
@@ -555,17 +575,18 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
                     .get(&symbol_exposure_key)
                     .copied()
                     .unwrap_or_default();
+            let live_entry_price_for_gates = executable_entry_price.max(0.01);
             let lane_cap = (live_total_bankroll * config.live_max_lane_exposure_pct.max(0.0))
-                .max(theoretical_entry_price);
+                .max(live_entry_price_for_gates);
             let symbol_cap = (live_total_bankroll * config.live_max_symbol_exposure_pct.max(0.0))
-                .max(theoretical_entry_price);
+                .max(live_entry_price_for_gates);
             if lane_exposure + recommended_size > lane_cap + f64::EPSILON {
                 reasons.push("lane_exposure_cap".to_string());
             }
             if symbol_exposure + recommended_size > symbol_cap + f64::EPSILON {
                 reasons.push("symbol_exposure_cap".to_string());
             }
-            if live_contract_count(recommended_size, theoretical_entry_price) < 1.0 {
+            if live_contract_count(recommended_size, live_entry_price_for_gates) < 1.0 {
                 reasons.push("size_too_small_for_live_contract".to_string());
             }
         }
@@ -590,9 +611,9 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
                 "calibration_sample_count": calibration.as_ref().map(|row| row.sample_count),
                 "trained_artifact_sample_count": trained_artifact.as_ref().map(|artifact| artifact.sample_count),
                 "effective_min_edge": min_edge,
-                "effective_min_confidence": min_confidence,
+                "effective_min_confidence": effective_min_confidence,
                 "effective_min_venue_quality": min_venue_quality,
-                "effective_min_seconds_to_expiry": min_seconds_to_expiry,
+                "effective_min_seconds_to_expiry": effective_min_seconds_to_expiry,
                 "reference_yes_prob": snapshot.reference_yes_prob,
                 "reference_gap_bps": snapshot.reference_gap_bps,
                 "reference_price_change_bps": snapshot.reference_price_change_bps,
@@ -628,6 +649,8 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
                     TradeMode::Live => "live",
                 },
                 "live_drawdown_guard_active": live_drawdown_guard_active,
+                "theoretical_entry_price": theoretical_entry_price,
+                "estimated_live_entry_price": executable_entry_price,
             }),
         };
         storage.insert_model_inference(&inference).await?;
@@ -651,8 +674,15 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
         decisions += 1;
 
         if approved
-            && !storage.has_open_trade_for_lane(&lane).await?
-            && !storage.has_active_execution_intent_for_lane(&lane).await?
+            && !storage
+                .has_open_trade_for_market(snapshot.market_id, Some(&snapshot.market_ticker))
+                .await?
+            && !storage
+                .has_active_execution_intent_for_market(
+                    snapshot.market_id,
+                    Some(&snapshot.market_ticker),
+                )
+                .await?
         {
             let stop_conditions = vec![
                 "expiry_exit".to_string(),
@@ -704,7 +734,7 @@ async fn decide_once(config: &AppConfig, storage: &storage::Storage) -> Result<(
                             paper_contract_count(recommended_size, theoretical_entry_price)
                         }
                         TradeMode::Live => {
-                            live_contract_count(recommended_size, theoretical_entry_price)
+                            live_contract_count(recommended_size, executable_entry_price)
                         }
                     },
                     promotion_state,
@@ -756,8 +786,10 @@ fn select_decision_snapshots(
     features: Vec<common::MarketFeatureSnapshotRecord>,
 ) -> Vec<common::MarketFeatureSnapshotRecord> {
     let mut selected = Vec::new();
-    let mut front_crypto: HashMap<(String, i32), common::MarketFeatureSnapshotRecord> =
-        HashMap::new();
+    let mut front_crypto: HashMap<
+        (String, i32, Option<ExpiryRegime>),
+        common::MarketFeatureSnapshotRecord,
+    > = HashMap::new();
 
     for snapshot in features {
         if snapshot.market_family != MarketFamily::Crypto {
@@ -770,12 +802,13 @@ fn select_decision_snapshots(
         if snapshot.seconds_to_expiry > crypto_decision_horizon_seconds(snapshot.window_minutes) {
             continue;
         }
-        let key = (snapshot.symbol.to_lowercase(), snapshot.window_minutes);
+        let key = (
+            snapshot.symbol.to_lowercase(),
+            snapshot.window_minutes,
+            snapshot.expiry_regime,
+        );
         match front_crypto.get(&key) {
-            Some(existing)
-                if existing.seconds_to_expiry < snapshot.seconds_to_expiry
-                    || (existing.seconds_to_expiry == snapshot.seconds_to_expiry
-                        && existing.created_at >= snapshot.created_at) => {}
+            Some(existing) if !should_prefer_crypto_snapshot(existing, &snapshot) => {}
             _ => {
                 front_crypto.insert(key, snapshot);
             }
@@ -786,6 +819,51 @@ fn select_decision_snapshots(
     front_crypto_snapshots.sort_by(|left, right| right.created_at.cmp(&left.created_at));
     selected.extend(front_crypto_snapshots);
     selected
+}
+
+fn snapshot_staleness_rank(snapshot: &common::MarketFeatureSnapshotRecord) -> i32 {
+    snapshot
+        .market_data_age_seconds
+        .max(0)
+        .max(snapshot.reference_age_seconds.max(0))
+}
+
+fn snapshot_spread_rank_bps(snapshot: &common::MarketFeatureSnapshotRecord) -> f64 {
+    if snapshot.spread_bps > 0.0 {
+        snapshot.spread_bps
+    } else {
+        10_000.0
+    }
+}
+
+fn should_prefer_crypto_snapshot(
+    current: &common::MarketFeatureSnapshotRecord,
+    candidate: &common::MarketFeatureSnapshotRecord,
+) -> bool {
+    let current_staleness = snapshot_staleness_rank(current);
+    let candidate_staleness = snapshot_staleness_rank(candidate);
+    if candidate_staleness != current_staleness {
+        return candidate_staleness < current_staleness;
+    }
+
+    let venue_quality_cmp = candidate
+        .venue_quality_score
+        .total_cmp(&current.venue_quality_score);
+    if venue_quality_cmp != std::cmp::Ordering::Equal {
+        return venue_quality_cmp.is_gt();
+    }
+
+    let spread_cmp =
+        snapshot_spread_rank_bps(candidate).total_cmp(&snapshot_spread_rank_bps(current));
+    if spread_cmp != std::cmp::Ordering::Equal {
+        return spread_cmp.is_lt();
+    }
+
+    if candidate.seconds_to_expiry != current.seconds_to_expiry {
+        return candidate.seconds_to_expiry < current.seconds_to_expiry;
+    }
+
+    candidate.created_at > current.created_at
 }
 
 fn crypto_decision_horizon_seconds(window_minutes: i32) -> i32 {
@@ -843,6 +921,29 @@ fn trained_policy_from_artifact(
     })
 }
 
+fn should_ignore_trained_policy(policy: &TrainedDecisionPolicy, regime: Regime) -> bool {
+    regime != Regime::Late
+        && policy.min_edge >= 0.35
+        && policy.min_confidence >= 0.95
+        && policy.min_venue_quality >= 0.95
+        && policy.min_seconds_to_expiry_scaled >= 0.80
+}
+
+fn regime_adjusted_min_confidence(model_name: &str, regime: Regime, min_confidence: f64) -> f64 {
+    match regime {
+        Regime::Mid => min_confidence.min(0.25),
+        Regime::Early if model_name == SETTLEMENT_ANCHOR_V3 => min_confidence.min(0.25),
+        _ => min_confidence,
+    }
+}
+
+fn regime_adjusted_min_seconds_to_expiry(regime: Regime, min_seconds_to_expiry: i64) -> i64 {
+    match regime {
+        Regime::Mid => min_seconds_to_expiry.min(120),
+        _ => min_seconds_to_expiry,
+    }
+}
+
 fn uses_trained_linear_weights(model_name: &str) -> bool {
     matches!(model_name, TRAINED_LINEAR_V1 | TRAINED_LINEAR_CONTRARIAN_V1)
 }
@@ -876,6 +977,35 @@ fn contract_price_for_side(side: &str, market_prob: f64) -> f64 {
         (1.0 - market_prob).clamp(0.01, 0.99)
     } else {
         market_prob.clamp(0.01, 0.99)
+    }
+}
+
+fn contract_book_ask_for_side(snapshot: &common::MarketFeatureSnapshotRecord, side: &str) -> f64 {
+    let (best_bid, best_ask) = if side == "buy_no" {
+        (
+            (1.0 - snapshot.best_ask).clamp(0.01, 0.99),
+            (1.0 - snapshot.best_bid).clamp(0.01, 0.99),
+        )
+    } else {
+        (
+            snapshot.best_bid.clamp(0.01, 0.99),
+            snapshot.best_ask.clamp(0.01, 0.99),
+        )
+    };
+    best_ask.max(best_bid.min(best_ask))
+}
+
+fn estimated_live_entry_price(snapshot: &common::MarketFeatureSnapshotRecord, side: &str) -> f64 {
+    let theoretical = contract_price_for_side(side, snapshot.market_prob);
+    let executable = contract_book_ask_for_side(snapshot, side).clamp(0.01, 0.99);
+    if snapshot.best_bid <= 0.0
+        || snapshot.best_ask <= 0.0
+        || !executable.is_finite()
+        || executable <= 0.0
+    {
+        theoretical
+    } else {
+        executable
     }
 }
 
@@ -1060,71 +1190,42 @@ fn execution_score_queue_decay_rate(
         .max(0.0)
 }
 
-fn estimate_fill_probability(
-    size_ahead: f64,
-    trade_consumption_rate: f64,
-    cancel_rate: f64,
-    seconds_to_expiry: f64,
-) -> f64 {
-    let effective_rate = (trade_consumption_rate + cancel_rate).max(0.0);
-    if effective_rate <= f64::EPSILON {
-        return 0.0;
-    }
-    let expected_fill_time = size_ahead.max(1.0) / effective_rate;
-    if !expected_fill_time.is_finite() || expected_fill_time <= f64::EPSILON {
-        return 0.0;
-    }
-    (seconds_to_expiry / expected_fill_time).clamp(0.0, 1.0)
-}
-
-fn build_execution_score(
+fn snapshot_execution_score(
     snapshot: &common::MarketFeatureSnapshotRecord,
     side: &str,
     raw_edge_bps: f64,
     queue_snapshot: Option<&QueueSnapshot>,
+    regime: Regime,
 ) -> ExecutionScore {
-    let size_ahead = execution_score_size_ahead(snapshot, queue_snapshot, side);
-    let trade_consumption_rate =
-        execution_score_trade_consumption_rate(snapshot, queue_snapshot, side);
-    let cancel_rate = execution_score_cancel_rate(snapshot, queue_snapshot, side);
-    let queue_decay_rate = execution_score_queue_decay_rate(snapshot, queue_snapshot, side);
-    let fill_probability = estimate_fill_probability(
-        size_ahead,
-        trade_consumption_rate,
-        cancel_rate,
-        f64::from(snapshot.seconds_to_expiry.max(1)),
-    );
-    let expected_slippage_bps = snapshot.spread_bps * 0.5;
-    let adverse_selection_bps = (snapshot.aggressive_buy_ratio * snapshot.spread_bps)
-        + ((cancel_rate + queue_decay_rate) * 10.0)
-        + (snapshot.quote_churn * 5.0);
-    ExecutionScore {
+    build_execution_score(ExecutionScoreInputs {
         raw_edge_bps,
-        fill_probability,
-        expected_slippage_bps,
-        adverse_selection_bps,
-    }
-}
-
-fn compute_execution_score(s: &ExecutionScore) -> f64 {
-    (s.raw_edge_bps * s.fill_probability) - s.expected_slippage_bps - s.adverse_selection_bps
-}
-
-fn directional_raw_edge_bps(side: &str, model_prob: f64, market_prob: f64) -> f64 {
-    if side == "buy_no" {
-        ((market_prob - model_prob) * 10_000.0).max(0.0)
-    } else {
-        ((model_prob - market_prob) * 10_000.0).max(0.0)
-    }
+        spread_bps: snapshot.spread_bps,
+        aggressive_buy_ratio: snapshot.aggressive_buy_ratio,
+        quote_churn: snapshot.quote_churn,
+        size_ahead: execution_score_size_ahead(snapshot, queue_snapshot, side),
+        trade_consumption_rate: execution_score_trade_consumption_rate(
+            snapshot,
+            queue_snapshot,
+            side,
+        ),
+        cancel_rate: execution_score_cancel_rate(snapshot, queue_snapshot, side),
+        queue_decay_rate: execution_score_queue_decay_rate(snapshot, queue_snapshot, side),
+        seconds_to_expiry: f64::from(snapshot.seconds_to_expiry.max(1)),
+        regime,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        AppConfig, ExecutionScore, MarketFamily, PromotionState, Regime, TradeMode,
-        compute_execution_score, crypto_decision_horizon_seconds, directional_raw_edge_bps,
-        get_regime, live_contract_count, live_drawdown_triggered, max_position_pct_for_mode,
-        select_decision_snapshots, should_skip_recent_lane_decision, target_intent_mode,
+        AppConfig, ExecutionScore, MarketFamily, PromotionState, Regime, SETTLEMENT_ANCHOR_V3,
+        TradeMode, TrainedDecisionPolicy, compute_execution_score_bps,
+        crypto_decision_horizon_seconds, directional_raw_edge_bps, estimate_fill_probability,
+        estimated_live_entry_price, get_regime, live_contract_count, live_drawdown_triggered,
+        max_position_pct_for_mode, regime_adjusted_min_confidence,
+        regime_adjusted_min_seconds_to_expiry, select_decision_snapshots,
+        should_ignore_trained_policy, should_prefer_crypto_snapshot,
+        should_skip_recent_lane_decision, target_intent_mode,
     };
     use chrono::{Duration, Utc};
     use common::MarketFeatureSnapshotRecord;
@@ -1337,16 +1438,52 @@ mod tests {
     }
 
     #[test]
-    fn decision_selection_prefers_nearest_valid_crypto_market() {
+    fn decision_selection_keeps_one_crypto_market_per_regime_and_prefers_nearest_tradable_expiry() {
         let selected = select_decision_snapshots(vec![
             sample_snapshot(MarketFamily::Crypto, "xrp", "KXXRP15M-expired", 0, 0),
-            sample_snapshot(MarketFamily::Crypto, "xrp", "KXXRP15M-front", 389, 0),
-            sample_snapshot(MarketFamily::Crypto, "xrp", "KXXRP15M-next", 1_289, 0),
+            sample_snapshot(MarketFamily::Crypto, "xrp", "KXXRP15M-late", 45, 0),
+            sample_snapshot(MarketFamily::Crypto, "xrp", "KXXRP15M-mid-low", 90, 0),
+            sample_snapshot(MarketFamily::Crypto, "xrp", "KXXRP15M-mid-high", 240, 0),
+            sample_snapshot(MarketFamily::Crypto, "xrp", "KXXRP15M-early-low", 389, 0),
+            sample_snapshot(MarketFamily::Crypto, "xrp", "KXXRP15M-early-high", 1_289, 0),
             sample_snapshot(MarketFamily::Crypto, "xrp", "KXXRP15M-too-far", 5_000, 0),
         ]);
 
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].market_ticker, "KXXRP15M-front");
+        assert_eq!(selected.len(), 3);
+        assert!(
+            selected
+                .iter()
+                .any(|row| row.market_ticker == "KXXRP15M-late")
+        );
+        assert!(
+            selected
+                .iter()
+                .any(|row| row.market_ticker == "KXXRP15M-mid-low")
+        );
+        assert!(
+            selected
+                .iter()
+                .any(|row| row.market_ticker == "KXXRP15M-early-low")
+        );
+    }
+
+    #[test]
+    fn stale_but_newer_snapshot_does_not_beat_fresher_tradable_market() {
+        let mut fresher = sample_snapshot(MarketFamily::Crypto, "btc", "KXBTC15M-fresh", 420, -30);
+        fresher.market_data_age_seconds = 1;
+        fresher.reference_age_seconds = 1;
+        fresher.venue_quality_score = 0.75;
+        fresher.spread_bps = 120.0;
+
+        let mut stale_newer =
+            sample_snapshot(MarketFamily::Crypto, "btc", "KXBTC15M-stale", 405, 0);
+        stale_newer.market_data_age_seconds = 35;
+        stale_newer.reference_age_seconds = 35;
+        stale_newer.venue_quality_score = 0.80;
+        stale_newer.spread_bps = 90.0;
+
+        assert!(!should_prefer_crypto_snapshot(&fresher, &stale_newer));
+        assert!(should_prefer_crypto_snapshot(&stale_newer, &fresher));
     }
 
     #[test]
@@ -1367,6 +1504,34 @@ mod tests {
     }
 
     #[test]
+    fn live_size_gate_uses_executable_book_price_not_only_theoretical_price() {
+        let mut snapshot = sample_snapshot(MarketFamily::Crypto, "sol", "KXSOL15M-live", 240, 0);
+        snapshot.market_prob = 0.92;
+        snapshot.best_bid = 0.38;
+        snapshot.best_ask = 0.40;
+
+        let theoretical = super::contract_price_for_side("buy_yes", snapshot.market_prob);
+        let executable = estimated_live_entry_price(&snapshot, "buy_yes");
+
+        assert!(live_contract_count(0.50, theoretical) < 1.0);
+        assert!(live_contract_count(0.50, executable) >= 1.0);
+    }
+
+    #[test]
+    fn missing_book_for_live_gate_falls_back_to_theoretical_price() {
+        let mut snapshot = sample_snapshot(MarketFamily::Crypto, "eth", "KXETH15M-live", 240, 0);
+        snapshot.market_prob = 0.61;
+        snapshot.best_bid = 0.0;
+        snapshot.best_ask = 0.0;
+
+        let theoretical = super::contract_price_for_side("buy_yes", snapshot.market_prob);
+        assert_eq!(
+            estimated_live_entry_price(&snapshot, "buy_yes"),
+            theoretical
+        );
+    }
+
+    #[test]
     fn expiry_regime_split_matches_expected_buckets() {
         assert_eq!(get_regime(301), Regime::Early);
         assert_eq!(get_regime(120), Regime::Mid);
@@ -1375,19 +1540,69 @@ mod tests {
 
     #[test]
     fn execution_score_penalizes_bad_fill_and_slippage() {
-        let strong = compute_execution_score(&ExecutionScore {
+        let strong = compute_execution_score_bps(&ExecutionScore {
             raw_edge_bps: 90.0,
             fill_probability: 0.8,
             expected_slippage_bps: 10.0,
             adverse_selection_bps: 12.0,
         });
-        let weak = compute_execution_score(&ExecutionScore {
+        let weak = compute_execution_score_bps(&ExecutionScore {
             raw_edge_bps: 40.0,
             fill_probability: 0.2,
             expected_slippage_bps: 15.0,
             adverse_selection_bps: 12.0,
         });
         assert!(strong > weak);
+    }
+
+    #[test]
+    fn missing_microstructure_uses_regime_fallback_fill_probability() {
+        assert_eq!(
+            estimate_fill_probability(10.0, 0.0, 0.0, 600.0, Regime::Early),
+            0.55
+        );
+        assert_eq!(
+            estimate_fill_probability(10.0, 0.0, 0.0, 240.0, Regime::Mid),
+            0.35
+        );
+        assert_eq!(
+            estimate_fill_probability(10.0, 0.0, 0.0, 30.0, Regime::Late),
+            0.10
+        );
+    }
+
+    #[test]
+    fn abstain_policy_is_ignored_for_non_late_regimes() {
+        let abstain = TrainedDecisionPolicy {
+            min_edge: 0.35,
+            min_confidence: 0.97,
+            min_venue_quality: 0.95,
+            min_seconds_to_expiry_scaled: 0.80,
+        };
+        assert!(should_ignore_trained_policy(&abstain, Regime::Early));
+        assert!(should_ignore_trained_policy(&abstain, Regime::Mid));
+        assert!(!should_ignore_trained_policy(&abstain, Regime::Late));
+    }
+
+    #[test]
+    fn mid_regime_caps_confidence_and_expiry_thresholds() {
+        assert_eq!(
+            regime_adjusted_min_confidence("trained_linear_v1", Regime::Mid, 0.5),
+            0.25
+        );
+        assert_eq!(regime_adjusted_min_seconds_to_expiry(Regime::Mid, 450), 120);
+    }
+
+    #[test]
+    fn early_settlement_anchor_gets_modest_confidence_cap() {
+        assert_eq!(
+            regime_adjusted_min_confidence(SETTLEMENT_ANCHOR_V3, Regime::Early, 0.42),
+            0.25
+        );
+        assert_eq!(
+            regime_adjusted_min_confidence("trained_linear_v1", Regime::Early, 0.42),
+            0.42
+        );
     }
 
     #[test]

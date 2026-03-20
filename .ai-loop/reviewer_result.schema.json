@@ -1,0 +1,50 @@
+{
+  "type": "object",
+  "required": [
+    "critical_trade_blockers",
+    "probable_trade_blockers",
+    "suggested_patches",
+    "acceptance_tests",
+    "next_tranche",
+    "approved",
+    "status"
+  ],
+  "properties": {
+    "critical_trade_blockers": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "probable_trade_blockers": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "suggested_patches": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "acceptance_tests": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "next_tranche": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "approved": {
+      "type": "boolean"
+    },
+    "status": {
+      "type": "string"
+    }
+  }
+}

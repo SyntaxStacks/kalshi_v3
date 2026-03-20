@@ -1,0 +1,9 @@
+{
+  "approved_decisions": null,
+  "intents_inserted": null,
+  "execution_score_rejections": null,
+  "duplicate_suppression": null,
+  "trades_opened": null,
+  "updated_at": null,
+  "notes": "Populate from runtime or SQL queries when available."
+}

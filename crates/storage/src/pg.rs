@@ -8,7 +8,7 @@ use common::{
     LivePositionCard, LiveTradeExceptionCard, MarketFamily, MarketFeatureSnapshotRecord,
     ModelInference, OpenTradeSummary, OperatorActionEvent, OperatorControlState, OpportunityCard,
     OpportunityDecision, PromotionState, ReadinessSummary, ReplayBenchmarkCard, StrategyFamily,
-    TradeMode,
+    TradeMode, parse_lane_key,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -24,6 +24,7 @@ pub struct PendingExecutionIntent {
     pub intent_id: i64,
     pub decision_id: i64,
     pub market_id: i64,
+    pub market_ticker: Option<String>,
     pub market_family: MarketFamily,
     pub lane_key: String,
     pub strategy_family: StrategyFamily,
@@ -172,6 +173,15 @@ pub struct SymbolLanePolicy {
     pub recent_replay_expectancy: f64,
     pub quarantine_reason: Option<String>,
     pub current_champion_model: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReplacementDecisionCandidate {
+    pub decision_id: i64,
+    pub market_id: i64,
+    pub market_ticker: Option<String>,
+    pub approved: bool,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone)]
@@ -924,8 +934,8 @@ impl Storage {
                 where created_at >= now() - interval '72 hours'
                 order by market_id, created_at desc, id desc
             ),
-            front_crypto as (
-                select distinct on (symbol, window_minutes)
+            crypto_candidates as (
+                select
                     id,
                     market_id,
                     market_family,
@@ -943,7 +953,7 @@ impl Storage {
                 from latest
                 where market_family = 'crypto'
                   and seconds_to_expiry > 0
-                order by symbol, window_minutes, seconds_to_expiry asc, created_at desc, id desc
+                  and seconds_to_expiry <= greatest(window_minutes * 60 * 3, 45 * 60)
             ),
             other_latest as (
                 select
@@ -968,7 +978,7 @@ impl Storage {
             )
             select *
             from (
-                select * from front_crypto
+                select * from crypto_candidates
                 union all
                 select * from other_latest
             ) decision_feed
@@ -1067,6 +1077,47 @@ impl Storage {
         .fetch_optional(&self.pool)
         .await?;
         Ok(created_at)
+    }
+
+    pub async fn latest_decision_at_for_market(
+        &self,
+        lane_key: &str,
+        market_id: i64,
+        market_ticker: Option<&str>,
+    ) -> Result<Option<DateTime<Utc>>> {
+        let rows = sqlx::query_as::<_, RecentDecisionIdentityRow>(
+            r#"
+            select
+                od.market_id,
+                latest_snapshot.market_ticker,
+                od.created_at
+            from opportunity_decision od
+            left join lateral (
+                select venue_features_json->>'market_ticker' as market_ticker
+                from market_feature_snapshot mfs
+                where mfs.market_id = od.market_id
+                order by mfs.created_at desc, mfs.id desc
+                limit 1
+            ) latest_snapshot on true
+            where od.lane_key = $1
+            order by od.created_at desc, od.id desc
+            limit 64
+            "#,
+        )
+        .bind(lane_key)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .find(|row| {
+                market_identity_matches(
+                    row.market_id,
+                    row.market_ticker.as_deref(),
+                    market_id,
+                    market_ticker,
+                )
+            })
+            .map(|row| row.created_at))
     }
 
     pub async fn insert_model_inference(&self, inference: &ModelInference) -> Result<i64> {
@@ -1358,35 +1409,34 @@ impl Storage {
         expiry_regime: Option<ExpiryRegime>,
     ) -> Result<Option<SymbolLanePolicy>> {
         let pattern = format!("kalshi:{}:%", symbol.to_lowercase());
-        let family = match strategy_family {
-            StrategyFamily::DirectionalSettlement => "directional_settlement",
-            StrategyFamily::PreSettlementScalp => "pre_settlement_scalp",
-            StrategyFamily::Portfolio => "portfolio",
-        };
-        let row = sqlx::query_as::<_, LaneStateRow>(
+        let rows = sqlx::query_as::<_, LaneStateRow>(
             r#"
             select lane_key, market_family, promotion_state, promotion_reason, recent_pnl, recent_brier, recent_execution_quality,
                    recent_replay_expectancy, quarantine_reason, current_champion_model
             from lane_state
             where market_family = $1
               and lane_key like $2
-              and lane_key like $3
-              and (
-                    ($4::text is null and split_part(lane_key, ':', 7) = '')
-                    or split_part(lane_key, ':', 7) = $4
-                  )
               and current_champion_model is not null
-            order by updated_at desc
-            limit 1
+            order by updated_at desc, lane_key asc
+            limit 64
             "#,
         )
         .bind(SqlMarketFamily::from(market_family))
         .bind(pattern)
-        .bind(format!("%:{}:%", family))
-        .bind(expiry_regime.map(|value| value.as_key()))
-        .fetch_optional(&self.pool)
+        .fetch_all(&self.pool)
         .await?;
-        Ok(row.map(Into::into))
+        Ok(rows
+            .into_iter()
+            .find(|row| {
+                lane_policy_matches_request(
+                    &row.lane_key,
+                    market_family,
+                    symbol,
+                    strategy_family,
+                    expiry_regime,
+                )
+            })
+            .map(Into::into))
     }
 
     pub async fn latest_portfolio_bankroll(&self, mode: TradeMode) -> Result<Option<BankrollCard>> {
@@ -2254,6 +2304,32 @@ impl Storage {
         Ok(exists)
     }
 
+    pub async fn has_open_trade_for_market(
+        &self,
+        market_id: i64,
+        market_ticker: Option<&str>,
+    ) -> Result<bool> {
+        let exists = sqlx::query_scalar::<_, bool>(
+            r#"
+            select exists(
+                select 1
+                from trade_lifecycle
+                where closed_at is null
+                  and status not in ('closed', 'cancelled')
+                  and (
+                        market_id = $1
+                        or ($2::text is not null and market_ticker = $2)
+                  )
+            )
+            "#,
+        )
+        .bind(market_id)
+        .bind(market_ticker)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(exists)
+    }
+
     pub async fn has_active_execution_intent_for_lane(&self, lane_key: &str) -> Result<bool> {
         let exists = sqlx::query_scalar::<_, bool>(
             r#"
@@ -2270,6 +2346,73 @@ impl Storage {
         .fetch_one(&self.pool)
         .await?;
         Ok(exists)
+    }
+
+    pub async fn has_active_execution_intent_for_market(
+        &self,
+        market_id: i64,
+        market_ticker: Option<&str>,
+    ) -> Result<bool> {
+        let exists = sqlx::query_scalar::<_, bool>(
+            r#"
+            select exists(
+                select 1
+                from execution_intent ei
+                join opportunity_decision od on od.id = ei.decision_id
+                left join lateral (
+                    select venue_features_json->>'market_ticker' as market_ticker
+                    from market_feature_snapshot mfs
+                    where mfs.market_id = od.market_id
+                    order by mfs.created_at desc, mfs.id desc
+                    limit 1
+                ) latest_snapshot on true
+                where ei.status in ('pending', 'submitted', 'acknowledged', 'partially_filled', 'cancel_pending')
+                  and (
+                        od.market_id = $1
+                        or ($2::text is not null and coalesce(ei.market_ticker, latest_snapshot.market_ticker) = $2)
+                  )
+            )
+            "#,
+        )
+        .bind(market_id)
+        .bind(market_ticker)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(exists)
+    }
+
+    pub async fn latest_replacement_decision_for_lane(
+        &self,
+        lane_key: &str,
+        created_after: DateTime<Utc>,
+    ) -> Result<Option<ReplacementDecisionCandidate>> {
+        let row = sqlx::query_as::<_, ReplacementDecisionCandidateRow>(
+            r#"
+            select
+                od.id as decision_id,
+                od.market_id,
+                latest_snapshot.market_ticker,
+                od.approved,
+                od.created_at
+            from opportunity_decision od
+            left join lateral (
+                select venue_features_json->>'market_ticker' as market_ticker
+                from market_feature_snapshot mfs
+                where mfs.market_id = od.market_id
+                order by mfs.created_at desc, mfs.id desc
+                limit 1
+            ) latest_snapshot on true
+            where od.lane_key = $1
+              and od.created_at > $2
+            order by od.created_at desc, od.id desc
+            limit 1
+            "#,
+        )
+        .bind(lane_key)
+        .bind(created_after)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(Into::into))
     }
 
     pub async fn open_exposure_for_mode_and_lane(
@@ -2376,6 +2519,7 @@ impl Storage {
                 ei.id as intent_id,
                 ei.decision_id,
                 od.market_id,
+                coalesce(ei.market_ticker, latest_snapshot.market_ticker) as market_ticker,
                 od.market_family,
                 od.lane_key,
                 od.strategy_family,
@@ -2406,6 +2550,13 @@ impl Storage {
                 ei.created_at
             from execution_intent ei
             join opportunity_decision od on od.id = ei.decision_id
+            left join lateral (
+                select venue_features_json->>'market_ticker' as market_ticker
+                from market_feature_snapshot mfs
+                where mfs.market_id = od.market_id
+                order by mfs.created_at desc, mfs.id desc
+                limit 1
+            ) latest_snapshot on true
             left join trade_lifecycle tl on tl.decision_id = ei.decision_id
             where tl.id is null
               and ei.status = 'pending'
@@ -2429,6 +2580,7 @@ impl Storage {
                 ei.id as intent_id,
                 ei.decision_id,
                 od.market_id,
+                coalesce(ei.market_ticker, latest_snapshot.market_ticker) as market_ticker,
                 od.market_family,
                 od.lane_key,
                 od.strategy_family,
@@ -2459,6 +2611,13 @@ impl Storage {
                 ei.created_at
             from execution_intent ei
             join opportunity_decision od on od.id = ei.decision_id
+            left join lateral (
+                select venue_features_json->>'market_ticker' as market_ticker
+                from market_feature_snapshot mfs
+                where mfs.market_id = od.market_id
+                order by mfs.created_at desc, mfs.id desc
+                limit 1
+            ) latest_snapshot on true
             where ei.id = $1
             "#,
         )
@@ -4362,6 +4521,7 @@ struct PendingExecutionIntentRow {
     intent_id: i64,
     decision_id: i64,
     market_id: i64,
+    market_ticker: Option<String>,
     market_family: SqlMarketFamily,
     lane_key: String,
     strategy_family: SqlStrategyFamily,
@@ -4389,6 +4549,22 @@ struct PendingExecutionIntentRow {
     terminal_outcome: Option<String>,
     promotion_state_at_creation: Option<String>,
     stop_conditions_json: serde_json::Value,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+struct ReplacementDecisionCandidateRow {
+    decision_id: i64,
+    market_id: i64,
+    market_ticker: Option<String>,
+    approved: bool,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+struct RecentDecisionIdentityRow {
+    market_id: i64,
+    market_ticker: Option<String>,
     created_at: DateTime<Utc>,
 }
 
@@ -5154,6 +5330,7 @@ impl From<PendingExecutionIntentRow> for PendingExecutionIntent {
             intent_id: value.intent_id,
             decision_id: value.decision_id,
             market_id: value.market_id,
+            market_ticker: value.market_ticker,
             market_family: value.market_family.into(),
             lane_key: value.lane_key,
             strategy_family: value.strategy_family.into(),
@@ -5193,6 +5370,18 @@ impl From<PendingExecutionIntentRow> for PendingExecutionIntent {
                         .collect()
                 })
                 .unwrap_or_default(),
+            created_at: value.created_at,
+        }
+    }
+}
+
+impl From<ReplacementDecisionCandidateRow> for ReplacementDecisionCandidate {
+    fn from(value: ReplacementDecisionCandidateRow) -> Self {
+        Self {
+            decision_id: value.decision_id,
+            market_id: value.market_id,
+            market_ticker: value.market_ticker,
+            approved: value.approved,
             created_at: value.created_at,
         }
     }
@@ -5546,6 +5735,54 @@ fn parse_expiry_regime(value: &str) -> Option<ExpiryRegime> {
         "late" => Some(ExpiryRegime::Late),
         _ => None,
     }
+}
+
+fn strategy_family_key(value: StrategyFamily) -> &'static str {
+    match value {
+        StrategyFamily::DirectionalSettlement => "directional_settlement",
+        StrategyFamily::PreSettlementScalp => "pre_settlement_scalp",
+        StrategyFamily::Portfolio => "portfolio",
+    }
+}
+
+fn market_identity_matches(
+    row_market_id: i64,
+    row_market_ticker: Option<&str>,
+    target_market_id: i64,
+    target_market_ticker: Option<&str>,
+) -> bool {
+    row_market_id == target_market_id
+        || matches!(
+            (row_market_ticker, target_market_ticker),
+            (Some(left), Some(right)) if !left.trim().is_empty() && left == right
+        )
+}
+
+fn lane_policy_matches_request(
+    lane_key: &str,
+    market_family: MarketFamily,
+    symbol: &str,
+    strategy_family: StrategyFamily,
+    expiry_regime: Option<ExpiryRegime>,
+) -> bool {
+    if market_family == MarketFamily::All {
+        return false;
+    }
+    let Some(parsed) = parse_lane_key(lane_key) else {
+        return false;
+    };
+    // Lane policy is intentionally shared across sides for now. We validate symbol/family/regime
+    // exactly, but do not require a side match so readiness/champion state can apply to both
+    // `buy_yes` and `buy_no` lanes without brittle SQL text slicing.
+    parsed.exchange == "kalshi"
+        && parsed.symbol == symbol.to_lowercase()
+        && parsed.strategy_family == strategy_family_key(strategy_family)
+        && parsed.expiry_regime == expiry_regime
+}
+
+#[cfg(test)]
+fn crypto_decision_horizon_seconds(window_minutes: i32) -> i32 {
+    (window_minutes.max(1) * 60 * 3).max(45 * 60)
 }
 
 fn parse_promotion_state(value: &str) -> PromotionState {
@@ -6263,14 +6500,15 @@ mod tests {
         LiveExecutionQualityRow, LiveLaneExecutionTruthRow, ReplayExecutionQualityRow,
         ReplayLaneExecutionTruthRow, SqlMarketFamily, build_lane_execution_truth_summaries,
         compare_call_to_outcome, derive_model_call, derive_resolved_outcome,
-        derive_trade_audit_note, derive_trade_call, opportunity_card_freshness_window,
+        derive_trade_audit_note, derive_trade_call, lane_policy_matches_request,
+        market_identity_matches, opportunity_card_freshness_window,
         summarize_family_execution_truth, summarize_live_execution_quality,
         summarize_replay_execution_quality,
     };
     use chrono::Utc;
     use common::{
-        LaneState, LaneTruthRecommendationPolicy, LaneTruthThresholdBand, MarketFamily,
-        PromotionState,
+        ExpiryRegime, LaneState, LaneTruthRecommendationPolicy, LaneTruthThresholdBand,
+        MarketFamily, PromotionState, StrategyFamily, lane_key_with_regime,
     };
 
     fn lane_state(lane_key: &str, promotion_state: PromotionState) -> LaneState {
@@ -6606,5 +6844,67 @@ mod tests {
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].status, "insufficient_sample");
         assert!(!summaries[0].live_sample_sufficient);
+    }
+
+    #[test]
+    fn crypto_snapshot_horizon_matches_decision_feed_limit() {
+        assert_eq!(super::crypto_decision_horizon_seconds(15), 2_700);
+        assert_eq!(super::crypto_decision_horizon_seconds(5), 2_700);
+    }
+
+    #[test]
+    fn market_identity_matches_same_market_and_rejects_different_market() {
+        assert!(market_identity_matches(
+            42,
+            Some("KXBTC15M-TEST"),
+            42,
+            Some("KXBTC15M-OTHER"),
+        ));
+        assert!(market_identity_matches(
+            1,
+            Some("KXBTC15M-TEST"),
+            2,
+            Some("KXBTC15M-TEST"),
+        ));
+        assert!(!market_identity_matches(
+            1,
+            Some("KXBTC15M-TEST"),
+            2,
+            Some("KXBTC15M-OTHER"),
+        ));
+    }
+
+    #[test]
+    fn lane_policy_lookup_helper_matches_symbol_family_and_regime_without_brittle_split_part() {
+        let lane = lane_key_with_regime(
+            "kalshi",
+            "btc",
+            15,
+            "buy_yes",
+            StrategyFamily::DirectionalSettlement,
+            "trained_linear_v1",
+            Some(ExpiryRegime::Early),
+        );
+        assert!(lane_policy_matches_request(
+            &lane,
+            MarketFamily::Crypto,
+            "btc",
+            StrategyFamily::DirectionalSettlement,
+            Some(ExpiryRegime::Early),
+        ));
+        assert!(!lane_policy_matches_request(
+            &lane,
+            MarketFamily::Crypto,
+            "btc",
+            StrategyFamily::DirectionalSettlement,
+            Some(ExpiryRegime::Mid),
+        ));
+        assert!(!lane_policy_matches_request(
+            &lane,
+            MarketFamily::Crypto,
+            "eth",
+            StrategyFamily::DirectionalSettlement,
+            Some(ExpiryRegime::Early),
+        ));
     }
 }
