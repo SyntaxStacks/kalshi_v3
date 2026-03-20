@@ -22,6 +22,7 @@ CODEX_RESULT_FILE = ROOT / "codex_result.json"
 REVIEWER_RESULT_FILE = ROOT / "reviewer_result.json"
 METRICS_SNAPSHOT_FILE = ROOT / "metrics_snapshot.json"
 NEEDS_INPUT_FILE = ROOT / "NEEDS_INPUT.md"
+LOOP_STATE_FILE = ROOT / "loop_state.json"
 CONFIG_FILE = ROOT / "config.json"
 CONFIG_EXAMPLE_FILE = ROOT / "config.example.json"
 CODEX_SCHEMA_FILE = ROOT / "codex_result.schema.json"
@@ -52,6 +53,13 @@ def write_json_file(path: pathlib.Path, payload: Any) -> None:
 
 def write_text_file(path: pathlib.Path, body: str) -> None:
     path.write_text(body, encoding="utf-8")
+
+
+def clear_file(path: pathlib.Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
 
 
 def load_config() -> dict[str, Any]:
@@ -93,6 +101,29 @@ def load_config() -> dict[str, Any]:
         ),
     }
     return config
+
+
+def write_loop_state(
+    status: str,
+    *,
+    iteration: int | None = None,
+    details: str = "",
+    needs_input: bool = False,
+    codex_status: str = "",
+    files_changed: int | None = None,
+    verification: list[Any] | None = None,
+) -> None:
+    payload = {
+        "updated_at": utc_now(),
+        "status": status,
+        "iteration": iteration,
+        "details": details,
+        "needs_input": needs_input,
+        "codex_status": codex_status,
+        "files_changed": files_changed,
+        "verification": verification or [],
+    }
+    write_json_file(LOOP_STATE_FILE, payload)
 
 
 def render_command(template: str, **values: str) -> str:
@@ -251,6 +282,11 @@ def write_needs_input(reason: str, details: str) -> None:
         f"{details}\n"
     )
     write_text_file(NEEDS_INPUT_FILE, body)
+    write_loop_state(
+        "needs_input",
+        details=reason,
+        needs_input=True,
+    )
 
 
 def summarize_test_verification(verification: list[Any]) -> str:
@@ -271,6 +307,8 @@ def loop() -> int:
     config = load_config()
     repo_path = pathlib.Path(config["repo_path"]).resolve()
     operator_input = read_operator_input()
+    clear_file(NEEDS_INPUT_FILE)
+    write_loop_state("starting", details="Preparing loop run.")
 
     if operator_input["stop"]:
         write_needs_input("operator_stop", "Operator requested stop via `.ai-loop/operator_input.json`.")
@@ -288,6 +326,7 @@ def loop() -> int:
         config["discord_webhook_url"],
         f"AI loop started{branch_note}. max_iterations={config['max_iterations']}",
     )
+    write_loop_state("running", details="Loop started.", iteration=0)
 
     for iteration in range(1, int(config["max_iterations"]) + 1):
         prompt_file = LOGS_DIR / f"iteration-{iteration:02d}-codex-prompt.txt"
@@ -300,6 +339,11 @@ def loop() -> int:
         write_text_file(
             prompt_file,
             build_codex_prompt(spec_body, operator_input, CODEX_SCHEMA_FILE),
+        )
+        write_loop_state(
+            "running",
+            iteration=iteration,
+            details="Running Codex pass.",
         )
         codex_command = render_command(
             config["codex_command"],
@@ -350,6 +394,14 @@ def loop() -> int:
                 f"files={len(codex_result.get('files_changed', []))} "
                 f"verification={summarize_test_verification(codex_result.get('verification', []))}"
             ),
+        )
+        write_loop_state(
+            "running",
+            iteration=iteration,
+            details="Codex pass completed.",
+            codex_status=str(codex_result.get("status") or ""),
+            files_changed=len(codex_result.get("files_changed", [])),
+            verification=list(codex_result.get("verification") or []),
         )
 
         reviewer_result: dict[str, Any] | None = None
@@ -426,6 +478,15 @@ def loop() -> int:
             return 0
 
         if should_stop_from_reviewer(reviewer_result):
+            clear_file(NEEDS_INPUT_FILE)
+            write_loop_state(
+                "completed",
+                iteration=iteration,
+                details="Reviewer reports no critical blockers in scope.",
+                codex_status=str(codex_result.get("status") or ""),
+                files_changed=len(codex_result.get("files_changed", [])),
+                verification=list(codex_result.get("verification") or []),
+            )
             post_discord(
                 config["discord_webhook_url"],
                 f"AI loop finished at iteration {iteration}: reviewer reports no critical blockers in scope.",
@@ -433,6 +494,15 @@ def loop() -> int:
             return 0
 
         if not reviewer_command and codex_result.get("status") == "completed":
+            clear_file(NEEDS_INPUT_FILE)
+            write_loop_state(
+                "completed",
+                iteration=iteration,
+                details="Codex completed and no reviewer is configured.",
+                codex_status=str(codex_result.get("status") or ""),
+                files_changed=len(codex_result.get("files_changed", [])),
+                verification=list(codex_result.get("verification") or []),
+            )
             post_discord(
                 config["discord_webhook_url"],
                 f"AI loop finished at iteration {iteration}: Codex completed and no reviewer is configured.",

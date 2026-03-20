@@ -4,6 +4,16 @@
 /.sqlx/
 /logs/
 /**/*.log
+/.ai-loop/logs/
+/.ai-loop/__pycache__/
+/.ai-loop/**/*.pyc
+/.ai-loop/codex_result.json
+/.ai-loop/reviewer_result.json
+/.ai-loop/operator_input.json
+/.ai-loop/NEEDS_INPUT.md
+/.ai-loop/run_loop.pid
+/.ai-loop/loop_state.json
+/.ai-loop/discord_operator.state.json
 /tmp/
 /.runtime/
 /.DS_Store

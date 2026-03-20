@@ -5,5 +5,9 @@
   "codex_command": "type \"{prompt_file}\" | \"C:\\nvm4w\\nodejs\\codex.CMD\" exec -C \"{repo_path}\" --dangerously-bypass-approvals-and-sandbox -o \"{output_file}\" -",
   "reviewer_command": "",
   "branch_name": "",
-  "auto_push": false
+  "auto_push": false,
+  "loop_notifications_enabled": true,
+  "loop_poll_interval_seconds": 15,
+  "idle_improvement_enabled": true,
+  "idle_check_interval_seconds": 180
 }

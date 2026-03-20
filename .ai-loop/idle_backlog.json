@@ -1,0 +1,31 @@
+[
+  {
+    "id": "profit-funnel-audit",
+    "enabled": true,
+    "priority": 10,
+    "cooldown_minutes": 240,
+    "max_runs": 1,
+    "review_spec_path": ".ai-loop/idle_specs/profit-funnel-audit.md",
+    "operator_note": "Idle run: audit approved->intent->trade funnel for profit blockers.",
+    "description": "Find funnel leaks that suppress profitable trades between approval and trade open.",
+    "when": {
+      "paper_trading_enabled": true,
+      "live_sample_sufficient": false,
+      "max_recent_live_terminal_intents": 5
+    }
+  },
+  {
+    "id": "blocked-opportunity-audit",
+    "enabled": true,
+    "priority": 20,
+    "cooldown_minutes": 240,
+    "max_runs": 1,
+    "review_spec_path": ".ai-loop/idle_specs/blocked-opportunity-audit.md",
+    "operator_note": "Idle run: inspect blocked opportunity reasons for false negatives.",
+    "description": "Rank blocked opportunity reasons and remove false-negative policy friction that suppresses profitable setups.",
+    "when": {
+      "paper_trading_enabled": true,
+      "replay_sample_sufficient": true
+    }
+  }
+]

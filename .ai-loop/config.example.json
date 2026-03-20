@@ -5,5 +5,9 @@
   "codex_command": "codex exec --cwd {repo_path} --output-file {output_file} --input-file {prompt_file}",
   "reviewer_command": "",
   "branch_name": "",
-  "auto_push": false
+  "auto_push": false,
+  "loop_notifications_enabled": true,
+  "loop_poll_interval_seconds": 15,
+  "idle_improvement_enabled": true,
+  "idle_check_interval_seconds": 180
 }

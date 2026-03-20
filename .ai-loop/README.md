@@ -27,8 +27,12 @@ Discord is notification-only here. A plain webhook cannot receive replies back i
   - optional runtime metrics scaffold
 - `NEEDS_INPUT.md`
   - written when the loop pauses for human action
+- `loop_state.json`
+  - current loop state used by the Discord bot for proactive notifications
 - `logs/`
   - stdout/stderr and prompt files for each iteration
+- `idle_backlog.json`
+  - deterministic backlog of profit-focused idle tranches
 - `discord_operator.py`
   - optional host-side Discord bot for `kalshi-v3` runtime + loop control
 - `requirements.txt`
@@ -101,6 +105,18 @@ Current commands:
   - writes operator notes first, then launches the loop
 - `/ai stop_loop`
   - writes `.ai-loop/operator_input.json` with `stop=true`
+
+Proactive behavior:
+- the bot watches `loop_state.json` and pushes loop updates into the allowed Discord channel
+- when enabled, the bot also checks `idle_backlog.json` and can launch the next profit-focused tranche automatically when:
+  - no loop is currently running
+  - `NEEDS_INPUT.md` is absent
+  - the repo worktree is clean
+
+Idle improvement is intentionally bounded:
+- it only launches specs from `idle_backlog.json`
+- each entry has deterministic conditions, cooldown, and max-runs
+- it does not invent new scope on its own
 
 ## Human Input
 
