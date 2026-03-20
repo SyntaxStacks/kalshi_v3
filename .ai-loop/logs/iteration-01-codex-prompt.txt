@@ -1,0 +1,47 @@
+You are running a bounded implementation pass for kalshi-v3.
+
+Rules:
+- Work only within the repo scope described below.
+- Return JSON only.
+- The JSON must validate against the schema file path below.
+- Do not include markdown fences.
+- Set needs_input=true only if human clarification is actually required.
+
+Schema file: C:\code\kalshi-v3\.ai-loop\codex_result.schema.json
+
+Operator input:
+{
+  "approved": true,
+  "notes": "",
+  "scope_adjustments": [],
+  "stop": false
+}
+
+Current tranche spec:
+# Active Tranche Spec
+
+Use this file as the only active implementation tranche for the local AI loop.
+
+## Goal
+
+Describe the single current tranche clearly.
+
+## Scope
+
+- list exact files or modules in scope
+- list exact failure modes to fix
+- list what must not change
+
+## Acceptance Criteria
+
+- list the tests or behaviors that must hold
+
+## Deliverable Format
+
+- list the exact JSON/report fields the Codex pass must return
+
+## Notes
+
+- keep this file narrowly scoped
+- prefer one tranche at a time
+
