@@ -1,8 +1,8 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use common::{
-    BankrollCard, DashboardSnapshot, ExecutionQualitySummary, ExpiryRegime,
-    FamilyExecutionTruthSummary, LaneExecutionTruthSummary, LaneInspectionSnapshot,
+    BankrollCard, ClosedTradeAuditSummary, DashboardSnapshot, ExecutionQualitySummary,
+    ExpiryRegime, FamilyExecutionTruthSummary, LaneExecutionTruthSummary, LaneInspectionSnapshot,
     LaneReplaySummary, LaneState, LaneTradeCard, LaneTruthRecommendationPolicy,
     LiveExceptionSnapshot, LiveExchangeSyncSummary, LiveFillCard, LiveIntentCard, LiveOrderCard,
     LivePositionCard, LiveTradeExceptionCard, MarketFamily, MarketFeatureSnapshotRecord,
@@ -398,6 +398,7 @@ impl Storage {
         let bankrolls = self.list_latest_bankrolls(family).await?;
         let lanes = self.list_lane_states(family).await?;
         let open_trades = self.list_open_trades(family).await?;
+        let closed_trades = self.list_recent_closed_trade_audits(family, 12).await?;
         let opportunities = self.list_latest_opportunities(family, 6).await?;
         let execution_quality = self.execution_quality_summary(family).await?;
         let lane_execution_truth = self
@@ -422,6 +423,7 @@ impl Storage {
             bankrolls,
             readiness,
             open_trades,
+            closed_trades,
             opportunities,
             execution_quality,
             family_execution_truth,
@@ -3760,6 +3762,77 @@ impl Storage {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    async fn list_recent_closed_trade_audits(
+        &self,
+        family: Option<MarketFamily>,
+        limit: i64,
+    ) -> Result<Vec<ClosedTradeAuditSummary>> {
+        let rows = sqlx::query_as::<_, ClosedTradeAuditRow>(
+            r#"
+            select
+                tl.id,
+                tl.lane_key,
+                tl.market_family,
+                tl.strategy_family,
+                tl.mode,
+                coalesce(
+                    tl.market_ticker,
+                    latest_snapshot.market_ticker,
+                    tl.metadata_json->>'market_ticker'
+                ) as market_ticker,
+                coalesce(
+                    tl.metadata_json->>'market_title',
+                    latest_snapshot.market_title
+                ) as market_title,
+                latest_snapshot.weather_city as weather_city,
+                latest_snapshot.weather_contract_kind as weather_contract_kind,
+                latest_snapshot.weather_market_date as weather_market_date,
+                latest_snapshot.weather_strike_type as weather_strike_type,
+                (latest_snapshot.weather_floor_strike)::double precision as weather_floor_strike,
+                (latest_snapshot.weather_cap_strike)::double precision as weather_cap_strike,
+                coalesce(tl.side, od.side) as side,
+                tl.quantity,
+                tl.entry_price,
+                tl.exit_price,
+                tl.realized_pnl,
+                tl.status,
+                tl.created_at,
+                tl.closed_at,
+                od.model_prob,
+                od.market_prob,
+                od.confidence,
+                od.edge
+            from trade_lifecycle tl
+            left join opportunity_decision od on od.id = tl.decision_id
+            left join lateral (
+                select
+                    venue_features_json->>'market_ticker' as market_ticker,
+                    venue_features_json->>'market_title' as market_title,
+                    settlement_features_json->>'weather_city' as weather_city,
+                    settlement_features_json->>'weather_contract_kind' as weather_contract_kind,
+                    settlement_features_json->>'weather_market_date' as weather_market_date,
+                    settlement_features_json->>'weather_strike_type' as weather_strike_type,
+                    settlement_features_json->>'weather_floor_strike' as weather_floor_strike,
+                    settlement_features_json->>'weather_cap_strike' as weather_cap_strike
+                from market_feature_snapshot mfs
+                where mfs.market_id = tl.market_id
+                order by mfs.created_at desc, mfs.id desc
+                limit 1
+            ) latest_snapshot on true
+            where tl.closed_at is not null
+              and ($1::text is null or tl.market_family = $1)
+            order by tl.closed_at desc, tl.id desc
+            limit $2
+            "#,
+        )
+        .bind(family.map(|value| SqlMarketFamily::from(value).as_key().to_string()))
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
     async fn list_latest_opportunities(
         &self,
         family: Option<MarketFamily>,
@@ -4077,6 +4150,35 @@ struct OpenTradeRow {
     entry_price: f64,
     created_at: DateTime<Utc>,
     status: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct ClosedTradeAuditRow {
+    id: i64,
+    lane_key: String,
+    market_family: SqlMarketFamily,
+    strategy_family: SqlStrategyFamily,
+    mode: SqlTradeMode,
+    market_ticker: Option<String>,
+    market_title: Option<String>,
+    weather_city: Option<String>,
+    weather_contract_kind: Option<String>,
+    weather_market_date: Option<String>,
+    weather_strike_type: Option<String>,
+    weather_floor_strike: Option<f64>,
+    weather_cap_strike: Option<f64>,
+    side: Option<String>,
+    quantity: f64,
+    entry_price: f64,
+    exit_price: Option<f64>,
+    realized_pnl: Option<f64>,
+    status: String,
+    created_at: DateTime<Utc>,
+    closed_at: Option<DateTime<Utc>>,
+    model_prob: Option<f64>,
+    market_prob: Option<f64>,
+    confidence: Option<f64>,
+    edge: Option<f64>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -4732,6 +4834,79 @@ impl From<LaneStateRow> for SymbolLanePolicy {
     }
 }
 
+fn derive_model_call(model_prob: Option<f64>) -> Option<String> {
+    model_prob.map(|value| {
+        if value >= 0.5 {
+            "yes".to_string()
+        } else {
+            "no".to_string()
+        }
+    })
+}
+
+fn derive_trade_call(side: Option<&str>) -> Option<String> {
+    match side.unwrap_or_default().to_ascii_lowercase().as_str() {
+        "buy_yes" => Some("yes".to_string()),
+        "buy_no" => Some("no".to_string()),
+        _ => None,
+    }
+}
+
+fn derive_resolved_outcome(
+    status: &str,
+    side: Option<&str>,
+    exit_price: Option<f64>,
+) -> Option<String> {
+    if status != "market_result_reconcile" {
+        return None;
+    }
+    let is_yes_side = matches!(
+        side.unwrap_or_default().to_ascii_lowercase().as_str(),
+        "buy_yes"
+    );
+    exit_price.map(|price| {
+        let resolved_yes = if is_yes_side {
+            price >= 0.5
+        } else {
+            price < 0.5
+        };
+        if resolved_yes {
+            "yes".to_string()
+        } else {
+            "no".to_string()
+        }
+    })
+}
+
+fn compare_call_to_outcome(call: Option<&str>, outcome: Option<&str>) -> Option<bool> {
+    match (call, outcome) {
+        (Some(call), Some(outcome)) => Some(call == outcome),
+        _ => None,
+    }
+}
+
+fn derive_trade_audit_note(
+    status: &str,
+    has_resolved_outcome: bool,
+    model_prob: Option<f64>,
+) -> Option<String> {
+    if has_resolved_outcome {
+        return Some("Final outcome came from actual settlement truth.".to_string());
+    }
+    match status {
+        "stale_trade_reconcile" => Some(
+            "Closed flat because the paper stale safeguard fired before final settlement truth was available.".to_string(),
+        ),
+        "pre_expiry_flatten" | "timeout_exit" | "expiry_reconcile" => Some(
+            "Strategy/process exit. This trade closed before final market settlement, so model-vs-outcome remains diagnostic only.".to_string(),
+        ),
+        _ if model_prob.is_none() => Some(
+            "No originating decision probability was available for this trade.".to_string(),
+        ),
+        _ => None,
+    }
+}
+
 impl From<OpenTradeRow> for OpenTradeSummary {
     fn from(value: OpenTradeRow) -> Self {
         Self {
@@ -4752,6 +4927,55 @@ impl From<OpenTradeRow> for OpenTradeSummary {
             entry_price: value.entry_price,
             created_at: value.created_at,
             status: value.status,
+        }
+    }
+}
+
+impl From<ClosedTradeAuditRow> for ClosedTradeAuditSummary {
+    fn from(value: ClosedTradeAuditRow) -> Self {
+        let resolved_outcome =
+            derive_resolved_outcome(&value.status, value.side.as_deref(), value.exit_price);
+        let model_call = derive_model_call(value.model_prob);
+        let trade_call = derive_trade_call(value.side.as_deref());
+        let model_call_correct =
+            compare_call_to_outcome(model_call.as_deref(), resolved_outcome.as_deref());
+        let trade_call_correct =
+            compare_call_to_outcome(trade_call.as_deref(), resolved_outcome.as_deref());
+        let audit_note =
+            derive_trade_audit_note(&value.status, resolved_outcome.is_some(), value.model_prob);
+
+        Self {
+            trade_id: value.id,
+            lane_key: value.lane_key,
+            market_family: value.market_family.into(),
+            strategy_family: value.strategy_family.into(),
+            mode: value.mode.into(),
+            market_ticker: value.market_ticker,
+            market_title: value.market_title,
+            weather_city: value.weather_city,
+            weather_contract_kind: value.weather_contract_kind,
+            weather_market_date: value.weather_market_date,
+            weather_strike_type: value.weather_strike_type,
+            weather_floor_strike: value.weather_floor_strike,
+            weather_cap_strike: value.weather_cap_strike,
+            side: value.side,
+            quantity: value.quantity,
+            entry_price: value.entry_price,
+            exit_price: value.exit_price,
+            realized_pnl: value.realized_pnl,
+            status: value.status,
+            created_at: value.created_at,
+            closed_at: value.closed_at,
+            predicted_yes_probability: value.model_prob,
+            market_yes_probability_at_entry: value.market_prob,
+            confidence: value.confidence,
+            edge: value.edge,
+            model_call,
+            trade_call,
+            resolved_outcome,
+            model_call_correct,
+            trade_call_correct,
+            audit_note,
         }
     }
 }
@@ -6038,8 +6262,10 @@ mod tests {
     use super::{
         LiveExecutionQualityRow, LiveLaneExecutionTruthRow, ReplayExecutionQualityRow,
         ReplayLaneExecutionTruthRow, SqlMarketFamily, build_lane_execution_truth_summaries,
-        opportunity_card_freshness_window, summarize_family_execution_truth,
-        summarize_live_execution_quality, summarize_replay_execution_quality,
+        compare_call_to_outcome, derive_model_call, derive_resolved_outcome,
+        derive_trade_audit_note, derive_trade_call, opportunity_card_freshness_window,
+        summarize_family_execution_truth, summarize_live_execution_quality,
+        summarize_replay_execution_quality,
     };
     use chrono::Utc;
     use common::{
@@ -6154,6 +6380,31 @@ mod tests {
         );
         assert_eq!(summary.recent_live_filled_quantity_ratio, Some(10.0 / 15.0));
         assert_eq!(summary.recent_live_actual_fill_hit_rate, Some(1.0));
+    }
+
+    #[test]
+    fn closed_trade_audit_derives_outcome_and_call_correctness() {
+        assert_eq!(derive_model_call(Some(0.71)).as_deref(), Some("yes"));
+        assert_eq!(derive_trade_call(Some("buy_no")).as_deref(), Some("no"));
+        assert_eq!(
+            derive_resolved_outcome("market_result_reconcile", Some("buy_no"), Some(1.0))
+                .as_deref(),
+            Some("no")
+        );
+        assert_eq!(compare_call_to_outcome(Some("no"), Some("no")), Some(true));
+    }
+
+    #[test]
+    fn closed_trade_audit_keeps_stale_reconcile_diagnostic_only() {
+        assert_eq!(
+            derive_resolved_outcome("stale_trade_reconcile", Some("buy_yes"), Some(1.0)),
+            None
+        );
+        assert!(
+            derive_trade_audit_note("stale_trade_reconcile", false, Some(0.62))
+                .expect("note")
+                .contains("paper stale safeguard")
+        );
     }
 
     #[test]

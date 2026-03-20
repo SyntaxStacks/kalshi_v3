@@ -44,10 +44,12 @@ type MarketCache = Arc<RwLock<HashMap<String, KalshiMarketState>>>;
 type OrderBookCache = Arc<RwLock<HashMap<String, OrderBookState>>>;
 type ReferenceCache = Arc<RwLock<HashMap<String, ReferencePriceState>>>;
 type WeatherReferenceCache = Arc<RwLock<HashMap<String, WeatherReferenceState>>>;
+type WeatherSeriesBackoffCache = Arc<RwLock<HashMap<String, DateTime<Utc>>>>;
 
 const WEATHER_HIGH_KIND: &str = "daily_high_temperature";
 const WEATHER_LOW_KIND: &str = "daily_low_temperature";
 const WEATHER_MODEL_NAME: &str = "weather_threshold_v1";
+const WEATHER_SERIES_429_BACKOFF_SECONDS: i64 = 90;
 
 #[derive(Debug, Clone)]
 struct SeriesDiscovery {
@@ -165,8 +167,9 @@ async fn main() -> Result<()> {
     let orderbook_cache: OrderBookCache = Arc::new(RwLock::new(HashMap::new()));
     let reference_cache: ReferenceCache = Arc::new(RwLock::new(HashMap::new()));
     let weather_reference_cache: WeatherReferenceCache = Arc::new(RwLock::new(HashMap::new()));
+    let weather_series_backoff: WeatherSeriesBackoffCache = Arc::new(RwLock::new(HashMap::new()));
 
-    let bootstrap_markets = fetch_kalshi_markets(&config, &http).await?;
+    let bootstrap_markets = fetch_kalshi_markets(&config, &http, &weather_series_backoff).await?;
     refresh_market_cache(
         &redis_client,
         &storage,
@@ -224,6 +227,7 @@ async fn main() -> Result<()> {
             &market_cache,
             &reference_cache,
             &weather_reference_cache,
+            &weather_series_backoff,
         )
         .await
         {
@@ -264,8 +268,9 @@ async fn recovery_sync_once(
     market_cache: &MarketCache,
     reference_cache: &ReferenceCache,
     weather_reference_cache: &WeatherReferenceCache,
+    weather_series_backoff: &WeatherSeriesBackoffCache,
 ) -> Result<(usize, usize, bool, bool)> {
-    let markets = fetch_kalshi_markets(config, http).await?;
+    let markets = fetch_kalshi_markets(config, http, weather_series_backoff).await?;
     refresh_market_cache(
         redis_client,
         storage,
@@ -1115,10 +1120,16 @@ fn parse_price_levels(value: Option<&Value>) -> Vec<PriceLevel> {
 async fn fetch_kalshi_markets(
     config: &AppConfig,
     http: &HttpClient,
+    weather_series_backoff: &WeatherSeriesBackoffCache,
 ) -> Result<Vec<KalshiMarketState>> {
     let mut out = Vec::new();
     let discovered_series = discover_series(config, http).await?;
     for series in discovered_series {
+        if series.market_family == MarketFamily::Weather
+            && weather_series_is_backed_off(weather_series_backoff, &series.series_ticker).await
+        {
+            continue;
+        }
         let url = format!("{}/markets", config.kalshi_api_base.trim_end_matches('/'));
         let mut cursor: Option<String> = None;
         let mut pages_fetched = 0usize;
@@ -1133,8 +1144,32 @@ async fn fetch_kalshi_markets(
                 request = request.query(&[("cursor", cursor_value)]);
             }
 
-            let response = match request.send().await?.error_for_status() {
-                Ok(response) => response,
+            let response = match request.send().await {
+                Ok(response) if response.status().is_success() => response,
+                Ok(response) => {
+                    if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
+                        && series.market_family == MarketFamily::Weather
+                    {
+                        apply_weather_series_backoff(
+                            weather_series_backoff,
+                            &series.series_ticker,
+                            WEATHER_SERIES_429_BACKOFF_SECONDS,
+                        )
+                        .await;
+                    }
+                    warn!(
+                        error = %format!(
+                            "HTTP status {} for url ({})",
+                            response.status(),
+                            response.url()
+                        ),
+                        series_ticker = %series.series_ticker,
+                        market_family = ?series.market_family,
+                        cursor = cursor,
+                        "series_market_fetch_failed"
+                    );
+                    break;
+                }
                 Err(error) => {
                     warn!(
                         error = %error,
@@ -1816,6 +1851,28 @@ fn weather_reference_cache_key(city: &str, market_date: &str, contract_kind: &st
     )
 }
 
+async fn weather_series_is_backed_off(
+    weather_series_backoff: &WeatherSeriesBackoffCache,
+    series_ticker: &str,
+) -> bool {
+    let cache = weather_series_backoff.read().await;
+    cache
+        .get(series_ticker)
+        .is_some_and(|until| *until > Utc::now())
+}
+
+async fn apply_weather_series_backoff(
+    weather_series_backoff: &WeatherSeriesBackoffCache,
+    series_ticker: &str,
+    seconds: i64,
+) {
+    let mut cache = weather_series_backoff.write().await;
+    cache.insert(
+        series_ticker.to_string(),
+        Utc::now() + chrono::Duration::seconds(seconds.max(1)),
+    );
+}
+
 fn normalize_weather_city(city: &str) -> String {
     city.chars()
         .map(|ch| {
@@ -1931,7 +1988,32 @@ fn parse_weather_market_city(title: &str) -> Option<WeatherSeriesMetadata> {
 }
 
 fn canonical_weather_city(input: &str) -> Option<String> {
-    let mut city = input.trim().to_string();
+    let mut city = input
+        .split('?')
+        .next()
+        .unwrap_or(input)
+        .trim()
+        .replace("Will the ", "")
+        .replace(" be", "");
+    for prefix in [
+        "Daily High Temperature ",
+        "Daily Low Temperature ",
+        "Highest Temperature ",
+        "Lowest Temperature ",
+        "Maximum Temperature ",
+        "Minimum Temperature ",
+        "Max Temperature ",
+        "Min Temperature ",
+        "High Temperature ",
+        "Low Temperature ",
+        "High Temp ",
+        "Low Temp ",
+    ] {
+        if city.to_lowercase().starts_with(&prefix.to_lowercase()) {
+            city = city[prefix.len()..].trim().to_string();
+            break;
+        }
+    }
     for suffix in [
         " Daily High Temperature",
         " Daily Low Temperature",
@@ -1952,9 +2034,13 @@ fn canonical_weather_city(input: &str) -> Option<String> {
             break;
         }
     }
+    if let Some((_, tail)) = city.rsplit_once(" in ") {
+        city = tail.trim().to_string();
+    }
     let canonical = match city.trim().to_ascii_uppercase().as_str() {
         "NYC" => "New York City".to_string(),
         "PHIL" => "Philadelphia".to_string(),
+        "LA" => "Los Angeles".to_string(),
         "LAX" => "Los Angeles".to_string(),
         "SEA" => "Seattle".to_string(),
         "SATX" => "San Antonio".to_string(),
@@ -2112,7 +2198,7 @@ fn to_i64(value: Option<&Value>) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::should_fetch_next_market_page;
+    use super::{canonical_weather_city, should_fetch_next_market_page};
     use common::MarketFamily;
 
     #[test]
@@ -2145,6 +2231,22 @@ mod tests {
             1,
             true
         ));
+    }
+
+    #[test]
+    fn canonical_weather_city_handles_la_and_prefixed_titles() {
+        assert_eq!(
+            canonical_weather_city("LA"),
+            Some("Los Angeles".to_string())
+        );
+        assert_eq!(
+            canonical_weather_city("Daily High Temperature Houston"),
+            Some("Houston".to_string())
+        );
+        assert_eq!(
+            canonical_weather_city("Will the minimum temperature be 27-28 in Philadelphia?"),
+            Some("Philadelphia".to_string())
+        );
     }
 }
 

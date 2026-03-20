@@ -191,6 +191,41 @@ function tradeDirectionLabel(trade) {
   return titleCase(side || "Unknown");
 }
 
+function yesNoLabel(value) {
+  if (!value) return "Unknown";
+  return String(value).toLowerCase() === "yes" ? "YES" : "NO";
+}
+
+function auditVerdict(item) {
+  if (item?.model_call_correct === true) {
+    return { label: "Model Right", tone: "good" };
+  }
+  if (item?.model_call_correct === false) {
+    return { label: "Model Wrong", tone: "bad" };
+  }
+  return { label: "Diagnostic Only", tone: "neutral" };
+}
+
+function auditOutcomeLabel(item) {
+  if (!item?.resolved_outcome) {
+    return "Outcome not final";
+  }
+  return yesNoLabel(item.resolved_outcome);
+}
+
+function auditPredictionSummary(item) {
+  const modelProb = item?.predicted_yes_probability;
+  const marketProb = item?.market_yes_probability_at_entry;
+  const parts = [];
+  if (modelProb != null) {
+    parts.push(`Model YES ${(Number(modelProb) * 100).toFixed(1)}%`);
+  }
+  if (marketProb != null) {
+    parts.push(`Market YES ${(Number(marketProb) * 100).toFixed(1)}%`);
+  }
+  return parts.join(" Â· ") || "No decision probability recorded";
+}
+
 function relativeAge(value) {
   if (!value) return "n/a";
   const seconds = Math.max(0, Math.round((Date.now() - new Date(value).getTime()) / 1000));
@@ -1065,6 +1100,52 @@ function renderTrades(items) {
   `).join("");
 }
 
+function renderClosedTrades(items) {
+  const root = document.getElementById("closed-trade-list");
+  if (!items.length) {
+    root.innerHTML = `<div class="empty">No closed trades yet. Once trades exit, their prediction-versus-outcome audit will appear here.</div>`;
+    return;
+  }
+  root.innerHTML = items.map((trade) => {
+    const verdict = auditVerdict(trade);
+    const pnl = Number(trade.realized_pnl ?? 0);
+    return `
+      <article class="trade-card">
+        <header>
+          <div>
+            <p class="eyebrow">${titleCase(trade.mode)} Â· ${titleCase(trade.strategy_family)} Â· ${titleCase(trade.status)}</p>
+            <div class="trade-heading-row">
+              <p class="eyebrow">${tradeSubhead(trade)}</p>
+              <span class="trade-direction ${tradeDirectionTone(trade)}">${tradeDirectionLabel(trade)}</span>
+            </div>
+            <strong class="trade-headline">${tradeHeadline(trade)}</strong>
+            <p class="trade-subtitle">${trade.market_ticker || "Kalshi market"}</p>
+          </div>
+          <div class="chip ${verdict.tone}">${verdict.label}</div>
+        </header>
+        <dl class="trade-grid">
+          <div class="mini"><dt>Realized PnL</dt><dd class="${pnl >= 0 ? "good" : "bad"}">${money(pnl)}</dd></div>
+          <div class="mini"><dt>Model Call</dt><dd>${trade.model_call ? yesNoLabel(trade.model_call) : "n/a"}</dd></div>
+          <div class="mini"><dt>Trade Side</dt><dd>${trade.trade_call ? yesNoLabel(trade.trade_call) : "n/a"}</dd></div>
+          <div class="mini"><dt>Final Outcome</dt><dd>${auditOutcomeLabel(trade)}</dd></div>
+          <div class="mini"><dt>Closed</dt><dd>${dateTime(trade.closed_at)}</dd></div>
+        </dl>
+        <p class="muted">${auditPredictionSummary(trade)}</p>
+        ${trade.audit_note ? `<p class="muted">${trade.audit_note}</p>` : ""}
+        <details>
+          <summary>More detail</summary>
+          ${trade.market_title ? `<p class="muted">${cleanMarketTitle(trade.market_title)}</p>` : ""}
+          <p class="muted">Entry ${money(trade.entry_price)}${trade.exit_price != null ? ` Â· Exit ${money(trade.exit_price)}` : ""} Â· Quantity ${trade.quantity}</p>
+          ${trade.edge != null ? `<p class="muted">Decision edge ${(Number(trade.edge) * 100).toFixed(1)}%${trade.confidence != null ? ` Â· Confidence ${(Number(trade.confidence) * 100).toFixed(1)}%` : ""}</p>` : ""}
+          <p class="muted">Opened ${dateTime(trade.created_at)}</p>
+          <p class="muted">Lane ${trade.lane_key}</p>
+          <p class="mono">Trade ID ${trade.trade_id}</p>
+        </details>
+      </article>
+    `;
+  }).join("");
+}
+
 function renderOpportunities(items) {
   const root = document.getElementById("opportunity-list");
   if (!items.length) {
@@ -1160,6 +1241,7 @@ async function refreshScreen() {
     renderMoneyView(payload);
     renderLiveExceptions(payload);
     renderTrades(payload.open_trades || []);
+    renderClosedTrades(payload.closed_trades || []);
     renderOpportunities(payload.opportunities || []);
   })();
 
@@ -1186,6 +1268,7 @@ refreshScreen()
     document.getElementById("exceptions-list").innerHTML = "";
     document.getElementById("exceptions-strip").innerHTML = "";
     document.getElementById("trade-list").innerHTML = "";
+    document.getElementById("closed-trade-list").innerHTML = "";
     document.getElementById("opportunity-list").innerHTML = "";
   });
 

@@ -1825,6 +1825,7 @@ mod tests {
                 }],
             },
             open_trades: Vec::new(),
+            closed_trades: Vec::new(),
             opportunities: Vec::new(),
             execution_quality: ExecutionQualitySummary {
                 as_of: Utc::now(),

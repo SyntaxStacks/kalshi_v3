@@ -5,7 +5,7 @@ pub mod kalshi;
 
 pub use config::{AppConfig, LaneTruthRecommendationPolicy, LaneTruthThresholdBand};
 pub use domain::{
-    BankrollCard, CriticalAlertNotification, DashboardSnapshot, ExecutionIntent,
+    BankrollCard, ClosedTradeAuditSummary, CriticalAlertNotification, DashboardSnapshot, ExecutionIntent,
     ExecutionQualitySummary, ExpiryRegime, FamilyExecutionTruthSummary, HealthSnapshot,
     KalshiMarketState, LaneExecutionTruthSummary, LaneInspectionSnapshot, LaneReplaySummary,
     LaneState, LaneTradeCard, LiveExceptionSnapshot, LiveExchangeSyncSummary, LiveFillCard,

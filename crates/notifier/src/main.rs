@@ -134,7 +134,10 @@ async fn build_critical_alert_candidates(
         .filter(|control| !control.live_order_placement_enabled)
     {
         alerts.push(CriticalAlertNotification {
-            alert_key: format!("live_disabled:{}", control.updated_at.timestamp()),
+            alert_key: stable_alert_key(
+                "live_disabled",
+                &[control.updated_by.as_deref().unwrap_or("unknown")],
+            ),
             headline: "ALERT | LIVE DISABLED".to_string(),
             severity: "critical".to_string(),
             reason: control
@@ -159,12 +162,7 @@ async fn build_critical_alert_candidates(
         .unwrap_or(false)
     {
         alerts.push(CriticalAlertNotification {
-            alert_key: format!(
-                "market_feed_stale:{}",
-                feature_timestamp
-                    .map(|timestamp| timestamp.timestamp())
-                    .unwrap_or_default()
-            ),
+            alert_key: stable_alert_key("market_feed_stale", &["market_data"]),
             headline: "ALERT | MARKET FEED STALE".to_string(),
             severity: "critical".to_string(),
             reason: format!(
@@ -194,7 +192,7 @@ async fn build_critical_alert_candidates(
             .map(|worker| worker.updated_at)
             .unwrap_or(now);
         alerts.push(CriticalAlertNotification {
-            alert_key: format!("reference_feed_stale:{}", occurred_at.timestamp()),
+            alert_key: stable_alert_key("reference_feed_stale", &["reference_data"]),
             headline: "ALERT | REFERENCE FEED STALE".to_string(),
             severity: "critical".to_string(),
             reason: format!(
@@ -226,7 +224,7 @@ async fn build_critical_alert_candidates(
             .map(|sync| sync.synced_at)
             .unwrap_or(now);
         alerts.push(CriticalAlertNotification {
-            alert_key: format!("live_exchange_sync_stale:{}", occurred_at.timestamp()),
+            alert_key: stable_alert_key("live_exchange_sync_stale", &["reconciliation"]),
             headline: "ALERT | LIVE SYNC STALE".to_string(),
             severity: "critical".to_string(),
             reason: format!(
@@ -251,11 +249,7 @@ async fn build_critical_alert_candidates(
     if let Some(sync) = live_exchange_sync.as_ref() {
         for issue in &sync.issues {
             alerts.push(CriticalAlertNotification {
-                alert_key: format!(
-                    "live_exchange_issue:{}:{}",
-                    sync.synced_at.timestamp(),
-                    issue
-                ),
+                alert_key: stable_alert_key("live_exchange_issue", &[issue]),
                 headline: "ALERT | RECONCILIATION ISSUE".to_string(),
                 severity: "warning".to_string(),
                 reason: issue.clone(),
@@ -281,10 +275,13 @@ async fn build_critical_alert_candidates(
             .max_by_key(|trade| trade.trade_id)
             .expect("trade exceptions not empty");
         alerts.push(CriticalAlertNotification {
-            alert_key: format!(
-                "trade_exception:{}:{}",
-                live_exceptions.trade_exceptions.len(),
-                newest.trade_id
+            alert_key: stable_alert_key(
+                "trade_exception",
+                &[
+                    &live_exceptions.trade_exceptions.len().to_string(),
+                    newest.issue.as_str(),
+                    newest.lane_key.as_str(),
+                ],
             ),
             headline: "ALERT | RECONCILIATION ISSUE".to_string(),
             severity: "critical".to_string(),
@@ -305,13 +302,12 @@ async fn build_critical_alert_candidates(
 
     for worker in workers.iter().filter(|worker| worker.status == "failed") {
         alerts.push(CriticalAlertNotification {
-            alert_key: format!(
-                "worker_failed:{}:{}",
-                worker.service,
-                worker
-                    .last_failed_at
-                    .map(|timestamp| timestamp.timestamp())
-                    .unwrap_or_default()
+            alert_key: stable_alert_key(
+                "worker_failed",
+                &[
+                    worker.service.as_str(),
+                    worker.last_error.as_deref().unwrap_or("unknown"),
+                ],
             ),
             headline: "ALERT | WORKER FAILED".to_string(),
             severity: "critical".to_string(),
@@ -384,6 +380,32 @@ fn operator_action_to_alert(
             occurred_at: action.created_at,
         }),
         _ => None,
+    }
+}
+
+fn stable_alert_key(prefix: &str, parts: &[&str]) -> String {
+    let suffix = parts
+        .iter()
+        .map(|part| {
+            part.chars()
+                .map(|ch| {
+                    if ch.is_ascii_alphanumeric() {
+                        ch.to_ascii_lowercase()
+                    } else {
+                        '_'
+                    }
+                })
+                .collect::<String>()
+                .trim_matches('_')
+                .replace("__", "_")
+        })
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(":");
+    if suffix.is_empty() {
+        prefix.to_string()
+    } else {
+        format!("{prefix}:{suffix}")
     }
 }
 
@@ -660,6 +682,7 @@ fn format_operator_action_state(action: &common::OperatorActionEvent) -> String 
 mod tests {
     use super::{
         build_alert_webhook, build_trade_webhook, compact_lane_summary, format_contract_price,
+        stable_alert_key,
     };
     use chrono::TimeZone;
     use common::{CriticalAlertNotification, MarketFamily, StrategyFamily, TradeMode};
@@ -766,5 +789,26 @@ mod tests {
             "XRP 15m · trained_linear_v1"
         );
         assert_eq!(format_contract_price(0.345), "34.5c");
+    }
+
+    #[test]
+    fn stable_alert_key_dedupes_repeated_worker_failures() {
+        assert_eq!(
+            stable_alert_key(
+                "worker_failed",
+                &["training", "duplicate key value violates constraint"]
+            ),
+            stable_alert_key(
+                "worker_failed",
+                &["training", "duplicate key value violates constraint"]
+            )
+        );
+        assert_ne!(
+            stable_alert_key(
+                "worker_failed",
+                &["training", "duplicate key value violates constraint"]
+            ),
+            stable_alert_key("worker_failed", &["training", "timeout while training"])
+        );
     }
 }

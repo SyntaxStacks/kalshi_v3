@@ -304,6 +304,41 @@ pub struct OpenTradeSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClosedTradeAuditSummary {
+    pub trade_id: i64,
+    pub lane_key: String,
+    pub market_family: MarketFamily,
+    pub strategy_family: StrategyFamily,
+    pub mode: TradeMode,
+    pub market_ticker: Option<String>,
+    pub market_title: Option<String>,
+    pub weather_city: Option<String>,
+    pub weather_contract_kind: Option<String>,
+    pub weather_market_date: Option<String>,
+    pub weather_strike_type: Option<String>,
+    pub weather_floor_strike: Option<f64>,
+    pub weather_cap_strike: Option<f64>,
+    pub side: Option<String>,
+    pub quantity: f64,
+    pub entry_price: f64,
+    pub exit_price: Option<f64>,
+    pub realized_pnl: Option<f64>,
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+    pub closed_at: Option<DateTime<Utc>>,
+    pub predicted_yes_probability: Option<f64>,
+    pub market_yes_probability_at_entry: Option<f64>,
+    pub confidence: Option<f64>,
+    pub edge: Option<f64>,
+    pub model_call: Option<String>,
+    pub trade_call: Option<String>,
+    pub resolved_outcome: Option<String>,
+    pub model_call_correct: Option<bool>,
+    pub trade_call_correct: Option<bool>,
+    pub audit_note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpportunityCard {
     pub lane_key: String,
     pub market_family: MarketFamily,
@@ -568,6 +603,7 @@ pub struct DashboardSnapshot {
     pub bankrolls: Vec<BankrollCard>,
     pub readiness: ReadinessSummary,
     pub open_trades: Vec<OpenTradeSummary>,
+    pub closed_trades: Vec<ClosedTradeAuditSummary>,
     pub opportunities: Vec<OpportunityCard>,
     pub execution_quality: ExecutionQualitySummary,
     pub family_execution_truth: Vec<FamilyExecutionTruthSummary>,

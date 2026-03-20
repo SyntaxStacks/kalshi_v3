@@ -15,6 +15,14 @@ use tracing::{info, warn};
 
 const EXECUTION_SCORE_THRESHOLD_BPS: f64 = 10.0;
 const REDIS_QUEUE_PREFIX: &str = "v3:queue:";
+const PRICE_TICK: f64 = 0.01;
+const ENTRY_MAX_SPREAD_BPS: f64 = 250.0;
+const EXIT_MAX_SPREAD_BPS: f64 = 400.0;
+const ENTRY_MAX_QUEUE_AHEAD: f64 = 125.0;
+const ENTRY_MAX_CROSS_QUEUE_AHEAD: f64 = 40.0;
+const MIN_POST_FEE_EDGE_BPS: f64 = 5.0;
+const CROSS_EXECUTION_SCORE_BPS: f64 = 40.0;
+const URGENT_EXIT_SECONDS: i32 = 90;
 
 #[derive(Clone)]
 struct LiveKalshiClient {
@@ -54,6 +62,30 @@ enum LiveOrderPlacement {
         status: Option<String>,
         orphaned: bool,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouterAction {
+    Skip,
+    Join,
+    ImproveOneTick,
+    Cross,
+}
+
+#[derive(Debug, Clone)]
+struct RoutingDecision {
+    action: RouterAction,
+    limit_price: f64,
+    time_in_force: String,
+    reason: Option<String>,
+    queue_ahead: f64,
+    post_fee_edge_bps: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ContractBook {
+    best_bid: f64,
+    best_ask: f64,
 }
 
 #[derive(Deserialize)]
@@ -150,6 +182,8 @@ async fn main() -> Result<()> {
             config.live_order_replace_enabled,
             config.live_order_replace_after_seconds,
             config.live_order_stale_after_seconds,
+            config.market_stale_after_seconds,
+            config.reference_stale_after_seconds,
         )
         .await
         {
@@ -206,6 +240,8 @@ async fn execute_once(
     live_order_replace_enabled: bool,
     live_order_replace_after_seconds: i64,
     live_order_stale_after_seconds: i64,
+    market_stale_after_seconds: i64,
+    reference_stale_after_seconds: i64,
 ) -> Result<(
     usize,
     usize,
@@ -230,11 +266,14 @@ async fn execute_once(
     let (live_reconciled, live_attention) = storage.reconcile_live_trades_from_sync().await?;
     let (live_intents_synced, live_orders_cleaned) = reconcile_active_live_intents(
         storage,
+        &mut redis,
         live_client,
         live_entry_time_in_force,
         live_order_replace_enabled,
         live_order_replace_after_seconds,
         live_order_stale_after_seconds,
+        market_stale_after_seconds,
+        reference_stale_after_seconds,
     )
     .await?;
     let (live_exit_synced, live_exit_replaced) = reconcile_active_live_exit_orders(
@@ -244,6 +283,7 @@ async fn execute_once(
         live_order_replace_enabled,
         live_order_replace_after_seconds,
         live_order_stale_after_seconds,
+        market_stale_after_seconds,
     )
     .await?;
     let live_order_placement_enabled = storage
@@ -438,6 +478,30 @@ async fn execute_once(
                     rejected += 1;
                     continue;
                 }
+                let route = route_live_entry(
+                    &snapshot,
+                    &intent.side,
+                    queue_snapshot.as_ref(),
+                    intent.model_prob,
+                    intent.predicted_fill_probability,
+                    intent.predicted_slippage_bps,
+                    current_score,
+                    threshold,
+                    live_entry_time_in_force,
+                    market_stale_after_seconds,
+                    reference_stale_after_seconds,
+                );
+                if route.action == RouterAction::Skip {
+                    storage
+                        .mark_execution_intent_status(
+                            intent.intent_id,
+                            "rejected",
+                            route.reason.as_deref(),
+                        )
+                        .await?;
+                    rejected += 1;
+                    continue;
+                }
 
                 let client_order_id = format!("v3-live-entry-{}", intent.intent_id);
                 storage
@@ -456,7 +520,11 @@ async fn execute_once(
                             details_json: json!({
                                 "market_ticker": snapshot.market_ticker.clone(),
                                 "quantity": quantity,
-                                "entry_price": theoretical_entry_price,
+                                "entry_price": route.limit_price,
+                                "routing_action": format!("{:?}", route.action),
+                                "queue_ahead": route.queue_ahead,
+                                "post_fee_edge_bps": route.post_fee_edge_bps,
+                                "time_in_force": route.time_in_force.clone(),
                             }),
                             ..Default::default()
                         },
@@ -468,9 +536,9 @@ async fn execute_once(
                     &snapshot.market_ticker,
                     &intent.side,
                     quantity as i64,
-                    theoretical_entry_price,
+                    route.limit_price,
                     &client_order_id,
-                    live_entry_time_in_force,
+                    &route.time_in_force,
                 )
                 .await?
                 {
@@ -620,6 +688,7 @@ async fn execute_once(
                     &settlement.status,
                     settlement.realized_pnl,
                     live_exit_time_in_force,
+                    market_stale_after_seconds,
                 )
                 .await?;
                 closed += 1;
@@ -633,6 +702,7 @@ async fn execute_once(
                 "stale_trade_reconcile",
                 0.0,
                 live_exit_time_in_force,
+                market_stale_after_seconds,
             )
             .await?;
             closed += 1;
@@ -655,6 +725,7 @@ async fn execute_once(
                     status,
                     0.0,
                     live_exit_time_in_force,
+                    market_stale_after_seconds,
                 )
                 .await?;
                 closed += 1;
@@ -678,6 +749,7 @@ async fn execute_once(
                     status,
                     0.0,
                     live_exit_time_in_force,
+                    market_stale_after_seconds,
                 )
                 .await?;
                 closed += 1;
@@ -698,6 +770,7 @@ async fn execute_once(
                 "expiry_reconcile",
                 0.0,
                 live_exit_time_in_force,
+                market_stale_after_seconds,
             )
             .await?;
             closed += 1;
@@ -779,11 +852,14 @@ async fn reconcile_pending_intents(storage: &storage::Storage) -> Result<usize> 
 
 async fn reconcile_active_live_intents(
     storage: &storage::Storage,
+    redis: &mut redis::aio::MultiplexedConnection,
     live_client: Option<&LiveKalshiClient>,
     entry_time_in_force: &str,
     replace_enabled: bool,
     replace_after_seconds: i64,
     stale_after_seconds: i64,
+    market_stale_after_seconds: i64,
+    reference_stale_after_seconds: i64,
 ) -> Result<(usize, usize)> {
     let Some(live_client) = live_client else {
         return Ok((0, 0));
@@ -864,8 +940,17 @@ async fn reconcile_active_live_intents(
             && order_is_resting(&order.status)
             && !time_in_force_is_fill_or_kill(entry_time_in_force)
         {
-            if replace_live_entry_order(storage, live_client, &intent, &order, entry_time_in_force)
-                .await?
+            if replace_live_entry_order(
+                storage,
+                redis,
+                live_client,
+                &intent,
+                &order,
+                entry_time_in_force,
+                market_stale_after_seconds,
+                reference_stale_after_seconds,
+            )
+            .await?
             {
                 synced += 1;
                 cleaned += 1;
@@ -1085,10 +1170,13 @@ async fn sync_live_intent_from_exchange(
 
 async fn replace_live_entry_order(
     storage: &storage::Storage,
+    redis: &mut redis::aio::MultiplexedConnection,
     live_client: &LiveKalshiClient,
     intent: &ActiveLiveExecutionIntent,
     order: &KalshiOrder,
     time_in_force: &str,
+    market_stale_after_seconds: i64,
+    reference_stale_after_seconds: i64,
 ) -> Result<bool> {
     let Some(snapshot) = storage
         .latest_feature_snapshot_for_market(intent.market_id)
@@ -1130,23 +1218,91 @@ async fn replace_live_entry_order(
         intent.client_order_id.as_deref(),
         &format!("v3-live-entry-{}", intent.intent_id),
     );
-    let entry_price = contract_price_for_side(&intent.side, snapshot.market_prob);
-    let quantity = (intent.recommended_size.max(0.0) / entry_price.max(0.05)).floor() as i64;
+    let quantity = remaining_live_entry_quantity(intent);
     if quantity < 1 {
         storage
             .transition_execution_intent(
                 intent.intent_id,
-                "rejected",
-                Some("size_too_small_for_live_contract"),
+                "cancelled",
+                Some("no_residual_quantity_after_replace"),
                 &ExecutionIntentStateUpdate {
                     market_ticker: Some(snapshot.market_ticker.clone()),
                     side: Some(intent.side.clone()),
                     client_order_id: Some(client_order_id),
                     exchange_order_id: Some(order.order_id.clone()),
                     fill_status: Some("cancelled".to_string()),
+                    cancelled_quantity: Some(
+                        intent.cancelled_quantity.max(0.0)
+                            + (intent.submitted_quantity.max(0.0)
+                                - intent.filled_quantity.max(0.0)
+                                - intent.cancelled_quantity.max(0.0)
+                                - intent.rejected_quantity.max(0.0))
+                            .max(0.0),
+                    ),
                     details_json: json!({
                         "phase": "replace_live_entry_order",
                         "replaced": false,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        return Ok(true);
+    }
+    let queue_snapshot = load_queue_snapshot(redis, &snapshot.market_ticker).await?;
+    let pending_record = storage.execution_intent_by_id(intent.intent_id).await?;
+    let threshold = pending_record
+        .as_ref()
+        .map(execution_score_threshold)
+        .unwrap_or(EXECUTION_SCORE_THRESHOLD_BPS);
+    let current_score = if intent.market_family == MarketFamily::Crypto {
+        pending_record
+            .as_ref()
+            .and_then(|record| {
+                current_crypto_execution_score(record, &snapshot, queue_snapshot.as_ref())
+            })
+            .unwrap_or(f64::NEG_INFINITY)
+    } else {
+        f64::INFINITY
+    };
+    let model_prob = pending_record
+        .as_ref()
+        .map(|record| record.model_prob)
+        .unwrap_or(snapshot.market_prob);
+    let route = route_live_entry(
+        &snapshot,
+        &intent.side,
+        queue_snapshot.as_ref(),
+        model_prob,
+        pending_record
+            .as_ref()
+            .and_then(|record| record.predicted_fill_probability),
+        pending_record
+            .as_ref()
+            .and_then(|record| record.predicted_slippage_bps),
+        current_score,
+        threshold,
+        time_in_force,
+        market_stale_after_seconds,
+        reference_stale_after_seconds,
+    );
+    if route.action == RouterAction::Skip {
+        storage
+            .transition_execution_intent(
+                intent.intent_id,
+                "cancelled",
+                route.reason.as_deref(),
+                &ExecutionIntentStateUpdate {
+                    market_ticker: Some(snapshot.market_ticker.clone()),
+                    side: Some(intent.side.clone()),
+                    client_order_id: Some(client_order_id),
+                    exchange_order_id: Some(order.order_id.clone()),
+                    fill_status: Some("cancelled".to_string()),
+                    cancelled_quantity: Some(intent.cancelled_quantity.max(0.0) + quantity as f64),
+                    details_json: json!({
+                        "phase": "replace_live_entry_order",
+                        "replaced": false,
+                        "routing_action": format!("{:?}", route.action),
                     }),
                     ..Default::default()
                 },
@@ -1169,7 +1325,11 @@ async fn replace_live_entry_order(
                     "phase": "replace_live_entry_order",
                     "replaced_order_id": order.order_id,
                     "quantity": quantity,
-                    "entry_price": entry_price,
+                    "entry_price": route.limit_price,
+                    "routing_action": format!("{:?}", route.action),
+                    "queue_ahead": route.queue_ahead,
+                    "post_fee_edge_bps": route.post_fee_edge_bps,
+                    "time_in_force": route.time_in_force.clone(),
                 }),
                 ..Default::default()
             },
@@ -1181,9 +1341,9 @@ async fn replace_live_entry_order(
         &snapshot.market_ticker,
         &intent.side,
         quantity,
-        entry_price,
+        route.limit_price,
         &client_order_id,
-        time_in_force,
+        &route.time_in_force,
     )
     .await?;
     handle_live_entry_placement_result(storage, intent, &snapshot.market_ticker, placement).await?;
@@ -1343,6 +1503,7 @@ async fn reconcile_active_live_exit_orders(
     replace_enabled: bool,
     replace_after_seconds: i64,
     stale_after_seconds: i64,
+    market_stale_after_seconds: i64,
 ) -> Result<(usize, usize)> {
     let Some(live_client) = live_client else {
         return Ok((0, 0));
@@ -1411,8 +1572,15 @@ async fn reconcile_active_live_exit_orders(
             && order_is_resting(&order.status)
             && !time_in_force_is_fill_or_kill(exit_time_in_force)
         {
-            if replace_live_exit_order(storage, live_client, &trade, &order, exit_time_in_force)
-                .await?
+            if replace_live_exit_order(
+                storage,
+                live_client,
+                &trade,
+                &order,
+                exit_time_in_force,
+                market_stale_after_seconds,
+            )
+            .await?
             {
                 replaced += 1;
                 continue;
@@ -1450,6 +1618,7 @@ async fn replace_live_exit_order(
     trade: &OpenTradeForExit,
     order: &KalshiOrder,
     time_in_force: &str,
+    market_stale_after_seconds: i64,
 ) -> Result<bool> {
     if !cancel_live_order(live_client, &order.order_id).await? {
         return Ok(false);
@@ -1501,7 +1670,32 @@ async fn replace_live_exit_order(
     if quantity <= 0 {
         return Ok(true);
     }
-    let exit_price = contract_price_for_side(&trade.side, snapshot.market_prob);
+    let route = route_live_exit(
+        &snapshot,
+        &trade.side,
+        time_in_force,
+        market_stale_after_seconds,
+        trade.force_exit_buffer_seconds,
+    );
+    if route.action == RouterAction::Skip {
+        storage
+            .update_live_trade_exit_order(
+                trade.trade_id,
+                Some(&order.order_id),
+                Some(&order_client_order_id(
+                    order,
+                    trade.exit_client_order_id.as_deref(),
+                )),
+                Some("cancelled"),
+                &json!({
+                    "phase": "replace_live_exit_order",
+                    "replaced": false,
+                    "reason": route.reason,
+                }),
+            )
+            .await?;
+        return Ok(true);
+    }
     let client_order_id = next_replacement_client_order_id(
         trade.exit_client_order_id.as_deref(),
         &format!("v3-live-exit-{}", trade.trade_id),
@@ -1514,9 +1708,9 @@ async fn replace_live_exit_order(
             .unwrap_or(&snapshot.market_ticker),
         &trade.side,
         quantity,
-        exit_price,
+        route.limit_price,
         &client_order_id,
-        time_in_force,
+        &route.time_in_force,
     )
     .await?;
     handle_live_exit_placement_result(storage, trade, placement, "replaced_live_exit").await?;
@@ -1626,6 +1820,7 @@ async fn close_trade_for_mode(
     status: &str,
     fallback_realized_pnl: f64,
     exit_time_in_force: &str,
+    market_stale_after_seconds: i64,
 ) -> Result<()> {
     match trade.mode {
         TradeMode::Paper => {
@@ -1664,14 +1859,29 @@ async fn close_trade_for_mode(
                 );
                 return Ok(());
             }
+            let route = route_live_exit(
+                &snapshot,
+                &trade.side,
+                exit_time_in_force,
+                market_stale_after_seconds,
+                trade.force_exit_buffer_seconds,
+            );
+            if route.action == RouterAction::Skip {
+                warn!(
+                    trade_id = trade.trade_id,
+                    reason = ?route.reason,
+                    "live_exit_skipped_by_router"
+                );
+                return Ok(());
+            }
             match place_live_exit(
                 live_client,
                 &snapshot.market_ticker,
                 &trade.side,
                 quantity,
-                theoretical_exit_price,
+                route.limit_price,
                 trade.trade_id,
-                exit_time_in_force,
+                &route.time_in_force,
             )
             .await?
             {
@@ -2108,6 +2318,250 @@ fn contract_price_for_side(side: &str, market_prob: f64) -> f64 {
     }
 }
 
+fn contract_book_for_side(
+    snapshot: &common::MarketFeatureSnapshotRecord,
+    side: &str,
+) -> ContractBook {
+    let (best_bid, best_ask) = if contract_side(side) == "no" {
+        (
+            (1.0 - snapshot.best_ask).clamp(0.01, 0.99),
+            (1.0 - snapshot.best_bid).clamp(0.01, 0.99),
+        )
+    } else {
+        (
+            snapshot.best_bid.clamp(0.01, 0.99),
+            snapshot.best_ask.clamp(0.01, 0.99),
+        )
+    };
+    ContractBook {
+        best_bid: best_bid.min(best_ask),
+        best_ask: best_ask.max(best_bid),
+    }
+}
+
+fn book_spread_bps(book: ContractBook) -> f64 {
+    ((book.best_ask - book.best_bid).max(0.0) * 10_000.0).max(0.0)
+}
+
+fn route_limit_price(book: ContractBook, order_action: &str, action: RouterAction) -> f64 {
+    let spread = (book.best_ask - book.best_bid).max(0.0);
+    match (order_action, action) {
+        (_, RouterAction::Skip) => 0.0,
+        ("buy", RouterAction::Join) => book.best_bid,
+        ("buy", RouterAction::Cross) => book.best_ask,
+        ("buy", RouterAction::ImproveOneTick) => {
+            if spread >= PRICE_TICK * 2.0 {
+                (book.best_bid + PRICE_TICK)
+                    .min(book.best_ask - PRICE_TICK)
+                    .clamp(0.01, 0.99)
+            } else {
+                book.best_bid
+            }
+        }
+        ("sell", RouterAction::Join) => book.best_ask,
+        ("sell", RouterAction::Cross) => book.best_bid,
+        ("sell", RouterAction::ImproveOneTick) => {
+            if spread >= PRICE_TICK * 2.0 {
+                (book.best_ask - PRICE_TICK)
+                    .max(book.best_bid + PRICE_TICK)
+                    .clamp(0.01, 0.99)
+            } else {
+                book.best_ask
+            }
+        }
+        _ => 0.0,
+    }
+}
+
+fn buy_side_post_fee_edge_bps(
+    fair_price: f64,
+    execution_price: f64,
+    predicted_slippage_bps: f64,
+    adverse_selection_bps: f64,
+) -> f64 {
+    ((fair_price - execution_price) * 10_000.0) - predicted_slippage_bps - adverse_selection_bps
+}
+
+fn route_skip(reason: &str) -> RoutingDecision {
+    RoutingDecision {
+        action: RouterAction::Skip,
+        limit_price: 0.0,
+        time_in_force: "good_till_cancelled".to_string(),
+        reason: Some(reason.to_string()),
+        queue_ahead: 0.0,
+        post_fee_edge_bps: None,
+    }
+}
+
+fn route_live_entry(
+    snapshot: &common::MarketFeatureSnapshotRecord,
+    side: &str,
+    queue_snapshot: Option<&QueueSnapshot>,
+    model_prob: f64,
+    predicted_fill_probability: Option<f64>,
+    predicted_slippage_bps: Option<f64>,
+    current_execution_score_bps: f64,
+    execution_score_threshold_bps: f64,
+    default_time_in_force: &str,
+    market_stale_after_seconds: i64,
+    reference_stale_after_seconds: i64,
+) -> RoutingDecision {
+    if i64::from(snapshot.market_data_age_seconds.max(0)) > market_stale_after_seconds {
+        return route_skip("stale_market_snapshot");
+    }
+    if i64::from(snapshot.reference_age_seconds.max(0)) > reference_stale_after_seconds {
+        return route_skip("stale_reference_snapshot");
+    }
+    if current_execution_score_bps <= execution_score_threshold_bps {
+        return route_skip("execution_score_below_threshold");
+    }
+
+    let book = contract_book_for_side(snapshot, side);
+    let spread_bps = book_spread_bps(book);
+    if spread_bps > ENTRY_MAX_SPREAD_BPS {
+        return route_skip("spread_above_entry_cap");
+    }
+
+    let queue_ahead = queue_side_summary(queue_snapshot, side)
+        .map(|queue| queue.size_ahead_real.max(0.0))
+        .unwrap_or(snapshot.size_ahead_real.max(snapshot.size_ahead).max(0.0));
+    if queue_ahead > ENTRY_MAX_QUEUE_AHEAD {
+        return route_skip("queue_ahead_above_cap");
+    }
+
+    let fill_probability = predicted_fill_probability.unwrap_or_else(|| {
+        estimate_fill_probability(
+            queue_ahead.max(1.0),
+            execution_queue_trade_consumption_rate(snapshot, queue_snapshot, side),
+            execution_queue_cancel_rate(snapshot, queue_snapshot, side),
+            f64::from(snapshot.seconds_to_expiry.max(1)),
+        )
+    });
+    let slippage_bps = predicted_slippage_bps.unwrap_or(snapshot.spread_bps * 0.5);
+    let adverse_selection_bps = (snapshot.aggressive_buy_ratio * snapshot.spread_bps)
+        + ((execution_queue_cancel_rate(snapshot, queue_snapshot, side)
+            + execution_queue_decay_rate(snapshot, queue_snapshot, side))
+            * 10.0)
+        + (snapshot.quote_churn * 5.0);
+    let fair_price = contract_price_for_side(side, model_prob);
+
+    let join_price = route_limit_price(book, "buy", RouterAction::Join);
+    let join_edge_bps =
+        buy_side_post_fee_edge_bps(fair_price, join_price, slippage_bps, adverse_selection_bps);
+    if join_edge_bps < MIN_POST_FEE_EDGE_BPS {
+        return route_skip("post_fee_edge_below_minimum");
+    }
+
+    let improve_price = route_limit_price(book, "buy", RouterAction::ImproveOneTick);
+    let improve_edge_bps = buy_side_post_fee_edge_bps(
+        fair_price,
+        improve_price,
+        slippage_bps,
+        adverse_selection_bps,
+    );
+    let cross_price = route_limit_price(book, "buy", RouterAction::Cross);
+    let cross_edge_bps =
+        buy_side_post_fee_edge_bps(fair_price, cross_price, slippage_bps, adverse_selection_bps);
+
+    if current_execution_score_bps >= CROSS_EXECUTION_SCORE_BPS
+        && fill_probability >= 0.75
+        && queue_ahead <= ENTRY_MAX_CROSS_QUEUE_AHEAD
+        && cross_edge_bps >= MIN_POST_FEE_EDGE_BPS
+    {
+        return RoutingDecision {
+            action: RouterAction::Cross,
+            limit_price: cross_price,
+            time_in_force: "fill_or_kill".to_string(),
+            reason: None,
+            queue_ahead,
+            post_fee_edge_bps: Some(cross_edge_bps),
+        };
+    }
+
+    if improve_edge_bps >= MIN_POST_FEE_EDGE_BPS && spread_bps >= PRICE_TICK * 20_000.0 {
+        return RoutingDecision {
+            action: RouterAction::ImproveOneTick,
+            limit_price: improve_price,
+            time_in_force: default_time_in_force.to_string(),
+            reason: None,
+            queue_ahead,
+            post_fee_edge_bps: Some(improve_edge_bps),
+        };
+    }
+
+    RoutingDecision {
+        action: RouterAction::Join,
+        limit_price: join_price,
+        time_in_force: default_time_in_force.to_string(),
+        reason: None,
+        queue_ahead,
+        post_fee_edge_bps: Some(join_edge_bps),
+    }
+}
+
+fn route_live_exit(
+    snapshot: &common::MarketFeatureSnapshotRecord,
+    side: &str,
+    default_time_in_force: &str,
+    market_stale_after_seconds: i64,
+    force_exit_buffer_seconds: i32,
+) -> RoutingDecision {
+    if i64::from(snapshot.market_data_age_seconds.max(0)) > market_stale_after_seconds * 2 {
+        return route_skip("stale_market_snapshot");
+    }
+
+    let book = contract_book_for_side(snapshot, side);
+    let spread_bps = book_spread_bps(book);
+    let urgent = snapshot.seconds_to_expiry <= URGENT_EXIT_SECONDS.max(force_exit_buffer_seconds);
+
+    if urgent || spread_bps > EXIT_MAX_SPREAD_BPS {
+        return RoutingDecision {
+            action: RouterAction::Cross,
+            limit_price: route_limit_price(book, "sell", RouterAction::Cross),
+            time_in_force: "fill_or_kill".to_string(),
+            reason: None,
+            queue_ahead: 0.0,
+            post_fee_edge_bps: None,
+        };
+    }
+
+    if spread_bps >= PRICE_TICK * 20_000.0 {
+        return RoutingDecision {
+            action: RouterAction::ImproveOneTick,
+            limit_price: route_limit_price(book, "sell", RouterAction::ImproveOneTick),
+            time_in_force: default_time_in_force.to_string(),
+            reason: None,
+            queue_ahead: 0.0,
+            post_fee_edge_bps: None,
+        };
+    }
+
+    RoutingDecision {
+        action: RouterAction::Join,
+        limit_price: route_limit_price(book, "sell", RouterAction::Join),
+        time_in_force: default_time_in_force.to_string(),
+        reason: None,
+        queue_ahead: 0.0,
+        post_fee_edge_bps: None,
+    }
+}
+
+fn remaining_live_entry_quantity(intent: &ActiveLiveExecutionIntent) -> i64 {
+    let submitted = intent.submitted_quantity.max(0.0);
+    let accounted = intent.filled_quantity.max(0.0)
+        + intent.cancelled_quantity.max(0.0)
+        + intent.rejected_quantity.max(0.0);
+    (submitted - accounted).floor().max(0.0) as i64
+}
+
+fn average_fill_cost_per_contract(total_fill_cost: f64, fill_quantity: f64) -> Option<f64> {
+    if total_fill_cost <= 0.0 || fill_quantity <= 0.0 {
+        None
+    } else {
+        Some((total_fill_cost / fill_quantity).clamp(0.01, 0.99))
+    }
+}
+
 fn pending_intent_priority(intent: &storage::PendingExecutionIntent) -> f64 {
     stop_condition_value(&intent.stop_conditions_json, "execution_score_bps").unwrap_or_default()
         + intent
@@ -2166,6 +2620,39 @@ fn queue_side_summary<'a>(
         (Some(queue), Some(ContractSide::No)) => Some(&queue.no),
         _ => None,
     }
+}
+
+fn execution_queue_trade_consumption_rate(
+    snapshot: &common::MarketFeatureSnapshotRecord,
+    queue_snapshot: Option<&QueueSnapshot>,
+    side: &str,
+) -> f64 {
+    queue_side_summary(queue_snapshot, side)
+        .map(|queue| queue.trade_consumption_rate)
+        .unwrap_or(snapshot.trade_consumption_rate.max(snapshot.trade_rate))
+        .max(0.0)
+}
+
+fn execution_queue_cancel_rate(
+    snapshot: &common::MarketFeatureSnapshotRecord,
+    queue_snapshot: Option<&QueueSnapshot>,
+    side: &str,
+) -> f64 {
+    queue_side_summary(queue_snapshot, side)
+        .map(|queue| queue.cancel_rate)
+        .unwrap_or(snapshot.cancel_rate.max(0.0))
+        .max(0.0)
+}
+
+fn execution_queue_decay_rate(
+    snapshot: &common::MarketFeatureSnapshotRecord,
+    queue_snapshot: Option<&QueueSnapshot>,
+    side: &str,
+) -> f64 {
+    queue_side_summary(queue_snapshot, side)
+        .map(|queue| queue.queue_decay_rate)
+        .unwrap_or(snapshot.queue_decay_rate.max(0.0))
+        .max(0.0)
 }
 
 fn estimate_fill_probability(
@@ -2301,12 +2788,13 @@ fn parse_order_time(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 }
 
 fn contract_fill_price(order: &KalshiOrder, contract_side: &str) -> f64 {
+    let fill_quantity = parse_fp(&order.fill_count_fp);
     let from_fill_cost = first_non_zero(&[
         &order.taker_fill_cost_dollars,
         &order.maker_fill_cost_dollars,
     ]);
-    if from_fill_cost > 0.0 {
-        return from_fill_cost.clamp(0.01, 0.99);
+    if let Some(avg_price) = average_fill_cost_per_contract(from_fill_cost, fill_quantity) {
+        return avg_price;
     }
     if contract_side == "yes" {
         parse_fp(&order.yes_price_dollars).clamp(0.01, 0.99)
@@ -2418,6 +2906,7 @@ fn parse_fp(raw: &str) -> f64 {
 mod tests {
     use super::*;
     use chrono::Utc;
+    use common::ExpiryRegime;
 
     fn sample_open_trade(exit_fill_status: Option<&str>) -> OpenTradeForExit {
         OpenTradeForExit {
@@ -2440,6 +2929,146 @@ mod tests {
             exit_exchange_order_id: Some("order-1".to_string()),
             exit_client_order_id: Some("client-1".to_string()),
             exit_fill_status: exit_fill_status.map(ToOwned::to_owned),
+        }
+    }
+
+    fn sample_live_intent() -> ActiveLiveExecutionIntent {
+        ActiveLiveExecutionIntent {
+            intent_id: 1,
+            decision_id: 1,
+            market_id: 1,
+            market_family: MarketFamily::Crypto,
+            lane_key: "kalshi:btc:15:buy_yes:directional_settlement:trained_linear_v1:mid"
+                .to_string(),
+            strategy_family: StrategyFamily::DirectionalSettlement,
+            side: "buy_yes".to_string(),
+            market_prob: 0.50,
+            recommended_size: 25.0,
+            mode: TradeMode::Live,
+            timeout_seconds: 120,
+            force_exit_buffer_seconds: 45,
+            created_at: Utc::now(),
+            status: "acknowledged".to_string(),
+            market_ticker: Some("KXBTC15M-TEST".to_string()),
+            client_order_id: Some("v3-live-entry-1".to_string()),
+            exchange_order_id: Some("order-1".to_string()),
+            fill_status: Some("resting".to_string()),
+            submitted_quantity: 10.0,
+            accepted_quantity: 10.0,
+            filled_quantity: 0.0,
+            cancelled_quantity: 0.0,
+            rejected_quantity: 0.0,
+            avg_fill_price: None,
+            terminal_outcome: None,
+            last_transition_at: Utc::now(),
+        }
+    }
+
+    fn sample_snapshot() -> common::MarketFeatureSnapshotRecord {
+        common::MarketFeatureSnapshotRecord {
+            market_id: 1,
+            market_family: MarketFamily::Crypto,
+            market_ticker: "KXBTC15M-TEST".to_string(),
+            market_title: "BTC 15m".to_string(),
+            feature_version: "v1".to_string(),
+            exchange: "kalshi".to_string(),
+            symbol: "btc".to_string(),
+            window_minutes: 15,
+            seconds_to_expiry: 240,
+            time_to_expiry_bucket: "2_to_5m".to_string(),
+            expiry_regime: Some(ExpiryRegime::Mid),
+            market_prob: 0.50,
+            best_bid: 0.46,
+            best_ask: 0.48,
+            last_price: 0.47,
+            bid_size: 25.0,
+            ask_size: 18.0,
+            liquidity: 43.0,
+            order_book_imbalance: 0.15,
+            aggressive_buy_ratio: 0.25,
+            spread_bps: 200.0,
+            venue_quality_score: 0.72,
+            reference_price: 100_000.0,
+            reference_previous_price: 99_950.0,
+            reference_price_change_bps: 5.0,
+            reference_yes_prob: 0.55,
+            reference_gap_bps: 75.0,
+            threshold_distance_bps_proxy: 10.0,
+            distance_to_strike_bps: 22.0,
+            reference_velocity: 4.0,
+            realized_vol_short: 8.0,
+            time_decay_factor: 0.8,
+            size_ahead: 10.0,
+            trade_rate: 6.0,
+            quote_churn: 0.1,
+            size_ahead_real: 10.0,
+            trade_consumption_rate: 6.0,
+            cancel_rate: 3.0,
+            queue_decay_rate: 1.0,
+            averaging_window_progress: 0.5,
+            settlement_regime: "active".to_string(),
+            last_minute_avg_proxy: 0.5,
+            market_data_age_seconds: 2,
+            reference_age_seconds: 1,
+            weather_city: None,
+            weather_contract_kind: None,
+            weather_market_date: None,
+            weather_strike_type: None,
+            weather_floor_strike: None,
+            weather_cap_strike: None,
+            weather_forecast_temperature_f: None,
+            weather_observation_temperature_f: None,
+            weather_reference_confidence: None,
+            weather_reference_source: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    fn sample_queue_snapshot(size_ahead: f64) -> QueueSnapshot {
+        let summary = QueueSideSummary {
+            best_price: Some(0.46),
+            total_size: 20.0,
+            size_ahead_real: size_ahead,
+            trade_consumption_rate: 6.0,
+            cancel_rate: 3.0,
+            queue_decay_rate: 1.0,
+            updated_at: Utc::now(),
+        };
+        QueueSnapshot {
+            market_ticker: "KXBTC15M-TEST".to_string(),
+            yes: summary.clone(),
+            no: summary,
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn sample_kalshi_order(
+        fill_count: f64,
+        total_fill_cost: f64,
+        contract_side: &str,
+    ) -> KalshiOrder {
+        KalshiOrder {
+            order_id: "order-1".to_string(),
+            ticker: "KXBTC15M-TEST".to_string(),
+            client_order_id: "client-1".to_string(),
+            status: "filled".to_string(),
+            yes_price_dollars: if contract_side == "yes" {
+                "0.44".to_string()
+            } else {
+                "0.56".to_string()
+            },
+            no_price_dollars: if contract_side == "no" {
+                "0.44".to_string()
+            } else {
+                "0.56".to_string()
+            },
+            fill_count_fp: fill_count.to_string(),
+            taker_fill_cost_dollars: total_fill_cost.to_string(),
+            maker_fill_cost_dollars: "0".to_string(),
+            taker_fees_dollars: "0.02".to_string(),
+            maker_fees_dollars: "0".to_string(),
+            created_time: Utc::now().to_rfc3339(),
+            last_update_time: Utc::now().to_rfc3339(),
         }
     }
 
@@ -2515,5 +3144,152 @@ mod tests {
             stop_condition_value(&stop_conditions, "fill_probability"),
             Some(0.75)
         );
+    }
+
+    #[test]
+    fn partial_fill_followed_by_replace_uses_residual_quantity_only() {
+        let mut intent = sample_live_intent();
+        intent.filled_quantity = 3.0;
+        intent.cancelled_quantity = 1.0;
+        assert_eq!(remaining_live_entry_quantity(&intent), 6);
+    }
+
+    #[test]
+    fn replacement_never_exceeds_original_intended_quantity() {
+        let mut intent = sample_live_intent();
+        intent.filled_quantity = 6.0;
+        intent.cancelled_quantity = 5.0;
+        assert_eq!(remaining_live_entry_quantity(&intent), 0);
+    }
+
+    #[test]
+    fn duplicate_recovery_residual_quantity_cannot_inflate_exposure() {
+        let mut intent = sample_live_intent();
+        intent.filled_quantity = 4.0;
+        let residual = remaining_live_entry_quantity(&intent);
+        assert!(residual as f64 + intent.filled_quantity <= intent.submitted_quantity);
+    }
+
+    #[test]
+    fn multi_contract_fill_price_is_averaged_for_one_contract() {
+        let order = sample_kalshi_order(1.0, 0.37, "yes");
+        assert!((contract_fill_price(&order, "yes") - 0.37).abs() < 1e-9);
+    }
+
+    #[test]
+    fn multi_contract_fill_price_is_averaged_for_two_contracts() {
+        let order = sample_kalshi_order(2.0, 0.74, "yes");
+        assert!((contract_fill_price(&order, "yes") - 0.37).abs() < 1e-9);
+    }
+
+    #[test]
+    fn multi_contract_fill_price_is_averaged_for_five_contracts() {
+        let order = sample_kalshi_order(5.0, 1.85, "yes");
+        assert!((contract_fill_price(&order, "yes") - 0.37).abs() < 1e-9);
+    }
+
+    #[test]
+    fn multi_contract_fill_price_is_averaged_for_ten_contracts() {
+        let order = sample_kalshi_order(10.0, 3.7, "yes");
+        assert!((contract_fill_price(&order, "yes") - 0.37).abs() < 1e-9);
+    }
+
+    #[test]
+    fn modest_edge_and_acceptable_queue_join_the_bid() {
+        let snapshot = sample_snapshot();
+        let queue = sample_queue_snapshot(12.0);
+        let route = route_live_entry(
+            &snapshot,
+            "buy_yes",
+            Some(&queue),
+            0.495,
+            Some(0.55),
+            Some(40.0),
+            18.0,
+            10.0,
+            "good_till_cancelled",
+            15,
+            15,
+        );
+        assert_eq!(route.action, RouterAction::Join);
+        assert_eq!(route.limit_price, 0.46);
+    }
+
+    #[test]
+    fn favorable_spread_and_good_ev_improves_one_tick() {
+        let mut snapshot = sample_snapshot();
+        snapshot.best_bid = 0.42;
+        snapshot.best_ask = 0.44;
+        snapshot.spread_bps = 200.0;
+        let queue = sample_queue_snapshot(8.0);
+        let route = route_live_entry(
+            &snapshot,
+            "buy_yes",
+            Some(&queue),
+            0.56,
+            Some(0.58),
+            Some(20.0),
+            25.0,
+            10.0,
+            "good_till_cancelled",
+            15,
+            15,
+        );
+        assert_eq!(route.action, RouterAction::ImproveOneTick);
+        assert_eq!(route.limit_price, 0.43);
+    }
+
+    #[test]
+    fn urgent_exit_near_expiry_crosses() {
+        let mut snapshot = sample_snapshot();
+        snapshot.seconds_to_expiry = 45;
+        let route = route_live_exit(&snapshot, "buy_yes", "good_till_cancelled", 15, 45);
+        assert_eq!(route.action, RouterAction::Cross);
+        assert_eq!(route.time_in_force, "fill_or_kill");
+        assert_eq!(route.limit_price, 0.46);
+    }
+
+    #[test]
+    fn stale_snapshot_or_bad_spread_skips_entry() {
+        let mut snapshot = sample_snapshot();
+        snapshot.market_data_age_seconds = 30;
+        let queue = sample_queue_snapshot(10.0);
+        let route = route_live_entry(
+            &snapshot,
+            "buy_yes",
+            Some(&queue),
+            0.56,
+            Some(0.6),
+            Some(20.0),
+            35.0,
+            10.0,
+            "good_till_cancelled",
+            15,
+            15,
+        );
+        assert_eq!(route.action, RouterAction::Skip);
+    }
+
+    #[test]
+    fn router_does_not_cross_when_ev_guardrail_fails() {
+        let mut snapshot = sample_snapshot();
+        snapshot.best_bid = 0.58;
+        snapshot.best_ask = 0.60;
+        snapshot.spread_bps = 200.0;
+        let queue = sample_queue_snapshot(5.0);
+        let route = route_live_entry(
+            &snapshot,
+            "buy_yes",
+            Some(&queue),
+            0.595,
+            Some(0.85),
+            Some(40.0),
+            55.0,
+            10.0,
+            "good_till_cancelled",
+            15,
+            15,
+        );
+        assert_ne!(route.action, RouterAction::Cross);
     }
 }
